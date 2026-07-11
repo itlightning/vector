@@ -20,6 +20,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tokio_openssl::SslStream;
+#[cfg(feature = "grpc")]
 use tonic::transport::{Certificate, server::Connected};
 
 use super::{
@@ -438,12 +439,14 @@ impl From<X509> for CertificateMetadata {
     }
 }
 
+#[cfg(feature = "grpc")]
 #[derive(Clone)]
 pub struct MaybeTlsConnectInfo {
     pub remote_addr: SocketAddr,
     pub peer_certs: Option<Vec<Certificate>>,
 }
 
+#[cfg(feature = "grpc")]
 impl Connected for MaybeTlsIncomingStream<TcpStream> {
     type ConnectInfo = MaybeTlsConnectInfo;
 
