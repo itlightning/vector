@@ -624,6 +624,7 @@ api = [
   "dep:prost-types",
   "protobuf-build",
   "vector-lib/api",
+  "vector-lib/grpc",
 ]
 
 # API client
@@ -800,7 +801,7 @@ sources-websocket = ["dep:tokio-tungstenite"]
 sources-windows_event_log = ["dep:windows", "dep:quick-xml", "dep:governor"]
 sources-windows_event_log-integration-tests = ["sources-windows_event_log"]
 
-sources-vector = ["dep:prost", "dep:tonic", "dep:tonic-health", "protobuf-build"]
+sources-vector = ["dep:prost", "dep:tonic", "dep:tonic-health", "protobuf-build", "vector-lib/grpc"]
 
 # Transforms
 transforms = ["transforms-logs", "transforms-metrics"]
@@ -982,7 +983,7 @@ sinks-socket = ["sinks-utils-udp"]
 sinks-splunk_hec = []
 sinks-statsd = ["sinks-utils-udp", "tokio-util/net"]
 sinks-utils-udp = []
-sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
+sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost", "vector-lib/grpc"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
 sinks-webhdfs = ["dep:opendal"]
