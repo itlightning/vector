@@ -2893,7 +2893,9 @@ mod tests {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
                 charset: CharsetMode::Auto,
-                fallback_charset: Some(UTF_16LE),
+                // Prove the knob: a single-byte fallback can frame raw `\n` bytes that
+                // are neither UTF-8 nor UTF-16.
+                fallback_charset: Some(encoding_rs::WINDOWS_1252),
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 // Disable reject so inconclusive windows still ingest via fallback.
