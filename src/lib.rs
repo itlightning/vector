@@ -83,6 +83,7 @@ pub mod common;
 pub mod completion;
 mod convert_config;
 pub mod cpu_time;
+pub mod encoding_detect;
 pub mod encoding_transcode;
 pub mod enrichment_tables;
 pub mod extra_context;

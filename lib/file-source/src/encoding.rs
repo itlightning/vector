@@ -1,0 +1,84 @@
+//! Optional per-file character-set auto-detection for the file source.
+//!
+//! Detection itself lives in the Vector crate (`encoding_detect`). This module
+//! only carries lifecycle state and a detector trait so `file-source` does not
+//! depend on `encoding_rs`.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+
+/// Result of running auto-detection on a sniff window.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EncodingDetectOutcome {
+    /// Need more bytes before deciding.
+    Pending,
+    /// Charset chosen; use `encoding_name` and `line_delimiter` from now on.
+    Decided {
+        encoding_name: &'static str,
+        via: &'static str,
+        line_delimiter: Bytes,
+    },
+    /// Sniff rejected as garbage under the chosen charset.
+    Rejected {
+        encoding_name: &'static str,
+        via: &'static str,
+        ratio: f64,
+    },
+}
+
+/// Implemented by the Vector file source to run charset detection without
+/// pulling `encoding_rs` into this crate.
+pub trait FileEncodingDetector: Send + Sync {
+    /// Maximum bytes to peek from offset 0.
+    fn max_peek_bytes(&self) -> usize;
+
+    /// Run detection on a sniff window that starts at file/stream offset 0.
+    fn detect(&self, sniff: &[u8]) -> EncodingDetectOutcome;
+}
+
+/// How the file server handles character encoding for framing.
+#[derive(Clone)]
+pub enum FileEncodingMode {
+    /// Fixed line delimiter for every file. Optional name annotates each `Line`
+    /// for transcoding in the Vector file source.
+    Fixed { encoding_name: Option<&'static str> },
+    /// Per-file auto-detection; delimiter is set after `Decided`.
+    Auto {
+        detector: Arc<dyn FileEncodingDetector>,
+    },
+}
+
+impl std::fmt::Debug for FileEncodingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed { encoding_name } => f
+                .debug_struct("Fixed")
+                .field("encoding_name", encoding_name)
+                .finish(),
+            Self::Auto { .. } => f.debug_struct("Auto").finish_non_exhaustive(),
+        }
+    }
+}
+
+/// Per-file encoding lifecycle while watching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileEncodingState {
+    /// Not using encoding / fixed mode (no pending detect).
+    Inactive,
+    /// Waiting for enough bytes (or a BOM) to decide.
+    Pending,
+    /// Charset chosen; `encoding_name` is an Encoding Standard name.
+    Decided { encoding_name: &'static str },
+    /// Permanently skip this fingerprint after reject gate.
+    Rejected,
+}
+
+impl FileEncodingState {
+    pub const fn encoding_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Decided { encoding_name } => Some(encoding_name),
+            _ => None,
+        }
+    }
+}
