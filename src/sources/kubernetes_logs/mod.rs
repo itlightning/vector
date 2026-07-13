@@ -26,8 +26,9 @@ use vector_lib::{
     codecs::{BytesDeserializer, BytesDeserializerConfig},
     config::{LegacyKey, LogNamespace},
     configurable::configurable_component,
-    file_source::file_server::{
-        FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before,
+    file_source::{
+        FileEncodingMode,
+        file_server::{FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before},
     },
     file_source_common::{
         Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
@@ -843,6 +844,9 @@ impl Source {
             max_line_bytes: resolved_max_line_bytes,
             // Delimiter bytes that is used to read the file line-by-line
             line_delimiter: Bytes::from("\n"),
+            encoding_mode: FileEncodingMode::Fixed {
+                encoding_name: None,
+            },
             // The directory where to keep the checkpoints.
             data_dir,
             // This value specifies not exactly the globbing, but interval

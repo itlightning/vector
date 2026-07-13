@@ -42,7 +42,7 @@ mod unix_stream;
 mod wrappers;
 
 #[cfg(feature = "sources-file")]
-pub use encoding_config::EncodingConfig;
+pub use encoding_config::{CharsetMode, EncodingConfig};
 pub use multiline_config::MultilineConfig;
 #[cfg(all(
     unix,

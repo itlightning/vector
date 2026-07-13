@@ -35,4 +35,10 @@ pub trait FileSourceInternalEvents: Send + Sync + Clone + 'static {
         configured_limit: usize,
         encountered_size_so_far: usize,
     );
+
+    fn emit_file_encoding_detected(&self, path: &Path, encoding: &str, via: &str);
+
+    fn emit_file_encoding_rejected(&self, path: &Path, encoding: &str, ratio: f64);
+
+    fn emit_file_encoding_fallback(&self, path: &Path, encoding: &str);
 }

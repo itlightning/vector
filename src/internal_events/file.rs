@@ -431,6 +431,103 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
+    pub struct FileEncodingDetected<'a> {
+        pub file: &'a Path,
+        pub encoding: &'a str,
+        pub via: &'a str,
+        pub include_file_metric_tag: bool,
+    }
+
+    impl InternalEvent for FileEncodingDetected<'_> {
+        fn emit(self) {
+            debug!(
+                message = "Detected file character encoding.",
+                file = %self.file.display(),
+                encoding = %self.encoding,
+                via = %self.via,
+            );
+            if self.include_file_metric_tag {
+                counter!(
+                    CounterName::FileEncodingDetectedTotal,
+                    "file" => self.file.to_string_lossy().into_owned(),
+                    "encoding" => self.encoding.to_owned(),
+                    "via" => self.via.to_owned(),
+                )
+            } else {
+                counter!(
+                    CounterName::FileEncodingDetectedTotal,
+                    "encoding" => self.encoding.to_owned(),
+                    "via" => self.via.to_owned(),
+                )
+            }
+            .increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct FileEncodingRejected<'a> {
+        pub file: &'a Path,
+        pub encoding: &'a str,
+        pub ratio: f64,
+        pub include_file_metric_tag: bool,
+    }
+
+    impl InternalEvent for FileEncodingRejected<'_> {
+        fn emit(self) {
+            warn!(
+                message = "Rejected file due to high replacement character ratio under detected encoding.",
+                file = %self.file.display(),
+                encoding = %self.encoding,
+                reason = "max_replacement_ratio",
+                ratio = %self.ratio,
+            );
+            if self.include_file_metric_tag {
+                counter!(
+                    CounterName::FileEncodingRejectedTotal,
+                    "file" => self.file.to_string_lossy().into_owned(),
+                    "encoding" => self.encoding.to_owned(),
+                )
+            } else {
+                counter!(
+                    CounterName::FileEncodingRejectedTotal,
+                    "encoding" => self.encoding.to_owned(),
+                )
+            }
+            .increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
+    pub struct FileEncodingFallback<'a> {
+        pub file: &'a Path,
+        pub encoding: &'a str,
+        pub include_file_metric_tag: bool,
+    }
+
+    impl InternalEvent for FileEncodingFallback<'_> {
+        fn emit(self) {
+            warn!(
+                message = "File character encoding detection was inconclusive; using fallback charset.",
+                file = %self.file.display(),
+                encoding = %self.encoding,
+            );
+            if self.include_file_metric_tag {
+                counter!(
+                    CounterName::FileEncodingFallbackTotal,
+                    "file" => self.file.to_string_lossy().into_owned(),
+                    "encoding" => self.encoding.to_owned(),
+                )
+            } else {
+                counter!(
+                    CounterName::FileEncodingFallbackTotal,
+                    "encoding" => self.encoding.to_owned(),
+                )
+            }
+            .increment(1);
+        }
+    }
+
+    #[derive(Debug, NamedInternalEvent)]
     pub struct FileCheckpointed {
         pub count: usize,
         pub duration: Duration,
@@ -621,6 +718,32 @@ mod source {
                 truncated_bytes,
                 configured_limit,
                 encountered_size_so_far
+            });
+        }
+
+        fn emit_file_encoding_detected(&self, file: &Path, encoding: &str, via: &str) {
+            emit!(FileEncodingDetected {
+                file,
+                encoding,
+                via,
+                include_file_metric_tag: self.include_file_metric_tag,
+            });
+        }
+
+        fn emit_file_encoding_rejected(&self, file: &Path, encoding: &str, ratio: f64) {
+            emit!(FileEncodingRejected {
+                file,
+                encoding,
+                ratio,
+                include_file_metric_tag: self.include_file_metric_tag,
+            });
+        }
+
+        fn emit_file_encoding_fallback(&self, file: &Path, encoding: &str) {
+            emit!(FileEncodingFallback {
+                file,
+                encoding,
+                include_file_metric_tag: self.include_file_metric_tag,
             });
         }
     }

@@ -4,11 +4,12 @@ use chrono::{DateTime, Utc};
 use std::{
     io::{self, SeekFrom},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     fs::File,
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncSeekExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
     time::Instant,
 };
 use tracing::debug;
@@ -17,6 +18,10 @@ use vector_common::constants::GZIP_MAGIC;
 use file_source_common::{
     AsyncFileInfo, FilePosition, PortableFileExt, ReadFrom,
     buffer::{ReadResult, read_until_with_max_size},
+};
+
+use crate::encoding::{
+    EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode, FileEncodingState,
 };
 
 const EOF_READ_BACKOFF_MIN: Duration = Duration::from_millis(1);
@@ -65,6 +70,10 @@ pub struct FileWatcher {
     max_line_bytes: usize,
     line_delimiter: Bytes,
     buf: BytesMut,
+    encoding_state: FileEncodingState,
+    encoding_detector: Option<Arc<dyn FileEncodingDetector>>,
+    fixed_encoding_name: Option<&'static str>,
+    gzipped: bool,
 }
 
 impl FileWatcher {
@@ -79,6 +88,7 @@ impl FileWatcher {
         ignore_before: Option<DateTime<Utc>>,
         max_line_bytes: usize,
         line_delimiter: Bytes,
+        encoding_mode: &FileEncodingMode,
     ) -> Result<FileWatcher, std::io::Error> {
         let f = File::open(&path).await?;
         let file_info = f.file_info().await?;
@@ -159,6 +169,15 @@ impl FileWatcher {
             .and_then(|diff| Instant::now().checked_sub(diff))
             .unwrap_or_else(Instant::now);
 
+        let (encoding_state, encoding_detector, fixed_encoding_name) = match encoding_mode {
+            FileEncodingMode::Fixed { encoding_name } => {
+                (FileEncodingState::Inactive, None, *encoding_name)
+            }
+            FileEncodingMode::Auto { detector } => {
+                (FileEncodingState::Pending, Some(Arc::clone(detector)), None)
+            }
+        };
+
         Ok(FileWatcher {
             path,
             findable: true,
@@ -175,7 +194,22 @@ impl FileWatcher {
             max_line_bytes,
             line_delimiter,
             buf: BytesMut::new(),
+            encoding_state,
+            encoding_detector,
+            fixed_encoding_name,
+            gzipped,
         })
+    }
+
+    /// Encoding annotation for emitted lines (`Encoding::name()` or `None`).
+    pub fn line_encoding_name(&self) -> Option<&'static str> {
+        self.encoding_state
+            .encoding_name()
+            .or(self.fixed_encoding_name)
+    }
+
+    pub fn encoding_state(&self) -> &FileEncodingState {
+        &self.encoding_state
     }
 
     pub async fn update_path(&mut self, path: PathBuf) -> io::Result<()> {
@@ -185,6 +219,7 @@ impl FileWatcher {
         if (file_info.portable_dev(), file_info.portable_ino()) != (self.devno, self.inode) {
             let mut reader = BufReader::new(File::open(&path).await?);
             let gzipped = is_gzipped(&mut reader).await?;
+            self.gzipped = gzipped;
             let new_reader: Box<dyn AsyncBufRead + Send + Unpin> = if gzipped {
                 if self.file_position != 0 {
                     Box::new(null_reader())
@@ -200,6 +235,11 @@ impl FileWatcher {
             let file_info = file_handle.file_info().await?;
             self.devno = file_info.portable_dev();
             self.inode = file_info.portable_ino();
+
+            // Fresh underlying file content: re-run auto-detection when enabled.
+            if self.encoding_detector.is_some() {
+                self.encoding_state = FileEncodingState::Pending;
+            }
         }
         self.reached_eof = false;
         self.read_retry_delay = EOF_READ_BACKOFF_MIN;
@@ -228,6 +268,67 @@ impl FileWatcher {
 
     pub fn get_file_position(&self) -> FilePosition {
         self.file_position
+    }
+
+    /// Peek at most `max_bytes` from stream offset 0 without moving the watcher's
+    /// read position (independent open + read; equivalent to seek-restore).
+    async fn peek_sniff(&self, max_bytes: usize) -> io::Result<Vec<u8>> {
+        let file = File::open(&self.path).await?;
+        if self.gzipped {
+            let decoder = gzip_multiple_decoder(BufReader::new(file));
+            let mut limited = decoder.take(max_bytes as u64);
+            let mut buf = Vec::new();
+            limited.read_to_end(&mut buf).await?;
+            Ok(buf)
+        } else {
+            let mut file = file;
+            let mut buf = vec![0u8; max_bytes];
+            let n = file.read(&mut buf).await?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+    }
+
+    /// Run auto-detection when Pending. Returns whether framing may proceed.
+    pub(super) async fn ensure_encoding_ready<E>(&mut self, emitter: &E) -> io::Result<bool>
+    where
+        E: file_source_common::FileSourceInternalEvents,
+    {
+        if !matches!(self.encoding_state, FileEncodingState::Pending) {
+            return Ok(!matches!(self.encoding_state, FileEncodingState::Rejected));
+        }
+
+        let Some(detector) = self.encoding_detector.clone() else {
+            self.encoding_state = FileEncodingState::Inactive;
+            return Ok(true);
+        };
+
+        let sniff = self.peek_sniff(detector.max_peek_bytes()).await?;
+        match detector.detect(&sniff) {
+            EncodingDetectOutcome::Pending => Ok(false),
+            EncodingDetectOutcome::Decided {
+                encoding_name,
+                via,
+                line_delimiter,
+            } => {
+                emitter.emit_file_encoding_detected(&self.path, encoding_name, via);
+                if via == "fallback" {
+                    emitter.emit_file_encoding_fallback(&self.path, encoding_name);
+                }
+                self.line_delimiter = line_delimiter;
+                self.encoding_state = FileEncodingState::Decided { encoding_name };
+                Ok(true)
+            }
+            EncodingDetectOutcome::Rejected {
+                encoding_name,
+                via: _,
+                ratio,
+            } => {
+                emitter.emit_file_encoding_rejected(&self.path, encoding_name, ratio);
+                self.encoding_state = FileEncodingState::Rejected;
+                Ok(false)
+            }
+        }
     }
 
     /// Read a single line from the underlying file
@@ -338,6 +439,10 @@ impl FileWatcher {
 
     #[inline]
     pub fn should_read(&self) -> bool {
+        if matches!(self.encoding_state, FileEncodingState::Rejected) {
+            return false;
+        }
+
         if self.reached_eof && self.last_read_attempt.elapsed() < self.read_retry_delay {
             return false;
         }

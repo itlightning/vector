@@ -14,6 +14,7 @@ use vector_lib::{
     config::{LegacyKey, LogNamespace},
     configurable::configurable_component,
     file_source::{
+        EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode,
         file_server::{FileServer, Line, calculate_ignore_before},
         paths_provider::{Glob, MatchOptions},
     },
@@ -25,13 +26,14 @@ use vector_lib::{
 };
 use vrl::value::Kind;
 
-use super::util::{EncodingConfig, MultilineConfig};
+use super::util::{CharsetMode, EncodingConfig, MultilineConfig};
 use crate::{
     SourceSender,
     config::{
         DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
         log_schema,
     },
+    encoding_detect::{AutoDetectConfig, DetectOutcome, detect_charset},
     encoding_transcode::{Decoder, Encoder},
     event::{BatchNotifier, BatchStatus, LogEvent},
     internal_events::{
@@ -59,7 +61,7 @@ enum BuildError {
 /// Configuration for the `file` source.
 #[serde_as]
 #[configurable_component(source("file", "Collect logs from files."))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Array of file patterns to include. [Globbing](https://vector.dev/docs/reference/configuration/sources/file/#globbing) is supported.
@@ -419,6 +421,10 @@ impl SourceConfig for FileConfig {
 
         let log_namespace = cx.log_namespace(self.log_namespace);
 
+        if let Some(ref encoding) = self.encoding {
+            encoding.validate_and_resolve()?;
+        }
+
         Ok(file_source(
             self,
             data_dir,
@@ -524,11 +530,40 @@ pub fn file_source(
 
     let encoding_charset = config.encoding.clone().map(|e| e.charset);
 
-    // if file encoding is specified, need to convert the line delimiter (present as utf8)
-    // to the specified encoding, so that delimiter-based line splitting can work properly
-    let line_delimiter_as_bytes = match encoding_charset {
-        Some(e) => Encoder::new(e).encode_from_utf8(&config.line_delimiter),
-        None => Bytes::from(config.line_delimiter.clone()),
+    // Resolve encoding mode: fixed charset (optional) or per-file auto-detection.
+    let (line_delimiter_as_bytes, encoding_mode) = match encoding_charset {
+        Some(CharsetMode::Auto) => {
+            let auto = config
+                .encoding
+                .as_ref()
+                .expect("charset auto requires encoding block")
+                .validate_and_resolve()
+                .expect("encoding validated in build")
+                .expect("auto mode resolves AutoDetectConfig");
+            let detector = std::sync::Arc::new(AutoFileEncodingDetector {
+                auto,
+                line_delimiter: config.line_delimiter.clone(),
+            });
+            (
+                Bytes::from(config.line_delimiter.clone()),
+                FileEncodingMode::Auto { detector },
+            )
+        }
+        Some(CharsetMode::Explicit(encoding)) => {
+            let delim = Encoder::new(encoding).encode_from_utf8(&config.line_delimiter);
+            (
+                delim,
+                FileEncodingMode::Fixed {
+                    encoding_name: Some(encoding.name()),
+                },
+            )
+        }
+        None => (
+            Bytes::from(config.line_delimiter.clone()),
+            FileEncodingMode::Fixed {
+                encoding_name: None,
+            },
+        ),
     };
 
     let checkpointer = Checkpointer::new(&data_dir);
@@ -542,6 +577,7 @@ pub fn file_source(
         ignore_before,
         max_line_bytes: config.max_line_bytes,
         line_delimiter: line_delimiter_as_bytes,
+        encoding_mode,
         data_dir,
         glob_minimum_cooldown,
         fingerprinter: Fingerprinter::new(strategy, config.max_line_bytes, config.ignore_not_found),
@@ -600,7 +636,9 @@ pub fn file_source(
     Box::pin(async move {
         info!(message = "Starting file server.", include = ?include, exclude = ?exclude);
 
-        let mut encoding_decoder = encoding_charset.map(Decoder::new);
+        // One decoder per detected/fixed charset name (shared across files).
+        let mut encoding_decoders: std::collections::HashMap<&'static str, Decoder> =
+            std::collections::HashMap::new();
 
         // sizing here is just a guess
         let (tx, rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -613,11 +651,15 @@ pub fn file_source(
                     file: &line.filename,
                     include_file_metric_tag,
                 });
-                // transcode each line from the file's encoding charset to utf8
-                line.text = match encoding_decoder.as_mut() {
-                    Some(d) => d.decode_to_utf8(line.text),
-                    None => line.text,
-                };
+                // Transcode each line from the file's encoding charset to utf8.
+                if let Some(encoding_name) = line.encoding {
+                    let decoder = encoding_decoders.entry(encoding_name).or_insert_with(|| {
+                        let encoding = encoding_rs::Encoding::for_label(encoding_name.as_bytes())
+                            .unwrap_or(encoding_rs::UTF_8);
+                        Decoder::new(encoding)
+                    });
+                    line.text = decoder.decode_to_utf8(line.text);
+                }
                 line
             });
 
@@ -735,23 +777,64 @@ fn wrap_with_line_agg(
                 (
                     line.filename,
                     line.text,
-                    (line.file_id, line.start_offset, line.end_offset),
+                    (
+                        line.file_id,
+                        line.start_offset,
+                        line.end_offset,
+                        line.encoding,
+                    ),
                 )
             }),
             logic,
         )
         .map(
-            |(filename, text, (file_id, start_offset, initial_end), lastline_context)| Line {
-                text,
-                filename,
-                file_id,
-                start_offset,
-                end_offset: lastline_context.map_or(initial_end, |(_, _, lastline_end_offset)| {
-                    lastline_end_offset
-                }),
+            |(filename, text, (file_id, start_offset, initial_end, encoding), lastline_context)| {
+                Line {
+                    text,
+                    filename,
+                    file_id,
+                    start_offset,
+                    end_offset: lastline_context
+                        .map_or(initial_end, |(_, _, lastline_end_offset, _)| {
+                            lastline_end_offset
+                        }),
+                    encoding,
+                }
             },
         ),
     )
+}
+
+/// Bridges file-source auto-detection to Vector's charset detector + delimiter encoder.
+struct AutoFileEncodingDetector {
+    auto: AutoDetectConfig,
+    line_delimiter: String,
+}
+
+impl FileEncodingDetector for AutoFileEncodingDetector {
+    fn max_peek_bytes(&self) -> usize {
+        self.auto.max_bytes
+    }
+
+    fn detect(&self, sniff: &[u8]) -> EncodingDetectOutcome {
+        match detect_charset(sniff, &self.auto) {
+            DetectOutcome::Pending => EncodingDetectOutcome::Pending,
+            DetectOutcome::Decided { encoding, via } => EncodingDetectOutcome::Decided {
+                encoding_name: encoding.name(),
+                via: via.as_str(),
+                line_delimiter: Encoder::new(encoding).encode_from_utf8(&self.line_delimiter),
+            },
+            DetectOutcome::Rejected {
+                encoding,
+                via,
+                ratio,
+            } => EncodingDetectOutcome::Rejected {
+                encoding_name: encoding.name(),
+                via: via.as_str(),
+                ratio,
+            },
+        }
+    }
 }
 
 struct EventMetadata {
@@ -943,7 +1026,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert_eq!(config.encoding, Some(EncodingConfig { charset: UTF_16LE }));
+        assert_eq!(config.encoding, Some(EncodingConfig::explicit(UTF_16LE)));
 
         let config: FileConfig = toml::from_str(
             r#"
@@ -2315,7 +2398,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![PathBuf::from("tests/data/utf-16le.log")],
-            encoding: Some(EncodingConfig { charset: UTF_16LE }),
+            encoding: Some(EncodingConfig::explicit(UTF_16LE)),
             ..test_default_file_config(&dir)
         };
 
@@ -2466,6 +2549,411 @@ mod tests {
                 i
             );
         }
+    }
+
+    fn utf16le_bytes(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_mixed_glob() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let utf8_path = dir.path().join("utf8.log");
+        let utf16_path = dir.path().join("utf16.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            let mut utf8 = File::create(&utf8_path).unwrap();
+            // Meet min_bytes with UTF-8 content.
+            let line = format!("{}\n", "u".repeat(64));
+            write!(&mut utf8, "{line}").unwrap();
+            utf8.flush().unwrap();
+
+            let mut utf16 = File::create(&utf16_path).unwrap();
+            let payload = utf16le_bytes(&format!("{}\n", "v".repeat(64)));
+            utf16.write_all(&payload).unwrap();
+            utf16.flush().unwrap();
+
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('u')),
+            "expected utf-8 file lines, got {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('v')),
+            "expected utf-16 file lines, got {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\0')),
+            "decoded lines must not contain NUL, got {received:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_rotation_redetect() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("app.log")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("app.log");
+        let rotated = dir.path().join("app.log.1");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            let mut file = File::create(&path).unwrap();
+            let first = format!("{}\n", "a".repeat(64));
+            write!(&mut file, "{first}").unwrap();
+            file.flush().unwrap();
+            sleep_500_millis().await;
+
+            // Rotate: move old file aside, create new file with different encoding.
+            drop(file);
+            std::fs::rename(&path, &rotated).unwrap();
+            let mut file = File::create(&path).unwrap();
+            let payload = utf16le_bytes(&format!("{}\n", "b".repeat(64)));
+            file.write_all(&payload).unwrap();
+            file.flush().unwrap();
+            sleep(Duration::from_millis(800)).await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('a')),
+            "missing first-generation utf-8 lines: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('b')),
+            "missing rotated utf-16 lines: {received:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_empty_grow_utf16() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("grow.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                let mut file = File::create(&path).unwrap();
+                file.flush().unwrap();
+                sleep(Duration::from_millis(300)).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+                let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
+                file.write_all(&payload).unwrap();
+                file.flush().unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received.len(), 1);
+        assert!(received[0].contains('g'));
+        assert!(!received[0].contains('\0'));
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_binary_rejected() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let bin_path = dir.path().join("bin.dat");
+        let good_path = dir.path().join("good.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            let mut good = File::create(&good_path).unwrap();
+            let line = format!("{}\n", "ok".repeat(32));
+            write!(&mut good, "{line}").unwrap();
+            good.flush().unwrap();
+
+            let mut file = File::create(&bin_path).unwrap();
+            let mut bytes = vec![0u8; 256];
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(37).wrapping_add(0x80);
+            }
+            file.write_all(&bytes).unwrap();
+            file.flush().unwrap();
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().all(|m| m.contains("ok")),
+            "only the utf-8 companion file should emit, got {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\u{FFFD}')),
+            "rejected binary must not contribute replacement-filled lines: {received:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_ratio_zero_allows_binary() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.0),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("bin.dat");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            let mut file = File::create(&path).unwrap();
+            // Invalid UTF-8 that still frames on `\n` under fallback UTF-8.
+            let mut bytes = vec![0x80u8; 64];
+            bytes.push(b'\n');
+            file.write_all(&bytes).unwrap();
+            file.flush().unwrap();
+            sleep_500_millis().await;
+        })
+        .await;
+
+        assert!(
+            !received.is_empty(),
+            "ratio 0 must not reject; got no events"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_bom_stripped_from_event() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(128),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("bom.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&[0xef, 0xbb, 0xbf]).unwrap();
+            writeln!(&mut file, "hello bom").unwrap();
+            file.flush().unwrap();
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received, vec!["hello bom".to_string()]);
+        assert!(!received[0].starts_with('\u{feff}'));
+        assert!(!received[0].as_bytes().starts_with(&[0xef, 0xbb, 0xbf]));
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_resume_mid_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("resume.log");
+        let data_dir = dir.path().join(".data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let make_config = |include: Vec<PathBuf>| file::FileConfig {
+            include,
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            data_dir: Some(data_dir.clone()),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            fingerprint: FingerprintConfig::Checksum {
+                ignored_header_bytes: 0,
+                lines: 1,
+            },
+            internal_metrics: FileInternalMetricsConfig {
+                include_file_tag: true,
+            },
+            ..Default::default()
+        };
+
+        // First run: ingest both UTF-16 lines with acks so checkpoints advance.
+        {
+            let mut file = File::create(&path).unwrap();
+            let line1 = utf16le_bytes(&format!("{}\n", "r".repeat(40)));
+            let line2 = utf16le_bytes(&format!("{}\n", "s".repeat(40)));
+            file.write_all(&line1).unwrap();
+            file.write_all(&line2).unwrap();
+            file.flush().unwrap();
+
+            let received = run_file_source(
+                &make_config(vec![path.clone()]),
+                true,
+                Acks,
+                LogNamespace::Legacy,
+                None,
+                sleep_500_millis(),
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            assert!(msgs.iter().any(|m| m.contains('r')));
+            assert!(msgs.iter().any(|m| m.contains('s')));
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+
+        // Second run: append a third line; peek-restore must not re-emit prior lines
+        // or NUL-mangle UTF-16 after re-detecting from offset 0.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let line3 = utf16le_bytes(&format!("{}\n", "t".repeat(40)));
+            file.write_all(&line3).unwrap();
+            file.flush().unwrap();
+
+            let received = run_file_source(
+                &make_config(vec![path.clone()]),
+                false,
+                NoAcks,
+                LogNamespace::Legacy,
+                None,
+                sleep_500_millis(),
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            assert!(
+                msgs.iter().any(|m| m.contains('t')),
+                "expected newly appended line after resume, got {msgs:?}"
+            );
+            assert!(
+                msgs.iter().all(|m| !m.contains('r') && !m.contains('s')),
+                "must not re-read checkpointed lines after peek-restore, got {msgs:?}"
+            );
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_fallback_charset() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: Some(UTF_16LE),
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                // Disable reject so inconclusive windows still ingest via fallback.
+                max_replacement_ratio: Some(0.0),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        // Bytes that are not BOM, not UTF-16-looking, and not valid UTF-8, so ladder
+        // reaches fallback_charset = UTF-16LE. Craft as UTF-16LE ASCII without enough
+        // leading NULs for the heuristic... actually that would look like UTF-16.
+        // Use high-bit bytes that UTF-16LE will still decode (with replacements ok since ratio 0).
+        let path = dir.path().join("fallback.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            let mut file = File::create(&path).unwrap();
+            // Valid UTF-16LE content without BOM, but scramble parity so heuristic fails
+            // and UTF-8 fails: mix of non-NUL odd/even that isn't strict UTF-8.
+            let mut bytes = utf16le_bytes(&format!("{}\n", "f".repeat(40)));
+            // Flip a few even-index bytes to break NUL parity while keeping even length.
+            for i in (0..bytes.len()).step_by(8) {
+                if bytes[i] == 0 {
+                    bytes[i] = 0x01;
+                }
+            }
+            // Ensure not valid UTF-8.
+            assert!(std::str::from_utf8(&bytes).is_err());
+            file.write_all(&bytes).unwrap();
+            file.flush().unwrap();
+            sleep_500_millis().await;
+        })
+        .await;
+
+        // With fallback UTF-16LE we should get some decoded output (may include FFFD).
+        assert!(
+            !received.is_empty(),
+            "fallback must still ingest when reject disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_validation_errors() {
+        let err = EncodingConfig {
+            charset: CharsetMode::Explicit(UTF_16LE),
+            fallback_charset: Some(encoding_rs::UTF_8),
+            auto_detect_min_bytes: None,
+            auto_detect_max_bytes: None,
+            max_replacement_ratio: None,
+        }
+        .validate_and_resolve();
+        assert!(err.is_err());
+
+        let ok = EncodingConfig {
+            charset: CharsetMode::Auto,
+            fallback_charset: Some(encoding_rs::UTF_8),
+            auto_detect_min_bytes: Some(64),
+            auto_detect_max_bytes: Some(1024),
+            max_replacement_ratio: Some(0.5),
+        }
+        .validate_and_resolve();
+        assert!(ok.is_ok());
     }
 
     #[tokio::test]
