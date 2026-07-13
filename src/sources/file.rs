@@ -658,7 +658,7 @@ pub fn file_source(
                             .unwrap_or(encoding_rs::UTF_8);
                         Decoder::new(encoding)
                     });
-                    line.text = decoder.decode_to_utf8(line.text);
+                    line.text = decoder.decode_to_utf8_with_file(line.text, Some(&line.filename));
                 }
                 line
             });
