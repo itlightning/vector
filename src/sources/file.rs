@@ -2924,6 +2924,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_encoding_auto_pending_until_min_then_emit() {
+        // Lifecycle: stay Pending across sub-min appends; only emit after size crosses min.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(64),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("drip.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                let mut file = File::create(&path).unwrap();
+                file.flush().unwrap();
+                sleep(Duration::from_millis(200)).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+                // Sub-min UTF-16: enough for a few code units, still Pending.
+                file.write_all(&utf16le_bytes("abcdefghij")).unwrap();
+                file.flush().unwrap();
+                sleep(Duration::from_millis(400)).await;
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    0,
+                    "must stay Pending below auto_detect_min_bytes"
+                );
+
+                // Cross min and complete a line.
+                let rest = utf16le_bytes(&format!("{}\n", "k".repeat(40)));
+                file.write_all(&rest).unwrap();
+                file.flush().unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received.len(), 1);
+        assert!(received[0].contains('k'));
+        assert!(!received[0].contains('\0'));
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_ratio_under_threshold_allows() {
+        // Sparse invalid UTF-8 → fallback decode with some U+FFFD, ratio well under 0.33.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("sparse_bad.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            let mut file = File::create(&path).unwrap();
+            let mut bytes = vec![b'a'; 90];
+            bytes.extend(std::iter::repeat(0x80u8).take(10));
+            bytes.push(b'\n');
+            assert!(std::str::from_utf8(&bytes).is_err());
+            file.write_all(&bytes).unwrap();
+            file.flush().unwrap();
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received.len(), 1, "under-threshold FFFD must not Reject: {received:?}");
+        assert!(
+            received[0].contains('a'),
+            "expected ASCII payload to survive: {received:?}"
+        );
+        assert!(
+            received[0].contains('\u{FFFD}'),
+            "fixture should surface replacements (proves allow-path, not reject): {received:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_ignored_header_bytes_compatible() {
+        // Fingerprint skips a fixed header; encoding auto still peeks at offset 0.
+        // UTF-16 header + body keeps detection on the UTF-16 ladder for the whole sniff.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        let data_dir = dir.path().join(".data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        // "HEADER!!!\n" is 10 UTF-16 code units → 20 bytes.
+        const HEADER_BYTES: usize = 20;
+        let header_a = utf16le_bytes("HEADER!!!\n");
+        let header_b = utf16le_bytes("HEADER###\n");
+        assert_eq!(header_a.len(), HEADER_BYTES);
+        assert_eq!(header_b.len(), HEADER_BYTES);
+
+        let make_config = |include: Vec<PathBuf>| file::FileConfig {
+            include,
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+            }),
+            data_dir: Some(data_dir.clone()),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            fingerprint: FingerprintConfig::Checksum {
+                ignored_header_bytes: HEADER_BYTES,
+                lines: 1,
+            },
+            internal_metrics: FileInternalMetricsConfig {
+                include_file_tag: true,
+            },
+            ..Default::default()
+        };
+
+        {
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&header_a).unwrap();
+            file.write_all(&utf16le_bytes(&format!("{}\n", "p".repeat(40))))
+                .unwrap();
+            file.write_all(&utf16le_bytes(&format!("{}\n", "q".repeat(40))))
+                .unwrap();
+            file.flush().unwrap();
+
+            let received = run_file_source(
+                &make_config(vec![path.clone()]),
+                true,
+                Acks,
+                LogNamespace::Legacy,
+                None,
+                sleep_500_millis(),
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            // Header line is still ingested (ignore is fingerprint-only).
+            assert!(
+                msgs.iter().any(|m| m.contains("HEADER!!!")),
+                "header line should still be read as content: {msgs:?}"
+            );
+            assert!(msgs.iter().any(|m| m.contains('p')));
+            assert!(msgs.iter().any(|m| m.contains('q')));
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+
+        // Same fingerprint body after a different header; append a new line only.
+        {
+            let body = {
+                let mut b = Vec::new();
+                b.extend_from_slice(&utf16le_bytes(&format!("{}\n", "p".repeat(40))));
+                b.extend_from_slice(&utf16le_bytes(&format!("{}\n", "q".repeat(40))));
+                b.extend_from_slice(&utf16le_bytes(&format!("{}\n", "r".repeat(40))));
+                b
+            };
+            let mut file = File::create(&path).unwrap();
+            file.write_all(&header_b).unwrap();
+            file.write_all(&body).unwrap();
+            file.flush().unwrap();
+
+            let received = run_file_source(
+                &make_config(vec![path.clone()]),
+                false,
+                NoAcks,
+                LogNamespace::Legacy,
+                None,
+                sleep_500_millis(),
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            assert!(
+                msgs.iter().any(|m| m.contains('r')),
+                "checkpoint+fingerprint must resume after header change: {msgs:?}"
+            );
+            assert!(
+                msgs.iter()
+                    .all(|m| !m.contains('p') && !m.contains('q') && !m.contains("HEADER")),
+                "must not re-emit checkpointed header/body lines: {msgs:?}"
+            );
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+    }
+
+    #[tokio::test]
     async fn test_encoding_auto_validation_errors() {
         let err = EncodingConfig {
             charset: CharsetMode::Explicit(UTF_16LE),
