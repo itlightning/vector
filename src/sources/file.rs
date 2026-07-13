@@ -2909,23 +2909,12 @@ mod tests {
             ..test_default_file_config(&dir)
         };
 
-        // Bytes that are not BOM, not UTF-16-looking, and not valid UTF-8, so ladder
-        // reaches fallback_charset = UTF-16LE. Craft as UTF-16LE ASCII without enough
-        // leading NULs for the heuristic... actually that would look like UTF-16.
-        // Use high-bit bytes that UTF-16LE will still decode (with replacements ok since ratio 0).
+        // Invalid UTF-8, not BOM, and not UTF-16 NUL-parity: forces fallback_charset.
         let path = dir.path().join("fallback.log");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
             let mut file = File::create(&path).unwrap();
-            // Valid UTF-16LE content without BOM, but scramble parity so heuristic fails
-            // and UTF-8 fails: mix of non-NUL odd/even that isn't strict UTF-8.
-            let mut bytes = utf16le_bytes(&format!("{}\n", "f".repeat(40)));
-            // Flip a few even-index bytes to break NUL parity while keeping even length.
-            for i in (0..bytes.len()).step_by(8) {
-                if bytes[i] == 0 {
-                    bytes[i] = 0x01;
-                }
-            }
-            // Ensure not valid UTF-8.
+            let mut bytes = vec![0x80u8; 80];
+            bytes.push(b'\n');
             assert!(std::str::from_utf8(&bytes).is_err());
             file.write_all(&bytes).unwrap();
             file.flush().unwrap();
@@ -2933,7 +2922,6 @@ mod tests {
         })
         .await;
 
-        // With fallback UTF-16LE we should get some decoded output (may include FFFD).
         assert!(
             !received.is_empty(),
             "fallback must still ingest when reject disabled"
