@@ -2663,6 +2663,19 @@ mod tests {
         encoder.finish().unwrap();
     }
 
+    /// Write `data` as the entire file contents (truncating any existing file),
+    /// plain or gzip-compressed. Lets a test seed and "grow" a watched file with
+    /// one call in both modes: a gzip stream cannot be appended in place, so
+    /// growth is modeled as a whole-file rewrite (equivalent for a still-Pending
+    /// file, which auto-detection re-peeks from offset 0 each cycle).
+    fn write_whole(path: &std::path::Path, data: &[u8], gzip: bool) {
+        if gzip {
+            write_complete_gzip_file(path, data);
+        } else {
+            std::fs::write(path, data).unwrap();
+        }
+    }
+
     macro_rules! encoding_auto_plain_and_gzip {
         ($plain:ident, $gzip:ident, $impl_fn:ident) => {
             #[tokio::test]
@@ -2694,24 +2707,33 @@ mod tests {
 
         let utf8_path = dir.path().join("utf8.log");
         let utf16_path = dir.path().join("utf16.log");
-        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            {
-                let mut utf8 = TestLogSink::create(&utf8_path, gzip).unwrap();
-                // Meet min_bytes with UTF-8 content.
-                let line = format!("{}\n", "u".repeat(64));
-                write!(&mut utf8, "{line}").unwrap();
-                utf8.flush().unwrap();
-            }
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut utf8 = TestLogSink::create(&utf8_path, gzip).unwrap();
+                    // Meet min_bytes with UTF-8 content.
+                    let line = format!("{}\n", "u".repeat(64));
+                    write!(&mut utf8, "{line}").unwrap();
+                    utf8.flush().unwrap();
+                }
 
-            {
-                let mut utf16 = TestLogSink::create(&utf16_path, gzip).unwrap();
-                let payload = utf16le_bytes(&format!("{}\n", "v".repeat(64)));
-                utf16.write_all(&payload).unwrap();
-                utf16.flush().unwrap();
-            }
+                {
+                    let mut utf16 = TestLogSink::create(&utf16_path, gzip).unwrap();
+                    let payload = utf16le_bytes(&format!("{}\n", "v".repeat(64)));
+                    utf16.write_all(&payload).unwrap();
+                    utf16.flush().unwrap();
+                }
 
-            sleep_500_millis().await;
-        })
+                // Both files emit one line; wait for them rather than a fixed sleep.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+            },
+        )
         .await;
 
         let received = extract_messages_string(received);
@@ -2814,30 +2836,14 @@ mod tests {
             LogNamespace::Legacy,
             Some(Arc::clone(&counter)),
             async {
-                if gzip {
-                    {
-                        let mut file = TestLogSink::create(&path, gzip).unwrap();
-                        file.flush().unwrap();
-                    }
-                    sleep(Duration::from_millis(300)).await;
-                    assert_eq!(counter.load(Ordering::SeqCst), 0);
+                // Empty file: below min, must stay Pending.
+                write_whole(&path, b"", gzip);
+                sleep(Duration::from_millis(300)).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-                    let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
-                    {
-                        let mut file = TestLogSink::create(&path, gzip).unwrap();
-                        file.write_all(&payload).unwrap();
-                        file.flush().unwrap();
-                    }
-                } else {
-                    let mut file = TestLogSink::create(&path, gzip).unwrap();
-                    file.flush().unwrap();
-                    sleep(Duration::from_millis(300)).await;
-                    assert_eq!(counter.load(Ordering::SeqCst), 0);
-
-                    let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
-                    file.write_all(&payload).unwrap();
-                    file.flush().unwrap();
-                }
+                // Grow past min with a complete UTF-16 line.
+                let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
+                write_whole(&path, &payload, gzip);
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
             },
         )
@@ -2926,17 +2932,25 @@ mod tests {
         };
 
         let path = dir.path().join("bin.dat");
-        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            {
-                let mut file = TestLogSink::create(&path, gzip).unwrap();
-                // Invalid UTF-8 that still frames on `\n` under fallback UTF-8.
-                let mut bytes = vec![0x80u8; 64];
-                bytes.push(b'\n');
-                file.write_all(&bytes).unwrap();
-                file.flush().unwrap();
-            }
-            sleep_500_millis().await;
-        })
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    // Invalid UTF-8 that still frames on `\n` under fallback UTF-8.
+                    let mut bytes = vec![0x80u8; 64];
+                    bytes.push(b'\n');
+                    file.write_all(&bytes).unwrap();
+                    file.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
         .await;
 
         assert!(
@@ -3096,17 +3110,25 @@ mod tests {
 
         // Invalid UTF-8, not BOM, and not UTF-16 NUL-parity: forces fallback_charset.
         let path = dir.path().join("fallback.log");
-        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            {
-                let mut file = TestLogSink::create(&path, gzip).unwrap();
-                let mut bytes = vec![0x80u8; 80];
-                bytes.push(b'\n');
-                assert!(std::str::from_utf8(&bytes).is_err());
-                file.write_all(&bytes).unwrap();
-                file.flush().unwrap();
-            }
-            sleep_500_millis().await;
-        })
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    let mut bytes = vec![0x80u8; 80];
+                    bytes.push(b'\n');
+                    assert!(std::str::from_utf8(&bytes).is_err());
+                    file.write_all(&bytes).unwrap();
+                    file.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
         .await;
 
         assert!(
@@ -3146,54 +3168,24 @@ mod tests {
             LogNamespace::Legacy,
             Some(Arc::clone(&counter)),
             async {
-                if gzip {
-                    {
-                        let mut file = TestLogSink::create(&path, gzip).unwrap();
-                        file.flush().unwrap();
-                    }
-                    sleep(Duration::from_millis(200)).await;
-                    assert_eq!(counter.load(Ordering::SeqCst), 0);
+                // Empty file: below min.
+                write_whole(&path, b"", gzip);
+                sleep(Duration::from_millis(200)).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-                    {
-                        let mut file = TestLogSink::create(&path, gzip).unwrap();
-                        file.write_all(&utf16le_bytes("abcdefghij")).unwrap();
-                        file.flush().unwrap();
-                    }
-                    sleep(Duration::from_millis(400)).await;
-                    assert_eq!(
-                        counter.load(Ordering::SeqCst),
-                        0,
-                        "must stay Pending below auto_detect_min_bytes"
-                    );
+                // Sub-min UTF-16 (a few code units, no newline): still Pending.
+                write_whole(&path, &utf16le_bytes("abcdefghij"), gzip);
+                sleep(Duration::from_millis(400)).await;
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    0,
+                    "must stay Pending below auto_detect_min_bytes"
+                );
 
-                    let mut payload = utf16le_bytes("abcdefghij");
-                    payload.extend(utf16le_bytes(&format!("{}\n", "k".repeat(40))));
-                    {
-                        let mut file = TestLogSink::create(&path, gzip).unwrap();
-                        file.write_all(&payload).unwrap();
-                        file.flush().unwrap();
-                    }
-                } else {
-                    let mut file = TestLogSink::create(&path, gzip).unwrap();
-                    file.flush().unwrap();
-                    sleep(Duration::from_millis(200)).await;
-                    assert_eq!(counter.load(Ordering::SeqCst), 0);
-
-                    // Sub-min UTF-16: enough for a few code units, still Pending.
-                    file.write_all(&utf16le_bytes("abcdefghij")).unwrap();
-                    file.flush().unwrap();
-                    sleep(Duration::from_millis(400)).await;
-                    assert_eq!(
-                        counter.load(Ordering::SeqCst),
-                        0,
-                        "must stay Pending below auto_detect_min_bytes"
-                    );
-
-                    // Cross min and complete a line.
-                    let rest = utf16le_bytes(&format!("{}\n", "k".repeat(40)));
-                    file.write_all(&rest).unwrap();
-                    file.flush().unwrap();
-                }
+                // Cross min and complete a line.
+                let mut payload = utf16le_bytes("abcdefghij");
+                payload.extend(utf16le_bytes(&format!("{}\n", "k".repeat(40))));
+                write_whole(&path, &payload, gzip);
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
             },
         )
@@ -3512,13 +3504,8 @@ mod tests {
         };
 
         let line = format!("{}\n", "y".repeat(4200));
-        if gzip {
-            write_complete_gzip_file(&path, b"stay pending");
-            write_complete_gzip_file(&decoy, line.as_bytes());
-        } else {
-            std::fs::write(&path, b"stay pending").unwrap();
-            std::fs::write(&decoy, &line).unwrap();
-        }
+        write_whole(&path, b"stay pending", gzip);
+        write_whole(&decoy, line.as_bytes(), gzip);
 
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
             sleep(Duration::from_millis(800)).await;
