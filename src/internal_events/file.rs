@@ -530,36 +530,6 @@ mod source {
     }
 
     #[derive(Debug, NamedInternalEvent)]
-    pub struct FileEncodingFallback<'a> {
-        pub file: &'a Path,
-        pub encoding: &'a str,
-        pub include_file_metric_tag: bool,
-    }
-
-    impl InternalEvent for FileEncodingFallback<'_> {
-        fn emit(self) {
-            warn!(
-                message = "File character encoding detection was inconclusive; using fallback charset.",
-                file = %self.file.display(),
-                encoding = %self.encoding,
-            );
-            if self.include_file_metric_tag {
-                counter!(
-                    CounterName::FileEncodingFallbackTotal,
-                    "file" => self.file.to_string_lossy().into_owned(),
-                    "encoding" => self.encoding.to_owned(),
-                )
-            } else {
-                counter!(
-                    CounterName::FileEncodingFallbackTotal,
-                    "encoding" => self.encoding.to_owned(),
-                )
-            }
-            .increment(1);
-        }
-    }
-
-    #[derive(Debug, NamedInternalEvent)]
     pub struct FileCheckpointed {
         pub count: usize,
         pub duration: Duration,
@@ -767,14 +737,6 @@ mod source {
                 file,
                 encoding,
                 ratio,
-                include_file_metric_tag: self.include_file_metric_tag,
-            });
-        }
-
-        fn emit_file_encoding_fallback(&self, file: &Path, encoding: &str) {
-            emit!(FileEncodingFallback {
-                file,
-                encoding,
                 include_file_metric_tag: self.include_file_metric_tag,
             });
         }

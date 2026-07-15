@@ -33,7 +33,7 @@ use crate::{
         DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
         log_schema,
     },
-    encoding_detect::{AutoDetectConfig, DetectOutcome, detect_charset},
+    encoding_detect::{AutoDetectConfig, DetectOutcome, detect_charset, detect_charset_idle_force},
     encoding_transcode::{Decoder, Encoder},
     event::{BatchNotifier, BatchStatus, LogEvent},
     internal_events::{
@@ -425,6 +425,8 @@ impl SourceConfig for FileConfig {
             encoding.validate_and_resolve()?;
         }
 
+        let resolved_encoding = resolve_file_encoding(self)?;
+
         Ok(file_source(
             self,
             data_dir,
@@ -432,6 +434,7 @@ impl SourceConfig for FileConfig {
             cx.out,
             acknowledgements,
             log_namespace,
+            resolved_encoding,
         ))
     }
 
@@ -486,6 +489,49 @@ impl SourceConfig for FileConfig {
     }
 }
 
+/// Resolved line delimiter and encoding mode for `FileServer` (computed once at build).
+pub struct ResolvedFileEncoding {
+    pub line_delimiter: Bytes,
+    pub mode: FileEncodingMode,
+}
+
+fn resolve_file_encoding(config: &FileConfig) -> crate::Result<ResolvedFileEncoding> {
+    let encoding_charset = config.encoding.clone().map(|e| e.charset);
+    match encoding_charset {
+        Some(CharsetMode::Auto) => {
+            let auto = config
+                .encoding
+                .as_ref()
+                .expect("charset auto requires encoding block")
+                .validate_and_resolve()?
+                .expect("auto mode resolves AutoDetectConfig");
+            let detector = std::sync::Arc::new(AutoFileEncodingDetector {
+                auto,
+                line_delimiter: config.line_delimiter.clone(),
+            });
+            Ok(ResolvedFileEncoding {
+                line_delimiter: Bytes::from(config.line_delimiter.clone()),
+                mode: FileEncodingMode::Auto { detector },
+            })
+        }
+        Some(CharsetMode::Explicit(encoding)) => {
+            let delim = Encoder::new(encoding).encode_from_utf8(&config.line_delimiter);
+            Ok(ResolvedFileEncoding {
+                line_delimiter: delim,
+                mode: FileEncodingMode::Fixed {
+                    encoding_name: Some(encoding.name()),
+                },
+            })
+        }
+        None => Ok(ResolvedFileEncoding {
+            line_delimiter: Bytes::from(config.line_delimiter.clone()),
+            mode: FileEncodingMode::Fixed {
+                encoding_name: None,
+            },
+        }),
+    }
+}
+
 pub fn file_source(
     config: &FileConfig,
     data_dir: PathBuf,
@@ -493,6 +539,7 @@ pub fn file_source(
     mut out: SourceSender,
     acknowledgements: bool,
     log_namespace: LogNamespace,
+    resolved_encoding: ResolvedFileEncoding,
 ) -> super::Source {
     // the include option must be specified but also must contain at least one entry.
     if config.include.is_empty() {
@@ -528,43 +575,10 @@ pub fn file_source(
     )
     .expect("invalid glob patterns");
 
-    let encoding_charset = config.encoding.clone().map(|e| e.charset);
-
-    // Resolve encoding mode: fixed charset (optional) or per-file auto-detection.
-    let (line_delimiter_as_bytes, encoding_mode) = match encoding_charset {
-        Some(CharsetMode::Auto) => {
-            let auto = config
-                .encoding
-                .as_ref()
-                .expect("charset auto requires encoding block")
-                .validate_and_resolve()
-                .expect("encoding validated in build")
-                .expect("auto mode resolves AutoDetectConfig");
-            let detector = std::sync::Arc::new(AutoFileEncodingDetector {
-                auto,
-                line_delimiter: config.line_delimiter.clone(),
-            });
-            (
-                Bytes::from(config.line_delimiter.clone()),
-                FileEncodingMode::Auto { detector },
-            )
-        }
-        Some(CharsetMode::Explicit(encoding)) => {
-            let delim = Encoder::new(encoding).encode_from_utf8(&config.line_delimiter);
-            (
-                delim,
-                FileEncodingMode::Fixed {
-                    encoding_name: Some(encoding.name()),
-                },
-            )
-        }
-        None => (
-            Bytes::from(config.line_delimiter.clone()),
-            FileEncodingMode::Fixed {
-                encoding_name: None,
-            },
-        ),
-    };
+    let ResolvedFileEncoding {
+        line_delimiter: line_delimiter_as_bytes,
+        mode: encoding_mode,
+    } = resolved_encoding;
 
     let checkpointer = Checkpointer::new(&data_dir);
     let strategy = config.fingerprint.clone().into();
@@ -816,14 +830,39 @@ impl FileEncodingDetector for AutoFileEncodingDetector {
         self.auto.max_bytes
     }
 
-    fn detect(&self, sniff: &[u8]) -> EncodingDetectOutcome {
-        match detect_charset(sniff, &self.auto) {
+    fn idle_timeout_secs(&self) -> u64 {
+        self.auto.idle_timeout_secs
+    }
+
+    fn detect(&self, sniff: &[u8], waive_min: bool) -> EncodingDetectOutcome {
+        let outcome = if waive_min {
+            detect_charset_idle_force(sniff, &self.auto)
+        } else {
+            detect_charset(sniff, &self.auto)
+        };
+        match outcome {
             DetectOutcome::Pending => EncodingDetectOutcome::Pending,
-            DetectOutcome::Decided { encoding, via } => EncodingDetectOutcome::Decided {
-                encoding_name: encoding.name(),
-                via: via.as_str(),
-                line_delimiter: Encoder::new(encoding).encode_from_utf8(&self.line_delimiter),
-            },
+            DetectOutcome::Decided { encoding, via } => {
+                let bom_skip_bytes = encoding_rs::Encoding::for_bom(sniff)
+                    .filter(|(enc, _)| *enc == encoding_rs::UTF_8)
+                    .map(|(_, len)| len as u16)
+                    .unwrap_or(0);
+                let zero_copy_utf8 = encoding == encoding_rs::UTF_8;
+                EncodingDetectOutcome::Decided {
+                    encoding_name: if zero_copy_utf8 {
+                        None
+                    } else {
+                        Some(encoding.name())
+                    },
+                    via: via.as_str(),
+                    line_delimiter: if zero_copy_utf8 {
+                        Bytes::from(self.line_delimiter.clone())
+                    } else {
+                        Encoder::new(encoding).encode_from_utf8(&self.line_delimiter)
+                    },
+                    bom_skip_bytes: if zero_copy_utf8 { bom_skip_bytes } else { 0 },
+                }
+            }
             DetectOutcome::Rejected {
                 encoding,
                 via,
@@ -914,7 +953,7 @@ mod tests {
         collections::HashSet,
         fs::{self, File},
         future::Future,
-        io::{Seek, Write},
+        io::{BufWriter, Seek, Write},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -922,6 +961,7 @@ mod tests {
     };
 
     use encoding_rs::UTF_16LE;
+    use flate2::{Compression, write::GzEncoder};
     use indoc::indoc;
     use similar_asserts::assert_eq;
     use tempfile::tempdir;
@@ -2562,8 +2602,89 @@ mod tests {
         s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_mixed_glob() {
+    enum TestLogSinkInner {
+        Plain(File),
+        Gzip(GzEncoder<BufWriter<File>>),
+        Finished,
+    }
+
+    struct TestLogSink {
+        inner: TestLogSinkInner,
+    }
+
+    impl Write for TestLogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match &mut self.inner {
+                TestLogSinkInner::Plain(file) => file.write(buf),
+                TestLogSinkInner::Gzip(encoder) => encoder.write(buf),
+                TestLogSinkInner::Finished => {
+                    Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "gzip stream finished"))
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            match &mut self.inner {
+                TestLogSinkInner::Plain(file) => file.flush(),
+                TestLogSinkInner::Gzip(encoder) => {
+                    encoder.flush()?;
+                    encoder.get_mut().flush()?;
+                    encoder.get_mut().get_mut().sync_all()?;
+                    Ok(())
+                }
+                TestLogSinkInner::Finished => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for TestLogSink {
+        fn drop(&mut self) {
+            if let TestLogSinkInner::Gzip(encoder) =
+                std::mem::replace(&mut self.inner, TestLogSinkInner::Finished)
+            {
+                let _ = encoder.finish();
+            }
+        }
+    }
+
+    impl TestLogSink {
+        fn create(path: &std::path::Path, gzip: bool) -> std::io::Result<Self> {
+            if gzip {
+                let file = File::create(path)?;
+                let encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+                Ok(Self {
+                    inner: TestLogSinkInner::Gzip(encoder),
+                })
+            } else {
+                Ok(Self {
+                    inner: TestLogSinkInner::Plain(File::create(path)?),
+                })
+            }
+        }
+    }
+
+    fn write_complete_gzip_file(path: &std::path::Path, data: &[u8]) {
+        let file = File::create(path).unwrap();
+        let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap();
+    }
+
+    macro_rules! encoding_auto_plain_and_gzip {
+        ($plain:ident, $gzip:ident, $impl_fn:ident) => {
+            #[tokio::test]
+            async fn $plain() {
+                $impl_fn(false).await;
+            }
+
+            #[tokio::test]
+            async fn $gzip() {
+                $impl_fn(true).await;
+            }
+        };
+    }
+
+    async fn encoding_auto_mixed_glob_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
@@ -2573,6 +2694,7 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
@@ -2580,16 +2702,20 @@ mod tests {
         let utf8_path = dir.path().join("utf8.log");
         let utf16_path = dir.path().join("utf16.log");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            let mut utf8 = File::create(&utf8_path).unwrap();
-            // Meet min_bytes with UTF-8 content.
-            let line = format!("{}\n", "u".repeat(64));
-            write!(&mut utf8, "{line}").unwrap();
-            utf8.flush().unwrap();
+            {
+                let mut utf8 = TestLogSink::create(&utf8_path, gzip).unwrap();
+                // Meet min_bytes with UTF-8 content.
+                let line = format!("{}\n", "u".repeat(64));
+                write!(&mut utf8, "{line}").unwrap();
+                utf8.flush().unwrap();
+            }
 
-            let mut utf16 = File::create(&utf16_path).unwrap();
-            let payload = utf16le_bytes(&format!("{}\n", "v".repeat(64)));
-            utf16.write_all(&payload).unwrap();
-            utf16.flush().unwrap();
+            {
+                let mut utf16 = TestLogSink::create(&utf16_path, gzip).unwrap();
+                let payload = utf16le_bytes(&format!("{}\n", "v".repeat(64)));
+                utf16.write_all(&payload).unwrap();
+                utf16.flush().unwrap();
+            }
 
             sleep_500_millis().await;
         })
@@ -2610,8 +2736,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_rotation_redetect() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_mixed_glob,
+        test_encoding_auto_mixed_glob_gzip,
+        encoding_auto_mixed_glob_impl
+    );
+
+    async fn encoding_auto_rotation_redetect_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("app.log")],
@@ -2621,6 +2752,7 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
@@ -2628,19 +2760,22 @@ mod tests {
         let path = dir.path().join("app.log");
         let rotated = dir.path().join("app.log.1");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            let mut file = File::create(&path).unwrap();
-            let first = format!("{}\n", "a".repeat(64));
-            write!(&mut file, "{first}").unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                let first = format!("{}\n", "a".repeat(64));
+                write!(&mut file, "{first}").unwrap();
+                file.flush().unwrap();
+            }
             sleep_500_millis().await;
 
             // Rotate: move old file aside, create new file with different encoding.
-            drop(file);
             std::fs::rename(&path, &rotated).unwrap();
-            let mut file = File::create(&path).unwrap();
-            let payload = utf16le_bytes(&format!("{}\n", "b".repeat(64)));
-            file.write_all(&payload).unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                let payload = utf16le_bytes(&format!("{}\n", "b".repeat(64)));
+                file.write_all(&payload).unwrap();
+                file.flush().unwrap();
+            }
             sleep(Duration::from_millis(800)).await;
         })
         .await;
@@ -2656,8 +2791,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_empty_grow_utf16() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_rotation_redetect,
+        test_encoding_auto_rotation_redetect_gzip,
+        encoding_auto_rotation_redetect_impl
+    );
+
+    async fn encoding_auto_empty_grow_utf16_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
@@ -2667,6 +2807,7 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
@@ -2680,14 +2821,30 @@ mod tests {
             LogNamespace::Legacy,
             Some(Arc::clone(&counter)),
             async {
-                let mut file = File::create(&path).unwrap();
-                file.flush().unwrap();
-                sleep(Duration::from_millis(300)).await;
-                assert_eq!(counter.load(Ordering::SeqCst), 0);
+                if gzip {
+                    {
+                        let mut file = TestLogSink::create(&path, gzip).unwrap();
+                        file.flush().unwrap();
+                    }
+                    sleep(Duration::from_millis(300)).await;
+                    assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-                let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
-                file.write_all(&payload).unwrap();
-                file.flush().unwrap();
+                    let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
+                    {
+                        let mut file = TestLogSink::create(&path, gzip).unwrap();
+                        file.write_all(&payload).unwrap();
+                        file.flush().unwrap();
+                    }
+                } else {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    file.flush().unwrap();
+                    sleep(Duration::from_millis(300)).await;
+                    assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+                    let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
+                    file.write_all(&payload).unwrap();
+                    file.flush().unwrap();
+                }
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
             },
         )
@@ -2699,8 +2856,13 @@ mod tests {
         assert!(!received[0].contains('\0'));
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_binary_rejected() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_empty_grow_utf16,
+        test_encoding_auto_empty_grow_utf16_gzip,
+        encoding_auto_empty_grow_utf16_impl
+    );
+
+    async fn encoding_auto_binary_rejected_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
@@ -2710,6 +2872,7 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
@@ -2717,18 +2880,22 @@ mod tests {
         let bin_path = dir.path().join("bin.dat");
         let good_path = dir.path().join("good.log");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            let mut good = File::create(&good_path).unwrap();
-            let line = format!("{}\n", "ok".repeat(32));
-            write!(&mut good, "{line}").unwrap();
-            good.flush().unwrap();
-
-            let mut file = File::create(&bin_path).unwrap();
-            let mut bytes = vec![0u8; 256];
-            for (i, b) in bytes.iter_mut().enumerate() {
-                *b = (i as u8).wrapping_mul(37).wrapping_add(0x80);
+            {
+                let mut good = TestLogSink::create(&good_path, gzip).unwrap();
+                let line = format!("{}\n", "ok".repeat(32));
+                write!(&mut good, "{line}").unwrap();
+                good.flush().unwrap();
             }
-            file.write_all(&bytes).unwrap();
-            file.flush().unwrap();
+
+            {
+                let mut file = TestLogSink::create(&bin_path, gzip).unwrap();
+                let mut bytes = vec![0u8; 256];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(37).wrapping_add(0x80);
+                }
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
             sleep_500_millis().await;
         })
         .await;
@@ -2744,8 +2911,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_ratio_zero_allows_binary() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_binary_rejected,
+        test_encoding_auto_binary_rejected_gzip,
+        encoding_auto_binary_rejected_impl
+    );
+
+    async fn encoding_auto_ratio_zero_allows_binary_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
@@ -2755,18 +2927,21 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.0),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
 
         let path = dir.path().join("bin.dat");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            let mut file = File::create(&path).unwrap();
-            // Invalid UTF-8 that still frames on `\n` under fallback UTF-8.
-            let mut bytes = vec![0x80u8; 64];
-            bytes.push(b'\n');
-            file.write_all(&bytes).unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                // Invalid UTF-8 that still frames on `\n` under fallback UTF-8.
+                let mut bytes = vec![0x80u8; 64];
+                bytes.push(b'\n');
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
             sleep_500_millis().await;
         })
         .await;
@@ -2777,8 +2952,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_bom_stripped_from_event() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_ratio_zero_allows_binary,
+        test_encoding_auto_ratio_zero_allows_binary_gzip,
+        encoding_auto_ratio_zero_allows_binary_impl
+    );
+
+    async fn encoding_auto_bom_stripped_from_event_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
@@ -2788,16 +2968,19 @@ mod tests {
                 auto_detect_min_bytes: Some(128),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
 
         let path = dir.path().join("bom.log");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            let mut file = File::create(&path).unwrap();
-            file.write_all(&[0xef, 0xbb, 0xbf]).unwrap();
-            writeln!(&mut file, "hello bom").unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                file.write_all(&[0xef, 0xbb, 0xbf]).unwrap();
+                writeln!(&mut file, "hello bom").unwrap();
+                file.flush().unwrap();
+            }
             sleep_500_millis().await;
         })
         .await;
@@ -2807,6 +2990,12 @@ mod tests {
         assert!(!received[0].starts_with('\u{feff}'));
         assert!(!received[0].as_bytes().starts_with(&[0xef, 0xbb, 0xbf]));
     }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_bom_stripped_from_event,
+        test_encoding_auto_bom_stripped_from_event_gzip,
+        encoding_auto_bom_stripped_from_event_impl
+    );
 
     #[tokio::test]
     async fn test_encoding_auto_resume_mid_file() {
@@ -2823,6 +3012,7 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             data_dir: Some(data_dir.clone()),
             glob_minimum_cooldown_ms: Duration::from_millis(100),
@@ -2893,8 +3083,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_fallback_charset() {
+    async fn encoding_auto_fallback_charset_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
@@ -2907,6 +3096,7 @@ mod tests {
                 auto_detect_max_bytes: Some(2048),
                 // Disable reject so inconclusive windows still ingest via fallback.
                 max_replacement_ratio: Some(0.0),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
@@ -2914,12 +3104,14 @@ mod tests {
         // Invalid UTF-8, not BOM, and not UTF-16 NUL-parity: forces fallback_charset.
         let path = dir.path().join("fallback.log");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            let mut file = File::create(&path).unwrap();
-            let mut bytes = vec![0x80u8; 80];
-            bytes.push(b'\n');
-            assert!(std::str::from_utf8(&bytes).is_err());
-            file.write_all(&bytes).unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                let mut bytes = vec![0x80u8; 80];
+                bytes.push(b'\n');
+                assert!(std::str::from_utf8(&bytes).is_err());
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
             sleep_500_millis().await;
         })
         .await;
@@ -2930,8 +3122,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_pending_until_min_then_emit() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_fallback_charset,
+        test_encoding_auto_fallback_charset_gzip,
+        encoding_auto_fallback_charset_impl
+    );
+
+    async fn encoding_auto_pending_until_min_then_emit_impl(gzip: bool) {
         // Lifecycle: stay Pending across sub-min appends; only emit after size crosses min.
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
@@ -2942,6 +3139,7 @@ mod tests {
                 auto_detect_min_bytes: Some(64),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
@@ -2955,25 +3153,54 @@ mod tests {
             LogNamespace::Legacy,
             Some(Arc::clone(&counter)),
             async {
-                let mut file = File::create(&path).unwrap();
-                file.flush().unwrap();
-                sleep(Duration::from_millis(200)).await;
-                assert_eq!(counter.load(Ordering::SeqCst), 0);
+                if gzip {
+                    {
+                        let mut file = TestLogSink::create(&path, gzip).unwrap();
+                        file.flush().unwrap();
+                    }
+                    sleep(Duration::from_millis(200)).await;
+                    assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-                // Sub-min UTF-16: enough for a few code units, still Pending.
-                file.write_all(&utf16le_bytes("abcdefghij")).unwrap();
-                file.flush().unwrap();
-                sleep(Duration::from_millis(400)).await;
-                assert_eq!(
-                    counter.load(Ordering::SeqCst),
-                    0,
-                    "must stay Pending below auto_detect_min_bytes"
-                );
+                    {
+                        let mut file = TestLogSink::create(&path, gzip).unwrap();
+                        file.write_all(&utf16le_bytes("abcdefghij")).unwrap();
+                        file.flush().unwrap();
+                    }
+                    sleep(Duration::from_millis(400)).await;
+                    assert_eq!(
+                        counter.load(Ordering::SeqCst),
+                        0,
+                        "must stay Pending below auto_detect_min_bytes"
+                    );
 
-                // Cross min and complete a line.
-                let rest = utf16le_bytes(&format!("{}\n", "k".repeat(40)));
-                file.write_all(&rest).unwrap();
-                file.flush().unwrap();
+                    let mut payload = utf16le_bytes("abcdefghij");
+                    payload.extend(utf16le_bytes(&format!("{}\n", "k".repeat(40))));
+                    {
+                        let mut file = TestLogSink::create(&path, gzip).unwrap();
+                        file.write_all(&payload).unwrap();
+                        file.flush().unwrap();
+                    }
+                } else {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    file.flush().unwrap();
+                    sleep(Duration::from_millis(200)).await;
+                    assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+                    // Sub-min UTF-16: enough for a few code units, still Pending.
+                    file.write_all(&utf16le_bytes("abcdefghij")).unwrap();
+                    file.flush().unwrap();
+                    sleep(Duration::from_millis(400)).await;
+                    assert_eq!(
+                        counter.load(Ordering::SeqCst),
+                        0,
+                        "must stay Pending below auto_detect_min_bytes"
+                    );
+
+                    // Cross min and complete a line.
+                    let rest = utf16le_bytes(&format!("{}\n", "k".repeat(40)));
+                    file.write_all(&rest).unwrap();
+                    file.flush().unwrap();
+                }
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
             },
         )
@@ -2985,8 +3212,13 @@ mod tests {
         assert!(!received[0].contains('\0'));
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_ratio_under_threshold_allows() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_pending_until_min_then_emit,
+        test_encoding_auto_pending_until_min_then_emit_gzip,
+        encoding_auto_pending_until_min_then_emit_impl
+    );
+
+    async fn encoding_auto_ratio_under_threshold_allows_impl(gzip: bool) {
         // Sparse invalid UTF-8 → fallback decode with some U+FFFD, ratio well under 0.33.
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
@@ -2997,19 +3229,22 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
             ..test_default_file_config(&dir)
         };
 
         let path = dir.path().join("sparse_bad.log");
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            let mut file = File::create(&path).unwrap();
-            let mut bytes = vec![b'a'; 90];
-            bytes.extend(std::iter::repeat(0x80u8).take(10));
-            bytes.push(b'\n');
-            assert!(std::str::from_utf8(&bytes).is_err());
-            file.write_all(&bytes).unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                let mut bytes = vec![b'a'; 90];
+                bytes.extend(std::iter::repeat(0x80u8).take(10));
+                bytes.push(b'\n');
+                assert!(std::str::from_utf8(&bytes).is_err());
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
             sleep_500_millis().await;
         })
         .await;
@@ -3026,14 +3261,21 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_encoding_auto_ignored_header_bytes_compatible() {
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_ratio_under_threshold_allows,
+        test_encoding_auto_ratio_under_threshold_allows_gzip,
+        encoding_auto_ratio_under_threshold_allows_impl
+    );
+
+    async fn encoding_auto_ignored_header_bytes_compatible_impl(gzip: bool) {
         // Fingerprint skips a fixed header; encoding auto still peeks at offset 0.
         // UTF-16 header + body keeps detection on the UTF-16 ladder for the whole sniff.
         let dir = tempdir().unwrap();
         let path = dir.path().join("hdr.log");
         let data_dir = dir.path().join(".data");
         fs::create_dir_all(&data_dir).unwrap();
+        let phase2_data_dir = dir.path().join(".data_phase2");
+        fs::create_dir_all(&phase2_data_dir).unwrap();
 
         // "HEADER!!!\n" is 10 UTF-16 code units → 20 bytes.
         const HEADER_BYTES: usize = 20;
@@ -3042,7 +3284,7 @@ mod tests {
         assert_eq!(header_a.len(), HEADER_BYTES);
         assert_eq!(header_b.len(), HEADER_BYTES);
 
-        let make_config = |include: Vec<PathBuf>| file::FileConfig {
+        let make_config = |include: Vec<PathBuf>, data_dir: PathBuf| file::FileConfig {
             include,
             encoding: Some(EncodingConfig {
                 charset: CharsetMode::Auto,
@@ -3050,8 +3292,9 @@ mod tests {
                 auto_detect_min_bytes: Some(32),
                 auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
             }),
-            data_dir: Some(data_dir.clone()),
+            data_dir: Some(data_dir),
             glob_minimum_cooldown_ms: Duration::from_millis(100),
             fingerprint: FingerprintConfig::Checksum {
                 ignored_header_bytes: HEADER_BYTES,
@@ -3064,21 +3307,26 @@ mod tests {
         };
 
         {
-            let mut file = File::create(&path).unwrap();
-            file.write_all(&header_a).unwrap();
-            file.write_all(&utf16le_bytes(&format!("{}\n", "p".repeat(40))))
-                .unwrap();
-            file.write_all(&utf16le_bytes(&format!("{}\n", "q".repeat(40))))
-                .unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                file.write_all(&header_a).unwrap();
+                file.write_all(&utf16le_bytes(&format!("{}\n", "p".repeat(40))))
+                    .unwrap();
+                file.write_all(&utf16le_bytes(&format!("{}\n", "q".repeat(40))))
+                    .unwrap();
+                file.flush().unwrap();
+            }
 
+            let counter = Arc::new(AtomicUsize::new(0));
             let received = run_file_source(
-                &make_config(vec![path.clone()]),
+                &make_config(vec![path.clone()], data_dir.clone()),
                 true,
                 Acks,
                 LogNamespace::Legacy,
-                None,
-                sleep_500_millis(),
+                Some(Arc::clone(&counter)),
+                async {
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 3, 5_000).await;
+                },
             )
             .await;
             let msgs = extract_messages_string(received);
@@ -3101,13 +3349,22 @@ mod tests {
                 b.extend_from_slice(&utf16le_bytes(&format!("{}\n", "r".repeat(40))));
                 b
             };
-            let mut file = File::create(&path).unwrap();
-            file.write_all(&header_b).unwrap();
-            file.write_all(&body).unwrap();
-            file.flush().unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                file.write_all(&header_b).unwrap();
+                file.write_all(&body).unwrap();
+                file.flush().unwrap();
+            }
 
             let received = run_file_source(
-                &make_config(vec![path.clone()]),
+                &make_config(
+                    vec![path.clone()],
+                    if gzip {
+                        phase2_data_dir.clone()
+                    } else {
+                        data_dir.clone()
+                    },
+                ),
                 false,
                 NoAcks,
                 LogNamespace::Legacy,
@@ -3116,17 +3373,250 @@ mod tests {
             )
             .await;
             let msgs = extract_messages_string(received);
-            assert!(
-                msgs.iter().any(|m| m.contains('r')),
-                "checkpoint+fingerprint must resume after header change: {msgs:?}"
-            );
-            assert!(
-                msgs.iter()
-                    .all(|m| !m.contains('p') && !m.contains('q') && !m.contains("HEADER")),
-                "must not re-emit checkpointed header/body lines: {msgs:?}"
-            );
+            if gzip {
+                // Gzip checkpoints are not resumed from a non-zero offset; phase two
+                // re-reads the whole member and still auto-detects UTF-16 past the header.
+                assert!(
+                    msgs.iter().any(|m| m.contains('r')),
+                    "gzip rewrite must still emit new body line: {msgs:?}"
+                );
+                assert!(
+                    msgs.iter().any(|m| m.contains("HEADER###")),
+                    "gzip rewrite must still read header as content: {msgs:?}"
+                );
+            } else {
+                assert!(
+                    msgs.iter().any(|m| m.contains('r')),
+                    "checkpoint+fingerprint must resume after header change: {msgs:?}"
+                );
+                assert!(
+                    msgs.iter()
+                        .all(|m| !m.contains('p') && !m.contains('q') && !m.contains("HEADER")),
+                    "must not re-emit checkpointed header/body lines: {msgs:?}"
+                );
+            }
             assert!(msgs.iter().all(|m| !m.contains('\0')));
         }
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_ignored_header_bytes_compatible,
+        test_encoding_auto_ignored_header_bytes_compatible_gzip,
+        encoding_auto_ignored_header_bytes_compatible_impl
+    );
+
+    async fn encoding_auto_idle_timeout_force_decide_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: Some(0),
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("idle.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                writeln!(&mut file, "small idle-timeout line").unwrap();
+                file.flush().unwrap();
+            }
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains("idle-timeout")),
+            "expected idle-timeout force-decide emit, got {received:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_idle_timeout_force_decide,
+        test_encoding_auto_idle_timeout_force_decide_gzip,
+        encoding_auto_idle_timeout_force_decide_impl
+    );
+
+    async fn encoding_auto_pending_delete_quiet_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: Some(3600),
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("gone.log");
+        let decoy = dir.path().join("ok.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut ok = TestLogSink::create(&decoy, gzip).unwrap();
+                let line = format!("{}\n", "z".repeat(1100));
+                write!(&mut ok, "{line}").unwrap();
+                ok.flush().unwrap();
+            }
+
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                write!(&mut file, "tiny").unwrap();
+                file.flush().unwrap();
+            }
+            sleep(Duration::from_millis(200)).await;
+            std::fs::remove_file(&path).unwrap();
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('z')),
+            "decoy file must emit for compliance: {received:?}"
+        );
+        assert!(
+            !received.iter().any(|m| m.contains("tiny")),
+            "deleted Pending file must not emit lines: {received:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_pending_delete_quiet,
+        test_encoding_auto_pending_delete_quiet_gzip,
+        encoding_auto_pending_delete_quiet_impl
+    );
+
+    async fn encoding_auto_remove_after_pending_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pending_remove.log");
+        let decoy = dir.path().join("ok.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(0),
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(4096),
+                auto_detect_max_bytes: Some(8192),
+                max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: Some(3600),
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(50),
+            ..test_default_file_config(&dir)
+        };
+
+        let line = format!("{}\n", "y".repeat(4200));
+        if gzip {
+            write_complete_gzip_file(&path, b"stay pending");
+            write_complete_gzip_file(&decoy, line.as_bytes());
+        } else {
+            std::fs::write(&path, b"stay pending").unwrap();
+            std::fs::write(&decoy, &line).unwrap();
+        }
+
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            sleep(Duration::from_millis(800)).await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('y')),
+            "decoy file must emit for compliance: {received:?}"
+        );
+        assert!(
+            !received.iter().any(|m| m.contains("stay pending")),
+            "Pending file should not emit: {received:?}"
+        );
+        assert!(
+            !path.exists(),
+            "remove_after should delete Pending file"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_remove_after_pending,
+        test_encoding_auto_remove_after_pending_gzip,
+        encoding_auto_remove_after_pending_impl
+    );
+
+    #[tokio::test]
+    async fn test_encoding_auto_gzip_rotation_while_pending() {
+        // Auto-detect on a gzip stream still below min_bytes, then rotate before
+        // deciding; generation two must emit without rejecting during the inode change.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("app.log")],
+            encoding: Some(EncodingConfig {
+                charset: CharsetMode::Auto,
+                fallback_charset: None,
+                auto_detect_min_bytes: Some(64),
+                auto_detect_max_bytes: Some(2048),
+                max_replacement_ratio: Some(0.33),
+                auto_detect_idle_timeout_secs: None,
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("app.log");
+        let rotated = dir.path().join("app.log.1");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut gen1 = TestLogSink::create(&path, true).unwrap();
+                    let sub_min = "x".repeat(20);
+                    gen1.write_all(sub_min.as_bytes()).unwrap();
+                    gen1.flush().unwrap();
+                }
+                sleep(Duration::from_millis(300)).await;
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    0,
+                    "sub-min pending gzip must not emit"
+                );
+
+                std::fs::rename(&path, &rotated).unwrap();
+
+                {
+                    let mut gen2 = TestLogSink::create(&path, true).unwrap();
+                    let payload = utf16le_bytes(&format!("{}\n", "q".repeat(64)));
+                    gen2.write_all(&payload).unwrap();
+                    gen2.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('q')),
+            "rotated generation must emit utf-16 line: {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\u{FFFD}')),
+            "must not reject during rotation: {received:?}"
+        );
+        assert!(counter.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
@@ -3137,6 +3627,7 @@ mod tests {
             auto_detect_min_bytes: None,
             auto_detect_max_bytes: None,
             max_replacement_ratio: None,
+            auto_detect_idle_timeout_secs: None,
         }
         .validate_and_resolve();
         assert!(err.is_err());
@@ -3147,6 +3638,7 @@ mod tests {
             auto_detect_min_bytes: Some(64),
             auto_detect_max_bytes: Some(1024),
             max_replacement_ratio: Some(0.5),
+            auto_detect_idle_timeout_secs: None,
         }
         .validate_and_resolve();
         assert!(ok.is_ok());
@@ -3237,6 +3729,7 @@ mod tests {
             let (trigger_shutdown, shutdown, shutdown_done) = ShutdownSignal::new_wired();
             let data_dir = config.data_dir.clone().unwrap();
             let acks = !matches!(acking_mode, NoAcks);
+            let resolved_encoding = file::resolve_file_encoding(config).expect("test config");
 
             tokio::spawn(file::file_source(
                 config,
@@ -3245,6 +3738,7 @@ mod tests {
                 tx,
                 acks,
                 log_namespace,
+                resolved_encoding,
             ));
 
             let result = if let Some(counter) = event_counter {

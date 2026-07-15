@@ -11,6 +11,9 @@ use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE};
 pub const DEFAULT_AUTO_DETECT_MIN_BYTES: usize = 128;
 pub const DEFAULT_AUTO_DETECT_MAX_BYTES: usize = 2048;
 pub const DEFAULT_MAX_REPLACEMENT_RATIO: f64 = 0.33;
+pub const DEFAULT_AUTO_DETECT_IDLE_TIMEOUT_SECS: u64 = 30;
+/// Soft UTF-16 heuristic confirm: fraction of decode errors allowed in the sniff window.
+pub const UTF16_SOFT_CONFIRM_ERROR_RATIO: f64 = 0.02;
 pub const MIN_AUTO_DETECT_MIN_BYTES: usize = 32;
 pub const MAX_AUTO_DETECT_MAX_BYTES: usize = 65536;
 
@@ -43,6 +46,8 @@ pub struct AutoDetectConfig {
     pub max_bytes: usize,
     /// `0.0` disables the replacement reject gate.
     pub max_replacement_ratio: f64,
+    /// After this many seconds Pending without deciding, run the ladder with `min_bytes` waived.
+    pub idle_timeout_secs: u64,
 }
 
 impl AutoDetectConfig {
@@ -52,12 +57,14 @@ impl AutoDetectConfig {
         min_bytes: usize,
         max_bytes: usize,
         max_replacement_ratio: f64,
+        idle_timeout_secs: u64,
     ) -> Self {
         Self {
             fallback,
             min_bytes,
             max_bytes,
             max_replacement_ratio,
+            idle_timeout_secs,
         }
     }
 }
@@ -86,11 +93,24 @@ pub enum DetectOutcome {
 /// at/above `min_bytes`, UTF-16 heuristic runs before strict UTF-8 (UTF-16LE ASCII is
 /// byte-valid UTF-8). Then the replacement-ratio reject gate may Reject.
 pub fn detect_charset(sniff: &[u8], config: &AutoDetectConfig) -> DetectOutcome {
+    detect_charset_inner(sniff, config, false)
+}
+
+/// Run the detection ladder with `min_bytes` waived (idle-timeout force-decide).
+pub fn detect_charset_idle_force(sniff: &[u8], config: &AutoDetectConfig) -> DetectOutcome {
+    detect_charset_inner(sniff, config, true)
+}
+
+fn detect_charset_inner(
+    sniff: &[u8],
+    config: &AutoDetectConfig,
+    waive_min: bool,
+) -> DetectOutcome {
     if let Some((encoding, _bom_len)) = Encoding::for_bom(sniff) {
         return apply_reject_gate(sniff, encoding, DetectVia::Bom, config);
     }
 
-    if sniff.len() < config.min_bytes {
+    if !waive_min && sniff.len() < config.min_bytes {
         return DetectOutcome::Pending;
     }
 
@@ -100,11 +120,28 @@ pub fn detect_charset(sniff: &[u8], config: &AutoDetectConfig) -> DetectOutcome 
         return apply_reject_gate(window, encoding, DetectVia::Utf16Heuristic, config);
     }
 
-    if std::str::from_utf8(window).is_ok() {
-        return apply_reject_gate(window, UTF_8, DetectVia::Utf8Valid, config);
+    if let Some(utf8_window) = utf8_window_allowing_incomplete_trail(window) {
+        return apply_reject_gate(utf8_window, UTF_8, DetectVia::Utf8Valid, config);
     }
 
     apply_reject_gate(window, config.fallback, DetectVia::Fallback, config)
+}
+
+/// Accept UTF-8 when the only problem is an incomplete trailing code unit (`error_len == None`).
+/// Mid-window malformed bytes must not be trimmed away into a false Utf8Valid claim.
+fn utf8_window_allowing_incomplete_trail(bytes: &[u8]) -> Option<&[u8]> {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Some(bytes),
+        Err(err) if err.error_len().is_none() => {
+            let prefix = &bytes[..err.valid_up_to()];
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix)
+            }
+        }
+        Err(_) => None,
+    }
 }
 
 fn apply_reject_gate(
@@ -190,9 +227,34 @@ fn detect_utf16_nul_parity(bytes: &[u8]) -> Option<&'static Encoding> {
         None
     }?;
 
-    candidate
-        .decode_without_bom_handling_and_without_replacement(window)
-        .map(|_| candidate)
+    if utf16_soft_confirm(window, candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// UTF-16 confirm after NUL-parity: allow a small decode-error ratio (`last = false`).
+fn utf16_soft_confirm(bytes: &[u8], encoding: &'static Encoding) -> bool {
+    decode_error_ratio(bytes, encoding) < UTF16_SOFT_CONFIRM_ERROR_RATIO
+}
+
+/// Fraction of decoded codepoints that are U+FFFD under `encoding` (`last = false`).
+fn decode_error_ratio(sniff: &[u8], encoding: &'static Encoding) -> f64 {
+    if sniff.is_empty() {
+        return 0.0;
+    }
+
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut output = String::with_capacity(sniff.len());
+    let (_result, _read, _had_errors) = decoder.decode_to_string(sniff, &mut output, false);
+
+    let total = output.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let replacements = output.chars().filter(|&c| c == '\u{FFFD}').count();
+    replacements as f64 / total as f64
 }
 
 #[cfg(test)]
@@ -202,7 +264,7 @@ mod tests {
     use super::*;
 
     fn cfg(min: usize, max: usize, ratio: f64, fallback: &'static Encoding) -> AutoDetectConfig {
-        AutoDetectConfig::new(fallback, min, max, ratio)
+        AutoDetectConfig::new(fallback, min, max, ratio, DEFAULT_AUTO_DETECT_IDLE_TIMEOUT_SECS)
     }
 
     fn utf16le_ascii(s: &str) -> Vec<u8> {
@@ -383,5 +445,121 @@ mod tests {
         assert_eq!(MAX_AUTO_DETECT_MAX_BYTES, 65536);
         assert_eq!(DEFAULT_AUTO_DETECT_MIN_BYTES, 128);
         assert_eq!(DEFAULT_AUTO_DETECT_MAX_BYTES, 2048);
+        assert_eq!(DEFAULT_AUTO_DETECT_IDLE_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn utf8_trim_incomplete_trail_accepts_split_multibyte() {
+        // U+20AC euro sign is e2 82 ac in UTF-8; split after 1 and 2 bytes must not trap to fallback.
+        let euro = "€";
+        let full = euro.as_bytes();
+        assert_eq!(full.len(), 3);
+
+        for split_at in 1..3 {
+            let mut sniff = vec![b'x'; 64];
+            sniff.extend_from_slice(&full[..split_at]);
+            assert!(sniff.len() >= 32);
+            let trimmed = utf8_window_allowing_incomplete_trail(&sniff).expect("trim");
+            assert_eq!(trimmed.len(), 64, "split at {split_at}");
+            let outcome = detect_charset(&sniff, &cfg(32, 2048, 0.33, UTF_8));
+            match outcome {
+                DetectOutcome::Decided { encoding, via } => {
+                    assert_eq!(encoding, UTF_8, "split at {split_at}");
+                    assert_eq!(via, DetectVia::Utf8Valid, "split at {split_at}");
+                }
+                other => panic!("expected UTF-8 valid at split {split_at}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_mid_window_malformed_does_not_claim_utf8_valid() {
+        let mut sniff = vec![b'a'; 64];
+        sniff.push(0xff);
+        sniff.extend(b"tail");
+        let outcome = detect_charset(&sniff, &cfg(32, 2048, 0.33, UTF_8));
+        match outcome {
+            DetectOutcome::Decided {
+                encoding,
+                via: DetectVia::Fallback,
+            } => assert_eq!(encoding, UTF_8),
+            other => panic!("expected fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf16_odd_length_even_truncates() {
+        let mut sniff = utf16le_ascii(&"D".repeat(70));
+        sniff.push(0x41);
+        assert!(sniff.len() >= 128);
+        let outcome = detect_charset(&sniff, &cfg(128, 2048, 0.33, UTF_8));
+        match outcome {
+            DetectOutcome::Decided { encoding, via } => {
+                assert_eq!(encoding, UTF_16LE);
+                assert_eq!(via, DetectVia::Utf16Heuristic);
+            }
+            other => panic!("expected UTF-16LE heuristic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf16_soft_confirm_just_under_threshold() {
+        // 200 valid ASCII UTF-16LE code units + 2 lone high surrogates (~1%).
+        let mut sniff = utf16le_ascii(&"E".repeat(200));
+        for _ in 0..2 {
+            sniff.extend([0x00, 0xd8]);
+        }
+        let ratio = decode_error_ratio(&sniff, UTF_16LE);
+        assert!(
+            ratio < UTF16_SOFT_CONFIRM_ERROR_RATIO,
+            "ratio {ratio} should be under threshold"
+        );
+        let outcome = detect_charset(&sniff, &cfg(32, 4096, 0.33, UTF_8));
+        match outcome {
+            DetectOutcome::Decided { encoding, via } => {
+                assert_eq!(encoding, UTF_16LE);
+                assert_eq!(via, DetectVia::Utf16Heuristic);
+            }
+            other => panic!("expected UTF-16LE heuristic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf16_soft_confirm_just_over_threshold_abandons() {
+        // 100 valid ASCII UTF-16LE code units + 3 lone high surrogates (~3% errors).
+        let mut sniff = utf16le_ascii(&"F".repeat(100));
+        for _ in 0..4 {
+            sniff.extend([0x00, 0xd8]); // U+D800 without low surrogate
+        }
+        let ratio = decode_error_ratio(&sniff, UTF_16LE);
+        assert!(
+            ratio >= UTF16_SOFT_CONFIRM_ERROR_RATIO,
+            "ratio {ratio} should meet or exceed threshold"
+        );
+        let outcome = detect_charset(&sniff, &cfg(32, 4096, 0.33, UTF_8));
+        match outcome {
+            DetectOutcome::Decided { encoding, via } => {
+                assert_ne!(via, DetectVia::Utf16Heuristic);
+                assert_eq!(encoding, UTF_8);
+            }
+            other => panic!("expected non-UTF-16 decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn idle_force_decide_waives_min_bytes() {
+        let sniff = b"short but valid utf-8\n";
+        assert!(sniff.len() < 32);
+        assert_eq!(
+            detect_charset(sniff, &cfg(32, 2048, 0.33, UTF_8)),
+            DetectOutcome::Pending
+        );
+        match detect_charset_idle_force(sniff, &cfg(32, 2048, 0.33, UTF_8)) {
+            DetectOutcome::Decided { encoding, via } => {
+                assert_eq!(encoding, UTF_8);
+                assert_eq!(via, DetectVia::Utf8Valid);
+            }
+            other => panic!("expected idle-force UTF-8, got {other:?}"),
+        }
     }
 }

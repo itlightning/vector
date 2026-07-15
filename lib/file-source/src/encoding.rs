@@ -15,9 +15,12 @@ pub enum EncodingDetectOutcome {
     Pending,
     /// Charset chosen; use `encoding_name` and `line_delimiter` from now on.
     Decided {
-        encoding_name: &'static str,
+        /// `None` when bytes are already UTF-8 (zero-copy downstream).
+        encoding_name: Option<&'static str>,
         via: &'static str,
         line_delimiter: Bytes,
+        /// Leading BOM bytes to skip on the held reader when `encoding_name` is `None`.
+        bom_skip_bytes: u16,
     },
     /// Sniff rejected as garbage under the chosen charset.
     Rejected {
@@ -33,8 +36,13 @@ pub trait FileEncodingDetector: Send + Sync {
     /// Maximum bytes to peek from offset 0.
     fn max_peek_bytes(&self) -> usize;
 
+    /// Idle timeout before force-deciding with `min_bytes` waived.
+    fn idle_timeout_secs(&self) -> u64;
+
     /// Run detection on a sniff window that starts at file/stream offset 0.
-    fn detect(&self, sniff: &[u8]) -> EncodingDetectOutcome;
+    ///
+    /// When `waive_min` is true, sub-`min_bytes` windows may still decide (idle timeout).
+    fn detect(&self, sniff: &[u8], waive_min: bool) -> EncodingDetectOutcome;
 }
 
 /// How the file server handles character encoding for framing.
@@ -68,8 +76,11 @@ pub enum FileEncodingState {
     Inactive,
     /// Waiting for enough bytes (or a BOM) to decide.
     Pending,
-    /// Charset chosen; `encoding_name` is an Encoding Standard name.
-    Decided { encoding_name: &'static str },
+    /// Charset chosen; `encoding_name` is an Encoding Standard name when transcoding is required.
+    Decided {
+        encoding_name: Option<&'static str>,
+        bom_skip_bytes: u16,
+    },
     /// Permanently skip this fingerprint after reject gate.
     Rejected,
 }
@@ -77,7 +88,7 @@ pub enum FileEncodingState {
 impl FileEncodingState {
     pub const fn encoding_name(&self) -> Option<&'static str> {
         match self {
-            Self::Decided { encoding_name } => Some(encoding_name),
+            Self::Decided { encoding_name, .. } => *encoding_name,
             _ => None,
         }
     }

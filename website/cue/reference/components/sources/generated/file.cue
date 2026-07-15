@@ -40,6 +40,19 @@ generated: components: sources: file: configuration: {
 		description: "Character set encoding."
 		required:    false
 		type: object: options: {
+			auto_detect_idle_timeout_secs: {
+				description: """
+					Seconds a file may stay Pending (below `auto_detect_min_bytes`) before force-deciding.
+
+					Only valid when `charset` is `auto`. Defaults to 30. Post-timeout decisions use a
+					best-effort sniff window and may be lower confidence than a full `min_bytes` window.
+					"""
+				required: false
+				type: uint: {
+					examples: [30]
+					unit: "seconds"
+				}
+			}
 			auto_detect_max_bytes: {
 				description: """
 					Maximum number of bytes peeked from offset 0 for auto-detection.
@@ -136,7 +149,7 @@ generated: components: sources: file: configuration: {
 		type: string: {
 			default: "file"
 			examples: [
-				"path"
+				"path",
 			]
 		}
 	}
@@ -250,7 +263,7 @@ generated: components: sources: file: configuration: {
 		required:    false
 		type: uint: {
 			examples: [
-				600
+				600,
 			]
 			unit: "seconds"
 		}
@@ -280,7 +293,7 @@ generated: components: sources: file: configuration: {
 		type: string: {
 			default: "\n"
 			examples: [
-				"\r\n"
+				"\r\n",
 			]
 		}
 	}
@@ -390,7 +403,7 @@ generated: components: sources: file: configuration: {
 			"""
 		required: false
 		type: string: examples: [
-			"offset"
+			"offset",
 		]
 	}
 	oldest_first: {
