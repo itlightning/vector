@@ -197,6 +197,7 @@ fn watcher_for_timing() -> FileWatcher {
         encoding_state: crate::FileEncodingState::Inactive,
         encoding_detector: None,
         fixed_encoding_name: None,
+        pending_since: None,
         gzipped: false,
     }
 }

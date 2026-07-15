@@ -27,7 +27,7 @@ use tokio::{
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    encoding::FileEncodingMode,
+    encoding::{FileEncodingMode, FileEncodingState},
     file_watcher::{FileWatcher, RawLineResult},
     paths_provider::PathsProvider,
 };
@@ -286,6 +286,13 @@ where
             let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
                 if !watcher.should_read() {
+                    // Rejected skips read_line; still honor remove_after.
+                    Self::maybe_remove_pending_or_rejected(
+                        watcher,
+                        self.remove_after,
+                        &self.emitter,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -294,6 +301,12 @@ where
 
                 match watcher.ensure_encoding_ready(&self.emitter).await {
                     Ok(false) => {
+                        Self::maybe_remove_pending_or_rejected(
+                            watcher,
+                            self.remove_after,
+                            &self.emitter,
+                        )
+                        .await;
                         stats.record("reading", start.elapsed());
                         continue;
                     }
@@ -351,14 +364,15 @@ where
                     if let Some(grace_period) = self.remove_after
                         && watcher.last_read_success().elapsed() >= grace_period
                     {
-                        // Try to remove
                         match remove_file(&watcher.path).await {
                             Ok(()) => {
                                 self.emitter.emit_file_deleted(&watcher.path);
                                 watcher.set_dead();
                             }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                watcher.set_dead();
+                            }
                             Err(error) => {
-                                // We will try again after some time.
                                 self.emitter.emit_file_delete_error(&watcher.path, error);
                             }
                         }
@@ -446,6 +460,35 @@ where
                 Either::Right((_, future)) => shutdown_data = future,
             }
             stats.record("sleeping", start.elapsed());
+        }
+    }
+
+    async fn maybe_remove_pending_or_rejected(
+        watcher: &mut FileWatcher,
+        remove_after: Option<Duration>,
+        emitter: &E,
+    ) {
+        let Some(grace_period) = remove_after else {
+            return;
+        };
+        if !matches!(
+            watcher.encoding_state(),
+            FileEncodingState::Pending | FileEncodingState::Rejected
+        ) {
+            return;
+        }
+        if watcher.last_read_success().elapsed() < grace_period {
+            return;
+        }
+        match remove_file(&watcher.path).await {
+            Ok(()) => {
+                emitter.emit_file_deleted(&watcher.path);
+                watcher.set_dead();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                watcher.set_dead();
+            }
+            Err(error) => emitter.emit_file_delete_error(&watcher.path, error),
         }
     }
 

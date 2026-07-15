@@ -701,7 +701,5 @@ mod test {
         fn emit_file_encoding_detected(&self, _: &Path, _: &str, _: &str) {}
 
         fn emit_file_encoding_rejected(&self, _: &Path, _: &str, _: f64) {}
-
-        fn emit_file_encoding_fallback(&self, _: &Path, _: &str) {}
     }
 }

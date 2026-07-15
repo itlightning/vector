@@ -9,8 +9,9 @@ use vector_lib::configurable::{
 };
 
 use crate::encoding_detect::{
-    AutoDetectConfig, DEFAULT_AUTO_DETECT_MAX_BYTES, DEFAULT_AUTO_DETECT_MIN_BYTES,
-    DEFAULT_MAX_REPLACEMENT_RATIO, MAX_AUTO_DETECT_MAX_BYTES, MIN_AUTO_DETECT_MIN_BYTES,
+    AutoDetectConfig, DEFAULT_AUTO_DETECT_IDLE_TIMEOUT_SECS, DEFAULT_AUTO_DETECT_MAX_BYTES,
+    DEFAULT_AUTO_DETECT_MIN_BYTES, DEFAULT_MAX_REPLACEMENT_RATIO, MAX_AUTO_DETECT_MAX_BYTES,
+    MIN_AUTO_DETECT_MIN_BYTES,
 };
 
 /// Character set for the file source: an Encoding Standard label, or `auto`.
@@ -156,6 +157,15 @@ pub struct EncodingConfig {
     #[configurable(metadata(docs::examples = 0.33))]
     #[configurable(metadata(docs::examples = 0.0))]
     pub max_replacement_ratio: Option<f64>,
+
+    /// Seconds a file may stay Pending (below `auto_detect_min_bytes`) before force-deciding.
+    ///
+    /// Only valid when `charset` is `auto`. Defaults to 30. Post-timeout decisions use a
+    /// best-effort sniff window and may be lower confidence than a full `min_bytes` window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[configurable(metadata(docs::examples = 30))]
+    pub auto_detect_idle_timeout_secs: Option<u64>,
 }
 
 impl EncodingConfig {
@@ -167,6 +177,7 @@ impl EncodingConfig {
             auto_detect_min_bytes: None,
             auto_detect_max_bytes: None,
             max_replacement_ratio: None,
+            auto_detect_idle_timeout_secs: None,
         }
     }
 
@@ -175,13 +186,14 @@ impl EncodingConfig {
         let auto_only_set = self.fallback_charset.is_some()
             || self.auto_detect_min_bytes.is_some()
             || self.auto_detect_max_bytes.is_some()
-            || self.max_replacement_ratio.is_some();
+            || self.max_replacement_ratio.is_some()
+            || self.auto_detect_idle_timeout_secs.is_some();
 
         match self.charset {
             CharsetMode::Explicit(_) => {
                 if auto_only_set {
                     return Err(
-                        "encoding.fallback_charset, auto_detect_min_bytes, auto_detect_max_bytes, and max_replacement_ratio are only valid when encoding.charset is \"auto\""
+                        "encoding.fallback_charset, auto_detect_min_bytes, auto_detect_max_bytes, max_replacement_ratio, and auto_detect_idle_timeout_secs are only valid when encoding.charset is \"auto\""
                             .into(),
                     );
                 }
@@ -198,6 +210,9 @@ impl EncodingConfig {
                 let max_replacement_ratio = self
                     .max_replacement_ratio
                     .unwrap_or(DEFAULT_MAX_REPLACEMENT_RATIO);
+                let idle_timeout_secs = self
+                    .auto_detect_idle_timeout_secs
+                    .unwrap_or(DEFAULT_AUTO_DETECT_IDLE_TIMEOUT_SECS);
 
                 if min_bytes < MIN_AUTO_DETECT_MIN_BYTES {
                     min_bytes = MIN_AUTO_DETECT_MIN_BYTES;
@@ -223,6 +238,7 @@ impl EncodingConfig {
                     min_bytes,
                     max_bytes,
                     max_replacement_ratio,
+                    idle_timeout_secs,
                 )))
             }
         }
