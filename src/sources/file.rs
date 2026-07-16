@@ -3467,6 +3467,61 @@ mod tests {
         encoding_auto_sanitize_utf8_replaces_invalid_impl
     );
 
+    #[tokio::test]
+    async fn test_encoding_auto_sanitize_utf8_bom_matches_explicit_utf8() {
+        // A UTF-8 BOM file with an invalid byte: `sanitize_utf8` must route it
+        // through the decoder so the BOM is stripped and the invalid byte gets
+        // U+FFFD, identical to what an explicit `charset: utf-8` run produces.
+        const FIXTURE: &[u8] = b"\xEF\xBB\xBFbom line \x80 tail\n";
+
+        async fn run_once(encoding: EncodingConfig) -> Vec<Value> {
+            let dir = tempdir().unwrap();
+            let config = file::FileConfig {
+                include: vec![dir.path().join("*")],
+                encoding: Some(encoding),
+                ..test_default_file_config(&dir)
+            };
+            let path = dir.path().join("bom.log");
+            write_whole(&path, FIXTURE, false);
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let received = run_file_source(
+                &config,
+                false,
+                NoAcks,
+                LogNamespace::Legacy,
+                Some(Arc::clone(&counter)),
+                async {
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                },
+            )
+            .await;
+            extract_messages_value(received)
+        }
+
+        let auto = run_once(EncodingConfig {
+            sanitize_utf8: true,
+            ..EncodingConfig::auto()
+        })
+        .await;
+        let explicit = run_once(EncodingConfig::explicit(encoding_rs::UTF_8)).await;
+
+        assert_eq!(auto.len(), 1, "expected one sanitized line: {auto:?}");
+        assert_eq!(auto, explicit, "auto+sanitize must match explicit utf-8");
+
+        let bytes = auto[0].as_bytes().expect("message must be bytes");
+        let text = std::str::from_utf8(bytes).expect("sanitized line must be valid UTF-8");
+        assert!(
+            !text.starts_with('\u{FEFF}'),
+            "BOM must be stripped: {text:?}"
+        );
+        assert!(
+            text.contains('\u{FFFD}'),
+            "invalid byte must be replaced: {text:?}"
+        );
+        assert!(text.starts_with("bom line ") && text.ends_with(" tail"));
+    }
+
     async fn encoding_auto_ignored_header_bytes_compatible_impl(gzip: bool) {
         // Fingerprint skips a fixed header; encoding auto still peeks at offset 0.
         // UTF-16 header + body keeps detection on the UTF-16 ladder for the whole sniff.
