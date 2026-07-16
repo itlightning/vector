@@ -299,6 +299,11 @@ where
                 let start = time::Instant::now();
                 let mut bytes_read: usize = 0;
 
+                // Reap parity invariant: a file that never leaves Pending (or is
+                // Rejected) never reaches the regular read path, so every branch
+                // that skips reading must still run the remove_after check.
+                // Otherwise enabling auto-detection would change which files get
+                // cleaned up compared to a fixed charset.
                 match watcher.ensure_encoding_ready(&self.emitter).await {
                     Ok(false) => {
                         Self::maybe_remove_pending_or_rejected(
