@@ -475,6 +475,62 @@ mod tests {
     }
 
     #[test]
+    fn utf8_trim_incomplete_trail_accepts_split_four_byte() {
+        // U+1F600 is f0 9f 98 80 in UTF-8; splits after 1..3 bytes must trim,
+        // not fall through to the fallback charset.
+        let emoji = "😀".as_bytes();
+        assert_eq!(emoji.len(), 4);
+
+        for split_at in 1..4 {
+            let mut sniff = vec![b'x'; 64];
+            sniff.extend_from_slice(&emoji[..split_at]);
+            let outcome = detect_charset(&sniff, &cfg(32, 2048, 0.33, UTF_8));
+            match outcome {
+                DetectOutcome::Decided { encoding, via } => {
+                    assert_eq!(encoding, UTF_8, "split at {split_at}");
+                    assert_eq!(via, DetectVia::Utf8Valid, "split at {split_at}");
+                }
+                other => panic!("expected UTF-8 valid at split {split_at}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_four_byte_split_by_max_bytes_clip() {
+        // The max_bytes clip lands mid-way through a 4-byte sequence; the trimmed
+        // window must still be accepted as UTF-8.
+        let mut sniff = vec![b'x'; 64];
+        sniff.extend_from_slice("😀".as_bytes());
+        let outcome = detect_charset(&sniff, &cfg(32, 66, 0.33, UTF_8));
+        match outcome {
+            DetectOutcome::Decided { encoding, via } => {
+                assert_eq!(encoding, UTF_8);
+                assert_eq!(via, DetectVia::Utf8Valid);
+            }
+            other => panic!("expected UTF-8 valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf16_non_bmp_pair_split_at_window_end_still_detects() {
+        // UTF-16LE ASCII payload followed by a surrogate pair; the max_bytes clip
+        // ends the window after the high surrogate. The incomplete trailing unit
+        // must not count as a decode error, so the heuristic still confirms.
+        let mut sniff = utf16le_ascii(&"G".repeat(100));
+        sniff.extend(0xD83Du16.to_le_bytes()); // high surrogate of U+1F600
+        sniff.extend(0xDE00u16.to_le_bytes()); // low surrogate
+        assert_eq!(sniff.len(), 204);
+        let outcome = detect_charset(&sniff, &cfg(32, 202, 0.33, UTF_8));
+        match outcome {
+            DetectOutcome::Decided { encoding, via } => {
+                assert_eq!(encoding, UTF_16LE);
+                assert_eq!(via, DetectVia::Utf16Heuristic);
+            }
+            other => panic!("expected UTF-16LE heuristic, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn utf8_mid_window_malformed_does_not_claim_utf8_valid() {
         let mut sniff = vec![b'a'; 64];
         sniff.push(0xff);

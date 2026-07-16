@@ -2854,6 +2854,90 @@ mod tests {
         encoding_auto_rotation_redetect_impl
     );
 
+    // Rename rotation where the rotated name still matches the glob: the Pending
+    // watcher first sees an inode mismatch at its old path (stays Pending, never
+    // Rejected), then the glob pass remaps it to the rotated path where it
+    // decides and drains its content.
+    #[tokio::test]
+    async fn test_encoding_auto_rotation_in_glob_remaps_and_drains() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(64),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("app.log");
+        let rotated = dir.path().join("app.log.rotated");
+        // Staged outside the glob (subdirectories are not matched).
+        let staging = dir.path().join(".data").join("gen2.log");
+        let decoy = dir.path().join("decoy.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // Sub-min but newline-terminated: fingerprints, stays Pending.
+                std::fs::write(&path, b"tiny gen one\n").unwrap();
+                {
+                    let mut decoy_file = File::create(&decoy).unwrap();
+                    writeln!(&mut decoy_file, "{}", "d".repeat(70)).unwrap();
+                }
+                // Causal checkpoint: decoy emission proves a full server pass ran
+                // with generation one still Pending.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+                // Rotate without ever leaving the path absent: hard-link the old
+                // inode to the rotated name, then atomically replace the path with
+                // generation two. The old watcher can therefore only observe a
+                // same-path inode mismatch (never NotFound) until the glob pass
+                // remaps it to the rotated name.
+                std::fs::hard_link(&path, &rotated).unwrap();
+                std::fs::write(&staging, format!("{}\n", "r".repeat(70))).unwrap();
+                std::fs::rename(&staging, &path).unwrap();
+
+                // Grow the rotated file past min_bytes with a second complete
+                // line; the unchanged first line keeps the fingerprint matching
+                // the old watcher.
+                let mut tail = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&rotated)
+                    .unwrap();
+                writeln!(&mut tail, "{}", "k".repeat(70)).unwrap();
+                tail.flush().unwrap();
+
+                // decoy + generation two + both rotated lines.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 4, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m == "tiny gen one"),
+            "rotated file must drain its pre-rotation line after remap: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('k')),
+            "rotated file must drain its post-rotation line: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('r')),
+            "generation two must emit through its own watcher: {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\u{FFFD}')),
+            "nothing may be rejected or mangled during rotation: {received:?}"
+        );
+    }
+
     async fn encoding_auto_empty_grow_utf16_impl(gzip: bool) {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
@@ -3029,6 +3113,50 @@ mod tests {
         test_encoding_auto_bom_stripped_from_event,
         test_encoding_auto_bom_stripped_from_event_gzip,
         encoding_auto_bom_stripped_from_event_impl
+    );
+
+    async fn encoding_auto_utf16le_bom_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                // High min proves the BOM decides regardless of window size.
+                auto_detect_min_bytes: Some(1024),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("bom16.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    file.write_all(&[0xff, 0xfe]).unwrap();
+                    file.write_all(&utf16le_bytes("hello utf sixteen\n")).unwrap();
+                    file.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received, vec!["hello utf sixteen".to_string()]);
+        assert!(!received[0].contains('\u{feff}'));
+        assert!(!received[0].contains('\0'));
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_utf16le_bom,
+        test_encoding_auto_utf16le_bom_gzip,
+        encoding_auto_utf16le_bom_impl
     );
 
     #[tokio::test]
@@ -3609,6 +3737,115 @@ mod tests {
         test_encoding_auto_remove_after_pending,
         test_encoding_auto_remove_after_pending_gzip,
         encoding_auto_remove_after_pending_impl
+    );
+
+    async fn encoding_auto_remove_after_rejected_impl(gzip: bool) {
+        // Rejected files skip reading but must still honor remove_after.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bin.dat");
+        let decoy = dir.path().join("ok.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(0),
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(50),
+            ..test_default_file_config(&dir)
+        };
+
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut good = TestLogSink::create(&decoy, gzip).unwrap();
+                writeln!(&mut good, "{}", "ok".repeat(32)).unwrap();
+                good.flush().unwrap();
+            }
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                // High-entropy bytes: invalid UTF-8, not UTF-16-looking, rejected
+                // by the replacement-ratio gate. The pattern contains a 0x0A so
+                // the file fingerprints and gets a watcher.
+                let mut bytes = vec![0u8; 256];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(37).wrapping_add(0x80);
+                }
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
+            for _ in 0..50 {
+                if !path.exists() {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().all(|m| m.contains("ok")),
+            "only the utf-8 companion file should emit: {received:?}"
+        );
+        assert!(!path.exists(), "remove_after must reap Rejected files");
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_remove_after_rejected,
+        test_encoding_auto_remove_after_rejected_gzip,
+        encoding_auto_remove_after_rejected_impl
+    );
+
+    async fn remove_after_fixed_charset_ships_then_removes_impl(gzip: bool) {
+        // Reap-parity sibling: the same short file that stays quiet under auto
+        // detection (Pending) ships its content under a fixed charset and is then
+        // removed after the grace period.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pending_remove.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(1),
+            encoding: Some(EncodingConfig::explicit(encoding_rs::UTF_8)),
+            glob_minimum_cooldown_ms: Duration::from_millis(50),
+            ..test_default_file_config(&dir)
+        };
+
+        write_whole(&path, b"stay pending\n", gzip);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                for _ in 0..100 {
+                    if !path.exists() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains("stay pending")),
+            "fixed charset must read the content before removal: {received:?}"
+        );
+        assert!(
+            !path.exists(),
+            "remove_after must remove the file after it shipped"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_remove_after_fixed_charset_ships_then_removes,
+        test_remove_after_fixed_charset_ships_then_removes_gzip,
+        remove_after_fixed_charset_ships_then_removes_impl
     );
 
     // A sub-min Pending file whose mtime predates the `remove_after` grace period
