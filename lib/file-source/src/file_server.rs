@@ -493,6 +493,14 @@ where
         ) {
             return;
         }
+        // A Pending file has not yet had its idle-timeout force-decide chance;
+        // removing it now would destroy data a fixed charset would have shipped.
+        // Once the idle decision runs, the normal grace period applies.
+        if matches!(watcher.encoding_state(), FileEncodingState::Pending)
+            && !watcher.pending_idle_elapsed()
+        {
+            return;
+        }
         // `last_read_success` is seeded from the file's mtime, which can predate
         // watching by more than the grace period. Anchoring the grace on watch
         // start guarantees a Pending file gets its idle-timeout force-decide (and
@@ -515,6 +523,9 @@ where
             // Could not verify (permissions etc.); retry on a later pass.
             Err(_) => return,
         }
+        // Unavoidable window between the inode check above and this remove: a
+        // rotation in that gap still deletes the successor (no portable
+        // delete-by-handle).
         match remove_file(&watcher.path).await {
             Ok(()) => {
                 emitter.emit_file_deleted(&watcher.path);

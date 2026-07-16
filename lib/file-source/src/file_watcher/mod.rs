@@ -290,6 +290,18 @@ impl FileWatcher {
         self.file_position
     }
 
+    /// Whether a Pending file's idle-timeout window has elapsed, meaning the
+    /// detector's force-decide has had its chance to run. `false` while the
+    /// idle decision is still outstanding (or when no Pending window exists).
+    pub fn pending_idle_elapsed(&self) -> bool {
+        match (self.pending_since, &self.encoding_detector) {
+            (Some(since), Some(detector)) => {
+                since.elapsed() >= Duration::from_secs(detector.idle_timeout_secs())
+            }
+            _ => false,
+        }
+    }
+
     /// Whether the path still refers to the watched device+inode.
     ///
     /// `Ok(false)` means another file (for example a rotation successor) now
@@ -374,9 +386,7 @@ impl FileWatcher {
             }
         };
 
-        let waive_min = self.pending_since.is_some_and(|since| {
-            since.elapsed() >= Duration::from_secs(detector.idle_timeout_secs())
-        });
+        let waive_min = self.pending_idle_elapsed();
 
         match detector.detect(&peek, waive_min) {
             EncodingDetectOutcome::Pending => {

@@ -3654,32 +3654,47 @@ mod tests {
 
         let path = dir.path().join("gone.log");
         let decoy = dir.path().join("ok.log");
-        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            {
-                let mut ok = TestLogSink::create(&decoy, gzip).unwrap();
-                let line = format!("{}\n", "z".repeat(1100));
-                write!(&mut ok, "{line}").unwrap();
-                ok.flush().unwrap();
-            }
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    // Newline-terminated so the checksum fingerprinter creates a
+                    // watcher; without one the file never enters the Pending state
+                    // this test exists to exercise.
+                    writeln!(&mut file, "tiny").unwrap();
+                    file.flush().unwrap();
+                }
 
-            {
-                let mut file = TestLogSink::create(&path, gzip).unwrap();
-                // Newline-terminated so the checksum fingerprinter creates a
-                // watcher; without one the file never enters the Pending state
-                // this test exists to exercise.
-                writeln!(&mut file, "tiny").unwrap();
-                file.flush().unwrap();
-            }
-            sleep(Duration::from_millis(200)).await;
-            std::fs::remove_file(&path).unwrap();
-            sleep_500_millis().await;
-        })
+                // Causal checkpoint: the decoy is written only after the fixture
+                // exists, so its first emit proves a full server pass has seen
+                // (and watched) the still-Pending fixture. No timing guess.
+                let mut ok = TestLogSink::create(&decoy, gzip).unwrap();
+                writeln!(&mut ok, "{}", "z".repeat(1100)).unwrap();
+                ok.flush().unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+
+                std::fs::remove_file(&path).unwrap();
+
+                // Second decoy line: its emit proves at least one further full
+                // pass ran after the deletion, so the zero assert below is not
+                // vacuously early.
+                writeln!(&mut ok, "{}", "z".repeat(1100)).unwrap();
+                ok.flush().unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+            },
+        )
         .await;
 
         let received = extract_messages_string(received);
         assert!(
-            received.iter().any(|m| m.contains('z')),
-            "decoy file must emit for compliance: {received:?}"
+            received.iter().filter(|m| m.contains('z')).count() >= 2,
+            "both decoy lines must emit: {received:?}"
         );
         assert!(
             !received.iter().any(|m| m.contains("tiny")),
@@ -3693,50 +3708,64 @@ mod tests {
         encoding_auto_pending_delete_quiet_impl
     );
 
-    async fn encoding_auto_remove_after_pending_impl(gzip: bool) {
+    async fn encoding_auto_remove_after_pending_ships_then_removes_impl(gzip: bool) {
+        // A sub-min Pending file must get its idle-timeout decision (and ship
+        // its content) before remove_after may delete it, even when the grace
+        // period is shorter than the idle timeout. After the decision, the
+        // regular remove_after path reaps the file.
         let dir = tempdir().unwrap();
         let path = dir.path().join("pending_remove.log");
-        let decoy = dir.path().join("ok.log");
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             remove_after_secs: Some(0),
             encoding: Some(EncodingConfig {
                 auto_detect_min_bytes: Some(4096),
                 auto_detect_max_bytes: Some(8192),
-                auto_detect_idle_timeout_secs: Some(3600),
+                auto_detect_idle_timeout_secs: Some(1),
                 ..EncodingConfig::auto()
             }),
             glob_minimum_cooldown_ms: Duration::from_millis(50),
             ..test_default_file_config(&dir)
         };
 
-        let line = format!("{}\n", "y".repeat(4200));
         // Newline-terminated so the fingerprinter creates a watcher and the file
-        // actually reaches the Pending state that remove_after must reap.
-        write_whole(&path, b"stay pending\n", gzip);
-        write_whole(&decoy, line.as_bytes(), gzip);
+        // actually reaches the Pending state whose deletion floor is under test.
+        write_whole(&path, b"ships before removal\n", gzip);
 
-        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
-            sleep(Duration::from_millis(800)).await;
-        })
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // The idle force-decide must fire and ship the line first.
+                // Generous bound: Pending re-peeks are throttled like read
+                // attempts and can take a full throttle interval to land.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 15_000).await;
+                for _ in 0..100 {
+                    if !path.exists() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            },
+        )
         .await;
 
         let received = extract_messages_string(received);
         assert!(
-            received.iter().any(|m| m.contains('y')),
-            "decoy file must emit for compliance: {received:?}"
+            received.iter().any(|m| m.contains("ships before removal")),
+            "sub-min content must decide and ship before removal: {received:?}"
         );
-        assert!(
-            !received.iter().any(|m| m.contains("stay pending")),
-            "Pending file should not emit: {received:?}"
-        );
-        assert!(!path.exists(), "remove_after should delete Pending file");
+        assert!(!path.exists(), "remove_after must delete the file once it shipped");
     }
 
     encoding_auto_plain_and_gzip!(
-        test_encoding_auto_remove_after_pending,
-        test_encoding_auto_remove_after_pending_gzip,
-        encoding_auto_remove_after_pending_impl
+        test_encoding_auto_remove_after_pending_ships_then_removes,
+        test_encoding_auto_remove_after_pending_ships_then_removes_gzip,
+        encoding_auto_remove_after_pending_ships_then_removes_impl
     );
 
     async fn encoding_auto_remove_after_rejected_impl(gzip: bool) {
