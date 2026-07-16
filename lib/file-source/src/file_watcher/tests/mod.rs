@@ -190,7 +190,7 @@ async fn gzip_multi_stream_reads_all_members() {
         out
     }
 
-    // Write two separate gzip members into one file — the bug dropped the second.
+    // Write two separate gzip members into one file; the bug dropped the second.
     let mut bytes = encode(b"first\n").await;
     bytes.extend(encode(b"second\n").await);
     fs::write(&path, &bytes).unwrap();
