@@ -148,6 +148,9 @@ pub struct EncodingConfig {
     ///
     /// Only valid when `charset` is `auto`. Defaults to 30. Post-timeout decisions use a
     /// best-effort sniff window and may be lower confidence than a full `min_bytes` window.
+    /// `remove_after_secs` never removes a file that is still pending detection before this
+    /// timeout has elapsed, so pending content gets its forced decision (and a chance to be
+    /// read) first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::examples = 30))]
