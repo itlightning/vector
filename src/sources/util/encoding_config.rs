@@ -152,6 +152,19 @@ pub struct EncodingConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[configurable(metadata(docs::examples = 30))]
     pub auto_detect_idle_timeout_secs: Option<u64>,
+
+    /// Decode files detected as UTF-8 through the transcoder so malformed sequences are
+    /// replaced with the Unicode REPLACEMENT CHARACTER (U+FFFD).
+    ///
+    /// By default, files detected as UTF-8 are passed through unchanged for efficiency, so
+    /// invalid sequences appearing after the detection window are shipped as-is. When `true`,
+    /// UTF-8-detected files (including files with a UTF-8 BOM) are decoded the same way as an
+    /// explicit `charset: utf-8`, guaranteeing that every emitted line is valid UTF-8.
+    ///
+    /// Only valid when `charset` is `auto`. Defaults to `false`.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = true))]
+    pub sanitize_utf8: bool,
 }
 
 impl EncodingConfig {
@@ -164,6 +177,20 @@ impl EncodingConfig {
             auto_detect_max_bytes: None,
             max_replacement_ratio: None,
             auto_detect_idle_timeout_secs: None,
+            sanitize_utf8: false,
+        }
+    }
+
+    /// Auto-detection with every knob at its default.
+    pub const fn auto() -> Self {
+        Self {
+            charset: CharsetMode::Auto,
+            fallback_charset: None,
+            auto_detect_min_bytes: None,
+            auto_detect_max_bytes: None,
+            max_replacement_ratio: None,
+            auto_detect_idle_timeout_secs: None,
+            sanitize_utf8: false,
         }
     }
 
@@ -173,13 +200,14 @@ impl EncodingConfig {
             || self.auto_detect_min_bytes.is_some()
             || self.auto_detect_max_bytes.is_some()
             || self.max_replacement_ratio.is_some()
-            || self.auto_detect_idle_timeout_secs.is_some();
+            || self.auto_detect_idle_timeout_secs.is_some()
+            || self.sanitize_utf8;
 
         match self.charset {
             CharsetMode::Explicit(_) => {
                 if auto_only_set {
                     return Err(
-                        "encoding.fallback_charset, auto_detect_min_bytes, auto_detect_max_bytes, max_replacement_ratio, and auto_detect_idle_timeout_secs are only valid when encoding.charset is \"auto\""
+                        "encoding.fallback_charset, auto_detect_min_bytes, auto_detect_max_bytes, max_replacement_ratio, auto_detect_idle_timeout_secs, and sanitize_utf8 are only valid when encoding.charset is \"auto\""
                             .into(),
                     );
                 }
@@ -275,6 +303,42 @@ mod tests {
         })
         .unwrap();
         assert!(config.validate_and_resolve().is_err());
+    }
+
+    #[test]
+    fn sanitize_utf8_without_auto_errors() {
+        let config: EncodingConfig = serde_yaml::from_str(indoc! {
+            r#"
+            charset: utf-16le
+            sanitize_utf8: true
+            "#
+        })
+        .unwrap();
+        assert!(config.validate_and_resolve().is_err());
+    }
+
+    #[test]
+    fn sanitize_utf8_with_auto_resolves() {
+        let config: EncodingConfig = serde_yaml::from_str(indoc! {
+            r#"
+            charset: auto
+            sanitize_utf8: true
+            "#
+        })
+        .unwrap();
+        assert!(config.sanitize_utf8);
+        assert!(config.validate_and_resolve().unwrap().is_some());
+    }
+
+    #[test]
+    fn sanitize_utf8_defaults_false() {
+        let config: EncodingConfig = serde_yaml::from_str(indoc! {
+            r#"
+            charset: auto
+            "#
+        })
+        .unwrap();
+        assert!(!config.sanitize_utf8);
     }
 
     #[test]

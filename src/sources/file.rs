@@ -510,6 +510,7 @@ fn resolve_file_encoding(config: &FileConfig) -> crate::Result<ResolvedFileEncod
             let detector = std::sync::Arc::new(AutoFileEncodingDetector {
                 auto,
                 line_delimiter: config.line_delimiter.clone(),
+                sanitize_utf8: config.encoding.as_ref().is_some_and(|e| e.sanitize_utf8),
             });
             Ok(ResolvedFileEncoding {
                 line_delimiter: Bytes::from(config.line_delimiter.clone()),
@@ -831,6 +832,9 @@ fn wrap_with_line_agg(
 struct AutoFileEncodingDetector {
     auto: AutoDetectConfig,
     line_delimiter: String,
+    /// When true, UTF-8-decided files are decoded (never zero-copy) so malformed
+    /// bytes are replaced with U+FFFD and every emitted line is valid UTF-8.
+    sanitize_utf8: bool,
 }
 
 impl FileEncodingDetector for AutoFileEncodingDetector {
@@ -860,8 +864,11 @@ impl FileEncodingDetector for AutoFileEncodingDetector {
                 // NOT valid UTF-8 even when the fallback charset is UTF-8, so those
                 // files must flow through the decoder to get U+FFFD substitution and
                 // the malformed-input warning, matching explicit `charset: utf-8`.
+                // `sanitize_utf8` opts proven-UTF-8 files into the same decoder path
+                // to guarantee valid UTF-8 output beyond the detection window.
                 let zero_copy_utf8 = encoding == encoding_rs::UTF_8
-                    && matches!(via, DetectVia::Bom | DetectVia::Utf8Valid);
+                    && matches!(via, DetectVia::Bom | DetectVia::Utf8Valid)
+                    && !self.sanitize_utf8;
                 EncodingDetectOutcome::Decided {
                     encoding_name: if zero_copy_utf8 {
                         None
@@ -2709,12 +2716,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -2776,12 +2779,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("app.log")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -2831,12 +2830,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -2880,12 +2875,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -2935,12 +2926,9 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
                 max_replacement_ratio: Some(0.0),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -2984,12 +2972,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(128),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -3028,12 +3012,8 @@ mod tests {
         let make_config = |include: Vec<PathBuf>| file::FileConfig {
             include,
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             data_dir: Some(data_dir.clone()),
             glob_minimum_cooldown_ms: Duration::from_millis(100),
@@ -3109,15 +3089,13 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
                 // Prove the knob: a single-byte fallback can frame raw `\n` bytes that
                 // are neither UTF-8 nor UTF-16.
                 fallback_charset: Some(encoding_rs::WINDOWS_1252),
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
                 // Disable reject so inconclusive windows still ingest via fallback.
                 max_replacement_ratio: Some(0.0),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -3163,12 +3141,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(64),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -3223,12 +3197,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -3275,6 +3245,68 @@ mod tests {
         encoding_auto_ratio_under_threshold_allows_impl
     );
 
+    async fn encoding_auto_sanitize_utf8_replaces_invalid_impl(gzip: bool) {
+        // A file detected as UTF-8 can still grow invalid bytes after the detection
+        // window. With `sanitize_utf8` those lines are decoded (U+FFFD substitution)
+        // instead of passed through raw.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                sanitize_utf8: true,
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("sanitize.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                // Valid UTF-8 above min_bytes: detection decides via strict validation.
+                let clean = format!("{}\n", "a".repeat(64));
+                write!(&mut file, "{clean}").unwrap();
+                file.flush().unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+
+                // Invalid bytes arrive only after the file was decided as UTF-8.
+                file.write_all(b"bad \x80\x81 bytes\n").unwrap();
+                file.flush().unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+            },
+        )
+        .await;
+
+        // Raw-bytes assertions: `to_string_lossy` would fabricate U+FFFD at display
+        // time and hide an unsanitized pass-through.
+        let received = extract_messages_value(received);
+        assert_eq!(received.len(), 2, "expected both lines: {received:?}");
+        for value in &received {
+            let bytes = value.as_bytes().expect("message must be bytes");
+            std::str::from_utf8(bytes)
+                .expect("sanitize_utf8 must guarantee valid UTF-8 output lines");
+        }
+        let second = std::str::from_utf8(received[1].as_bytes().unwrap()).unwrap();
+        assert!(
+            second.contains('\u{FFFD}'),
+            "invalid bytes must be replaced at decode time: {second:?}"
+        );
+        assert!(second.starts_with("bad ") && second.ends_with(" bytes"));
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_sanitize_utf8_replaces_invalid,
+        test_encoding_auto_sanitize_utf8_replaces_invalid_gzip,
+        encoding_auto_sanitize_utf8_replaces_invalid_impl
+    );
+
     async fn encoding_auto_ignored_header_bytes_compatible_impl(gzip: bool) {
         // Fingerprint skips a fixed header; encoding auto still peeks at offset 0.
         // UTF-16 header + body keeps detection on the UTF-16 ladder for the whole sniff.
@@ -3295,12 +3327,8 @@ mod tests {
         let make_config = |include: Vec<PathBuf>, data_dir: PathBuf| file::FileConfig {
             include,
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(32),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             data_dir: Some(data_dir),
             glob_minimum_cooldown_ms: Duration::from_millis(100),
@@ -3418,12 +3446,9 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(1024),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
                 auto_detect_idle_timeout_secs: Some(0),
+                ..EncodingConfig::auto()
             }),
             glob_minimum_cooldown_ms: Duration::from_millis(100),
             ..test_default_file_config(&dir)
@@ -3458,12 +3483,9 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(1024),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
                 auto_detect_idle_timeout_secs: Some(3600),
+                ..EncodingConfig::auto()
             }),
             glob_minimum_cooldown_ms: Duration::from_millis(100),
             ..test_default_file_config(&dir)
@@ -3515,12 +3537,10 @@ mod tests {
             include: vec![dir.path().join("*")],
             remove_after_secs: Some(0),
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(4096),
                 auto_detect_max_bytes: Some(8192),
-                max_replacement_ratio: Some(0.33),
                 auto_detect_idle_timeout_secs: Some(3600),
+                ..EncodingConfig::auto()
             }),
             glob_minimum_cooldown_ms: Duration::from_millis(50),
             ..test_default_file_config(&dir)
@@ -3564,12 +3584,8 @@ mod tests {
         let config = file::FileConfig {
             include: vec![dir.path().join("app.log")],
             encoding: Some(EncodingConfig {
-                charset: CharsetMode::Auto,
-                fallback_charset: None,
                 auto_detect_min_bytes: Some(64),
-                auto_detect_max_bytes: Some(2048),
-                max_replacement_ratio: Some(0.33),
-                auto_detect_idle_timeout_secs: None,
+                ..EncodingConfig::auto()
             }),
             ..test_default_file_config(&dir)
         };
@@ -3625,23 +3641,26 @@ mod tests {
     #[tokio::test]
     async fn test_encoding_auto_validation_errors() {
         let err = EncodingConfig {
-            charset: CharsetMode::Explicit(UTF_16LE),
             fallback_charset: Some(encoding_rs::UTF_8),
-            auto_detect_min_bytes: None,
-            auto_detect_max_bytes: None,
-            max_replacement_ratio: None,
-            auto_detect_idle_timeout_secs: None,
+            ..EncodingConfig::explicit(UTF_16LE)
+        }
+        .validate_and_resolve();
+        assert!(err.is_err());
+
+        let err = EncodingConfig {
+            sanitize_utf8: true,
+            ..EncodingConfig::explicit(UTF_16LE)
         }
         .validate_and_resolve();
         assert!(err.is_err());
 
         let ok = EncodingConfig {
-            charset: CharsetMode::Auto,
             fallback_charset: Some(encoding_rs::UTF_8),
             auto_detect_min_bytes: Some(64),
             auto_detect_max_bytes: Some(1024),
             max_replacement_ratio: Some(0.5),
-            auto_detect_idle_timeout_secs: None,
+            sanitize_utf8: true,
+            ..EncodingConfig::auto()
         }
         .validate_and_resolve();
         assert!(ok.is_ok());
