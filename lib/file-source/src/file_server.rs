@@ -488,8 +488,27 @@ where
         ) {
             return;
         }
-        if watcher.last_read_success().elapsed() < grace_period {
+        // `last_read_success` is seeded from the file's mtime, which can predate
+        // watching by more than the grace period. Anchoring the grace on watch
+        // start guarantees a Pending file gets its idle-timeout force-decide (and
+        // a chance to ship its content) before it can be deleted.
+        let grace_basis = cmp::max(watcher.watch_start(), watcher.last_read_success());
+        if grace_basis.elapsed() < grace_period {
             return;
+        }
+        // After a rename rotation this watcher's path can point at a different
+        // file. Deleting by path would destroy that file's data, so only delete
+        // when the path still resolves to the watched inode.
+        match watcher.path_matches_watched_inode().await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone: nothing to remove.
+                watcher.set_dead();
+                return;
+            }
+            // Could not verify (permissions etc.); retry on a later pass.
+            Err(_) => return,
         }
         match remove_file(&watcher.path).await {
             Ok(()) => {
