@@ -101,11 +101,7 @@ pub fn detect_charset_idle_force(sniff: &[u8], config: &AutoDetectConfig) -> Det
     detect_charset_inner(sniff, config, true)
 }
 
-fn detect_charset_inner(
-    sniff: &[u8],
-    config: &AutoDetectConfig,
-    waive_min: bool,
-) -> DetectOutcome {
+fn detect_charset_inner(sniff: &[u8], config: &AutoDetectConfig, waive_min: bool) -> DetectOutcome {
     if let Some((encoding, _bom_len)) = Encoding::for_bom(sniff) {
         return apply_reject_gate(sniff, encoding, DetectVia::Bom, config);
     }
@@ -264,7 +260,13 @@ mod tests {
     use super::*;
 
     fn cfg(min: usize, max: usize, ratio: f64, fallback: &'static Encoding) -> AutoDetectConfig {
-        AutoDetectConfig::new(fallback, min, max, ratio, DEFAULT_AUTO_DETECT_IDLE_TIMEOUT_SECS)
+        AutoDetectConfig::new(
+            fallback,
+            min,
+            max,
+            ratio,
+            DEFAULT_AUTO_DETECT_IDLE_TIMEOUT_SECS,
+        )
     }
 
     fn utf16le_ascii(s: &str) -> Vec<u8> {

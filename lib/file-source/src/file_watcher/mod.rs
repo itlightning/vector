@@ -21,8 +21,7 @@ use file_source_common::{
 use vector_common::compression::gzip_multiple_decoder;
 
 use crate::encoding::{
-    DetectViaKind, EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode,
-    FileEncodingState,
+    DetectViaKind, EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode, FileEncodingState,
 };
 
 const EOF_READ_BACKOFF_MIN: Duration = Duration::from_millis(1);

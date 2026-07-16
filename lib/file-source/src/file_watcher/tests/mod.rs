@@ -265,8 +265,7 @@ impl crate::FileEncodingDetector for CountingDetector {
     }
 
     fn detect(&self, _sniff: &[u8], _waive_min: bool) -> crate::EncodingDetectOutcome {
-        self.calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::EncodingDetectOutcome::Decided {
             encoding_name: None,
             via: "utf8-valid",

@@ -511,9 +511,7 @@ fn resolve_file_encoding(
                 // a missing value here is a caller bug surfaced as a config error
                 // rather than a panic.
                 let Some(auto) = resolved_auto else {
-                    return Err(
-                        "charset auto requires resolved auto-detection settings".into(),
-                    );
+                    return Err("charset auto requires resolved auto-detection settings".into());
                 };
                 let detector = std::sync::Arc::new(AutoFileEncodingDetector {
                     auto,
@@ -2659,9 +2657,10 @@ mod tests {
             match &mut self.inner {
                 TestLogSinkInner::Plain(file) => file.write(buf),
                 TestLogSinkInner::Gzip(encoder) => encoder.write(buf),
-                TestLogSinkInner::Finished => {
-                    Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "gzip stream finished"))
-                }
+                TestLogSinkInner::Finished => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "gzip stream finished",
+                )),
             }
         }
 
@@ -3138,7 +3137,8 @@ mod tests {
                 {
                     let mut file = TestLogSink::create(&path, gzip).unwrap();
                     file.write_all(&[0xff, 0xfe]).unwrap();
-                    file.write_all(&utf16le_bytes("hello utf sixteen\n")).unwrap();
+                    file.write_all(&utf16le_bytes("hello utf sixteen\n"))
+                        .unwrap();
                     file.flush().unwrap();
                 }
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
@@ -3813,7 +3813,10 @@ mod tests {
             received.iter().any(|m| m.contains("ships before removal")),
             "sub-min content must decide and ship before removal: {received:?}"
         );
-        assert!(!path.exists(), "remove_after must delete the file once it shipped");
+        assert!(
+            !path.exists(),
+            "remove_after must delete the file once it shipped"
+        );
     }
 
     encoding_auto_plain_and_gzip!(
