@@ -21,7 +21,8 @@ use file_source_common::{
 };
 
 use crate::encoding::{
-    EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode, FileEncodingState,
+    DetectViaKind, EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode,
+    FileEncodingState,
 };
 
 const EOF_READ_BACKOFF_MIN: Duration = Duration::from_millis(1);
@@ -353,12 +354,13 @@ impl FileWatcher {
             EncodingDetectOutcome::Decided {
                 encoding_name,
                 via,
+                via_kind,
                 line_delimiter,
                 bom_skip_bytes,
             } => {
                 let event_encoding = encoding_name.unwrap_or("UTF-8");
                 emitter.emit_file_encoding_detected(&self.path, event_encoding, via);
-                if via == "fallback" {
+                if via_kind == DetectViaKind::Fallback {
                     warn!(
                         message = "File character encoding detection was inconclusive; using fallback charset.",
                         file = %self.path.display(),

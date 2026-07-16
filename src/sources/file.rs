@@ -14,7 +14,7 @@ use vector_lib::{
     config::{LegacyKey, LogNamespace},
     configurable::configurable_component,
     file_source::{
-        EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode,
+        DetectViaKind, EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode,
         file_server::{FileServer, Line, calculate_ignore_before},
         paths_provider::{Glob, MatchOptions},
     },
@@ -876,6 +876,7 @@ impl FileEncodingDetector for AutoFileEncodingDetector {
                         Some(encoding.name())
                     },
                     via: via.as_str(),
+                    via_kind: detect_via_kind(via),
                     line_delimiter: if zero_copy_utf8 {
                         Bytes::from(self.line_delimiter.clone())
                     } else {
@@ -894,6 +895,17 @@ impl FileEncodingDetector for AutoFileEncodingDetector {
                 ratio,
             },
         }
+    }
+}
+
+/// Maps the detector-internal `DetectVia` to the typed kind that crosses the
+/// file-source boundary (the string label in events stays separate).
+const fn detect_via_kind(via: DetectVia) -> DetectViaKind {
+    match via {
+        DetectVia::Bom => DetectViaKind::Bom,
+        DetectVia::Utf16Heuristic => DetectViaKind::Utf16Heuristic,
+        DetectVia::Utf8Valid => DetectViaKind::Utf8Valid,
+        DetectVia::Fallback => DetectViaKind::Fallback,
     }
 }
 

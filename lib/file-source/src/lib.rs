@@ -7,5 +7,6 @@ pub mod file_watcher;
 pub mod paths_provider;
 
 pub use encoding::{
-    EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode, FileEncodingState,
+    DetectViaKind, EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode,
+    FileEncodingState,
 };
