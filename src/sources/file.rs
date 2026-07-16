@@ -2713,11 +2713,32 @@ mod tests {
         encoder.finish().unwrap();
     }
 
+    /// Append one complete gzip member to `path`, creating the file if needed.
+    /// Appending members is the only way a gzip file can grow observably: a
+    /// member is not decodable until its trailer is written, and the reader
+    /// never picks up bytes added to a file it has already read to EOF, so
+    /// each growth step must be a self-contained member that is on disk
+    /// before the reader first reaches it.
+    fn append_gzip_member(path: &std::path::Path, data: &[u8]) {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+        encoder.write_all(data).unwrap();
+        let mut writer = encoder.finish().unwrap();
+        writer.flush().unwrap();
+    }
+
     /// Write `data` as the entire file contents (truncating any existing file),
-    /// plain or gzip-compressed. Lets a test seed and "grow" a watched file with
-    /// one call in both modes: a gzip stream cannot be appended in place, so
-    /// growth is modeled as a whole-file rewrite (equivalent for a still-Pending
-    /// file, which auto-detection re-peeks from offset 0 each cycle).
+    /// plain or gzip-compressed. For plain files a whole-file rewrite also
+    /// models growth: reads go through the file handle's offset, so a
+    /// still-Pending watcher drains the rewritten content once it decides. For
+    /// gzip a rewrite is only safe while no watcher exists: the watcher
+    /// buffers the creation-time compressed bytes when it probes for the gzip
+    /// magic, so rewriting a watched gzip file leaves its reader replaying the
+    /// old generation. Watched gzip files grow via `append_gzip_member`.
     fn write_whole(path: &std::path::Path, data: &[u8], gzip: bool) {
         if gzip {
             write_complete_gzip_file(path, data);
@@ -3320,8 +3341,15 @@ mod tests {
 
                 // Sub-min UTF-16, newline-terminated so the file fingerprints and
                 // gets a watcher: "stays Pending" is then enforced by the encoding
-                // gate, not by the fingerprinter refusing to watch.
-                write_whole(&path, &utf16le_bytes("abcdefghij\n"), gzip);
+                // gate, not by the fingerprinter refusing to watch. Once watched,
+                // a gzip file must grow by appended members (a rewrite would leave
+                // the watcher replaying its buffered generation-one bytes), while
+                // plain growth keeps the whole-file rewrite model.
+                if gzip {
+                    append_gzip_member(&path, &utf16le_bytes("abcdefghij\n"));
+                } else {
+                    write_whole(&path, &utf16le_bytes("abcdefghij\n"), false);
+                }
                 sleep(Duration::from_millis(400)).await;
                 assert_eq!(
                     counter.load(Ordering::SeqCst),
@@ -3331,9 +3359,13 @@ mod tests {
 
                 // Cross min with a second complete line (same first line keeps the
                 // fingerprint stable).
-                let mut payload = utf16le_bytes("abcdefghij\n");
-                payload.extend(utf16le_bytes(&format!("{}\n", "k".repeat(40))));
-                write_whole(&path, &payload, gzip);
+                if gzip {
+                    append_gzip_member(&path, &utf16le_bytes(&format!("{}\n", "k".repeat(40))));
+                } else {
+                    let mut payload = utf16le_bytes("abcdefghij\n");
+                    payload.extend(utf16le_bytes(&format!("{}\n", "k".repeat(40))));
+                    write_whole(&path, &payload, false);
+                }
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
             },
         )
@@ -3407,14 +3439,19 @@ mod tests {
     );
 
     async fn encoding_auto_sanitize_utf8_replaces_invalid_impl(gzip: bool) {
-        // A file detected as UTF-8 can still grow invalid bytes after the detection
-        // window. With `sanitize_utf8` those lines are decoded (U+FFFD substitution)
-        // instead of passed through raw.
+        // A file detected as UTF-8 can still contain invalid bytes past the
+        // detection window (capped at 64 bytes here, inside the clean first
+        // line). With `sanitize_utf8` those lines are decoded (U+FFFD
+        // substitution) instead of passed through raw. The plain variant grows
+        // the file after the decision; the gzip variant writes the malformed
+        // tail up front because a gzip reader latches EOF once it has decoded
+        // every complete member on disk and never sees later appends.
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![dir.path().join("*")],
             encoding: Some(EncodingConfig {
                 auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(64),
                 sanitize_utf8: true,
                 ..EncodingConfig::auto()
             }),
@@ -3431,16 +3468,23 @@ mod tests {
             Some(Arc::clone(&counter)),
             async {
                 let mut file = TestLogSink::create(&path, gzip).unwrap();
-                // Valid UTF-8 above min_bytes: detection decides via strict validation.
+                // Valid UTF-8 filling the whole detection window: detection
+                // decides via strict validation and never sees the bad bytes.
                 let clean = format!("{}\n", "a".repeat(64));
                 write!(&mut file, "{clean}").unwrap();
-                file.flush().unwrap();
-                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                if gzip {
+                    file.write_all(b"bad \x80\x81 bytes\n").unwrap();
+                    drop(file);
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+                } else {
+                    file.flush().unwrap();
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
 
-                // Invalid bytes arrive only after the file was decided as UTF-8.
-                file.write_all(b"bad \x80\x81 bytes\n").unwrap();
-                file.flush().unwrap();
-                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+                    // Invalid bytes arrive only after the file was decided as UTF-8.
+                    file.write_all(b"bad \x80\x81 bytes\n").unwrap();
+                    file.flush().unwrap();
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+                }
             },
         )
         .await;
@@ -3709,6 +3753,7 @@ mod tests {
 
         let path = dir.path().join("gone.log");
         let decoy = dir.path().join("ok.log");
+        let decoy2 = dir.path().join("ok2.log");
         let counter = Arc::new(AtomicUsize::new(0));
         let received = run_file_source(
             &config,
@@ -3727,20 +3772,29 @@ mod tests {
                 }
 
                 // Causal checkpoint: the decoy is written only after the fixture
-                // exists, so its first emit proves a full server pass has seen
-                // (and watched) the still-Pending fixture. No timing guess.
-                let mut ok = TestLogSink::create(&decoy, gzip).unwrap();
-                writeln!(&mut ok, "{}", "z".repeat(1100)).unwrap();
-                ok.flush().unwrap();
+                // exists, so its emit proves a full server pass has seen (and
+                // watched) the still-Pending fixture. No timing guess. Each decoy
+                // is a closed, self-contained file: a gzip member only becomes
+                // decodable once its trailer is written, and a gzip reader never
+                // sees lines appended after it reached EOF.
+                {
+                    let mut ok = TestLogSink::create(&decoy, gzip).unwrap();
+                    writeln!(&mut ok, "{}", "z".repeat(1100)).unwrap();
+                    ok.flush().unwrap();
+                }
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
 
                 std::fs::remove_file(&path).unwrap();
 
-                // Second decoy line: its emit proves at least one further full
+                // Second decoy file: its emit proves at least one further full
                 // pass ran after the deletion, so the zero assert below is not
-                // vacuously early.
-                writeln!(&mut ok, "{}", "z".repeat(1100)).unwrap();
-                ok.flush().unwrap();
+                // vacuously early. Distinct content keeps its checksum
+                // fingerprint separate from the first decoy's.
+                {
+                    let mut ok2 = TestLogSink::create(&decoy2, gzip).unwrap();
+                    writeln!(&mut ok2, "{}", "y".repeat(1100)).unwrap();
+                    ok2.flush().unwrap();
+                }
                 wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
             },
         )
@@ -3748,8 +3802,12 @@ mod tests {
 
         let received = extract_messages_string(received);
         assert!(
-            received.iter().filter(|m| m.contains('z')).count() >= 2,
-            "both decoy lines must emit: {received:?}"
+            received.iter().any(|m| m.contains('z')),
+            "first decoy line must emit: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('y')),
+            "second decoy line must emit: {received:?}"
         );
         assert!(
             !received.iter().any(|m| m.contains("tiny")),
