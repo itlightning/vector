@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn utf16_soft_confirm_just_over_threshold_abandons() {
-        // 100 valid ASCII UTF-16LE code units + 3 lone high surrogates (~3% errors).
+        // 100 valid ASCII UTF-16LE code units + 4 lone high surrogates (~4% errors).
         let mut sniff = utf16le_ascii(&"F".repeat(100));
         for _ in 0..4 {
             sniff.extend([0x00, 0xd8]); // U+D800 without low surrogate

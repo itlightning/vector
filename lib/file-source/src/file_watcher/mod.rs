@@ -83,7 +83,8 @@ pub struct FileWatcher {
     encoding_state: FileEncodingState,
     encoding_detector: Option<Arc<dyn FileEncodingDetector>>,
     fixed_encoding_name: Option<&'static str>,
-    /// When Pending, time of first peek attempt (idle-timeout force-decide).
+    /// When Pending, set at watcher creation (and again when the underlying
+    /// inode changes); basis for the idle-timeout force-decide.
     pending_since: Option<Instant>,
     gzipped: bool,
 }
@@ -314,10 +315,11 @@ impl FileWatcher {
             limited.read_to_end(&mut buf).await?;
             buf
         } else {
-            let mut file = file;
-            let mut buf = vec![0u8; max_bytes];
-            let n = file.read(&mut buf).await?;
-            buf.truncate(n);
+            // read_to_end on a limited reader: a single read() may return short
+            // and under-fill the sniff window even when more bytes exist.
+            let mut limited = file.take(max_bytes as u64);
+            let mut buf = Vec::new();
+            limited.read_to_end(&mut buf).await?;
             buf
         };
         Ok(VerifiedPeek::Sniff(sniff))
