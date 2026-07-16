@@ -342,7 +342,19 @@ impl FileWatcher {
                 self.set_dead();
                 return Ok(false);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Peek failures (permissions, sharing violations) must not become
+                // per-pass watch errors: with a fixed charset an unreadable file
+                // emits nothing until an actual read fails. Log at debug level and
+                // space out retries via the regular attempt throttle.
+                self.last_read_attempt = Instant::now();
+                debug!(
+                    message = "Charset detection peek failed; will retry.",
+                    file = %self.path.display(),
+                    error = %e,
+                );
+                return Ok(false);
+            }
         };
 
         let waive_min = self.pending_since.is_some_and(|since| {
@@ -350,7 +362,12 @@ impl FileWatcher {
         });
 
         match detector.detect(&peek, waive_min) {
-            EncodingDetectOutcome::Pending => Ok(false),
+            EncodingDetectOutcome::Pending => {
+                // Space out re-peeks the same way regular read attempts are spaced;
+                // otherwise a sustained-Pending file is peeked on every server pass.
+                self.last_read_attempt = Instant::now();
+                Ok(false)
+            }
             EncodingDetectOutcome::Decided {
                 encoding_name,
                 via,
