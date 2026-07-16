@@ -175,6 +175,136 @@ impl Arbitrary for FileWatcherAction {
     }
 }
 
+#[derive(Clone)]
+struct NoopEmitter;
+
+impl file_source_common::FileSourceInternalEvents for NoopEmitter {
+    fn emit_file_added(&self, _path: &std::path::Path) {}
+    fn emit_file_resumed(&self, _path: &std::path::Path, _file_position: u64) {}
+    fn emit_file_watch_error(&self, _path: &std::path::Path, _error: std::io::Error) {}
+    fn emit_file_unwatched(&self, _path: &std::path::Path, _reached_eof: bool) {}
+    fn emit_file_deleted(&self, _path: &std::path::Path) {}
+    fn emit_file_delete_error(&self, _path: &std::path::Path, _error: std::io::Error) {}
+    fn emit_file_fingerprint_read_error(&self, _path: &std::path::Path, _error: std::io::Error) {}
+    fn emit_file_checkpointed(&self, _count: usize, _duration: std::time::Duration) {}
+    fn emit_file_checksum_failed(&self, _path: &std::path::Path) {}
+    fn emit_file_checkpoint_write_error(&self, _error: std::io::Error) {}
+    fn emit_files_open(&self, _count: usize) {}
+    fn emit_path_globbing_failed(&self, _path: &std::path::Path, _error: &std::io::Error) {}
+    fn emit_file_line_too_long(
+        &self,
+        _truncated_bytes: &BytesMut,
+        _configured_limit: usize,
+        _encountered_size_so_far: usize,
+    ) {
+    }
+    fn emit_file_encoding_detected(&self, _path: &std::path::Path, _encoding: &str, _via: &str) {}
+    fn emit_file_encoding_rejected(&self, _path: &std::path::Path, _encoding: &str, _ratio: f64) {}
+}
+
+/// Counts `detect` invocations; any call decides immediately.
+struct CountingDetector {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::FileEncodingDetector for CountingDetector {
+    fn max_peek_bytes(&self) -> usize {
+        2048
+    }
+
+    fn idle_timeout_secs(&self) -> u64 {
+        0
+    }
+
+    fn detect(&self, _sniff: &[u8], _waive_min: bool) -> crate::EncodingDetectOutcome {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::EncodingDetectOutcome::Decided {
+            encoding_name: None,
+            via: "utf8-valid",
+            via_kind: crate::DetectViaKind::Utf8Valid,
+            line_delimiter: Bytes::from("\n"),
+            bom_skip_bytes: 0,
+        }
+    }
+}
+
+// When the watched path points at a different inode, the peek must bail out
+// before detection runs: with the idle timeout elapsed, running detection on
+// the replacement's bytes would force-decide an encoding for the wrong file.
+#[tokio::test]
+async fn inode_mismatch_peek_skips_detection_even_when_idle() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let dir = tempfile::TempDir::new().expect("could not create tempdir");
+    let path = dir.path().join("watched.log");
+    std::fs::write(&path, b"tiny\n").unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut fw = FileWatcher::new(
+        path.clone(),
+        file_source_common::ReadFrom::Beginning,
+        None,
+        100_000,
+        Bytes::from("\n"),
+        &crate::FileEncodingMode::Auto {
+            detector: Arc::new(CountingDetector {
+                calls: Arc::clone(&calls),
+            }),
+        },
+    )
+    .await
+    .expect("FileWatcher::new failed");
+
+    // Atomically replace the path with a different inode before any peek. The
+    // zero idle timeout means a same-inode peek would decide immediately, so a
+    // decision here could only come from the replacement's bytes.
+    let staged = dir.path().join("staged.log");
+    std::fs::write(&staged, b"replacement content, plenty of valid text\n").unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+
+    let ready = fw
+        .ensure_encoding_ready(&NoopEmitter)
+        .await
+        .expect("peek must not error");
+    assert!(!ready, "a mismatched inode must not open the read gate");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "detection must not run on another file's bytes"
+    );
+    assert!(matches!(
+        fw.encoding_state(),
+        crate::FileEncodingState::Pending
+    ));
+
+    // Same-inode control: a fresh watcher on the replacement decides, proving
+    // the counting detector is wired through.
+    let mut fresh = FileWatcher::new(
+        path,
+        file_source_common::ReadFrom::Beginning,
+        None,
+        100_000,
+        Bytes::from("\n"),
+        &crate::FileEncodingMode::Auto {
+            detector: Arc::new(CountingDetector {
+                calls: Arc::clone(&calls),
+            }),
+        },
+    )
+    .await
+    .expect("FileWatcher::new failed");
+    let ready = fresh
+        .ensure_encoding_ready(&NoopEmitter)
+        .await
+        .expect("peek must not error");
+    assert!(ready);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 fn watcher_for_timing() -> FileWatcher {
     let now = Instant::now();
 
