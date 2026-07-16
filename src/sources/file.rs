@@ -666,6 +666,12 @@ pub fn file_source(
                     include_file_metric_tag,
                 });
                 // Transcode each line from the file's encoding charset to utf8.
+                // `line.encoding` is a charset name the file source obtained from
+                // `Encoding::name()` (auto-detected or an explicit charset), which is always a
+                // valid Encoding Standard label, so `for_label` round-trips it losslessly; the
+                // `unwrap_or` is unreachable and only avoids a panic path.
+                // (The name crosses the file-source boundary as `&str` to keep that crate free
+                // of `encoding_rs`; see `lib/file-source/src/encoding.rs`.)
                 if let Some(encoding_name) = line.encoding {
                     let decoder = encoding_decoders.entry(encoding_name).or_insert_with(|| {
                         let encoding = encoding_rs::Encoding::for_label(encoding_name.as_bytes())

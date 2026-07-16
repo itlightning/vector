@@ -23,20 +23,6 @@ pub enum CharsetMode {
     Explicit(&'static Encoding),
 }
 
-impl CharsetMode {
-    /// Returns the fixed encoding when not in auto mode.
-    pub const fn explicit(self) -> Option<&'static Encoding> {
-        match self {
-            Self::Auto => None,
-            Self::Explicit(encoding) => Some(encoding),
-        }
-    }
-
-    pub const fn is_auto(self) -> bool {
-        matches!(self, Self::Auto)
-    }
-}
-
 impl Serialize for CharsetMode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
