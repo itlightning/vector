@@ -201,6 +201,9 @@ async fn gzip_multi_stream_reads_all_members() {
         None,
         100_000,
         Bytes::from("\n"),
+        &crate::FileEncodingMode::Fixed {
+            encoding_name: None,
+        },
     )
     .await
     .expect("FileWatcher::new failed");
@@ -239,6 +242,11 @@ fn watcher_for_timing() -> FileWatcher {
         max_line_bytes: 1024,
         line_delimiter: Bytes::from_static(b"\n"),
         buf: BytesMut::new(),
+        encoding_state: crate::FileEncodingState::Inactive,
+        encoding_detector: None,
+        fixed_encoding_name: None,
+        pending_since: None,
+        gzipped: false,
     }
 }
 

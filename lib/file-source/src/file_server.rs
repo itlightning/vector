@@ -27,6 +27,7 @@ use tokio::{
 use tracing::{debug, error, info, trace};
 
 use crate::{
+    encoding::{FileEncodingMode, FileEncodingState},
     file_watcher::{FileWatcher, RawLineResult},
     paths_provider::PathsProvider,
 };
@@ -51,6 +52,7 @@ where
     pub ignore_before: Option<DateTime<Utc>>,
     pub max_line_bytes: usize,
     pub line_delimiter: Bytes,
+    pub encoding_mode: FileEncodingMode,
     pub data_dir: PathBuf,
     pub glob_minimum_cooldown: Duration,
     pub fingerprinter: Fingerprinter,
@@ -284,11 +286,38 @@ where
             let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
                 if !watcher.should_read() {
+                    // Rejected skips read_line; still honor remove_after.
+                    Self::maybe_remove_pending_or_rejected(
+                        watcher,
+                        self.remove_after,
+                        &self.emitter,
+                    )
+                    .await;
                     continue;
                 }
 
                 let start = time::Instant::now();
                 let mut bytes_read: usize = 0;
+
+                match watcher.ensure_encoding_ready(&self.emitter).await {
+                    Ok(false) => {
+                        Self::maybe_remove_pending_or_rejected(
+                            watcher,
+                            self.remove_after,
+                            &self.emitter,
+                        )
+                        .await;
+                        stats.record("reading", start.elapsed());
+                        continue;
+                    }
+                    Err(error) => {
+                        self.emitter.emit_file_watch_error(&watcher.path, error);
+                        stats.record("reading", start.elapsed());
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+
                 while let Ok(RawLineResult {
                     raw_line: Some(line),
                     discarded_for_size_and_truncated,
@@ -318,6 +347,7 @@ where
                         file_id,
                         start_offset: line.offset,
                         end_offset: watcher.get_file_position(),
+                        encoding: watcher.line_encoding_name(),
                     });
 
                     if bytes_read > self.max_read_bytes {
@@ -334,14 +364,15 @@ where
                     if let Some(grace_period) = self.remove_after
                         && watcher.last_read_success().elapsed() >= grace_period
                     {
-                        // Try to remove
                         match remove_file(&watcher.path).await {
                             Ok(()) => {
                                 self.emitter.emit_file_deleted(&watcher.path);
                                 watcher.set_dead();
                             }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                watcher.set_dead();
+                            }
                             Err(error) => {
-                                // We will try again after some time.
                                 self.emitter.emit_file_delete_error(&watcher.path, error);
                             }
                         }
@@ -432,6 +463,35 @@ where
         }
     }
 
+    async fn maybe_remove_pending_or_rejected(
+        watcher: &mut FileWatcher,
+        remove_after: Option<Duration>,
+        emitter: &E,
+    ) {
+        let Some(grace_period) = remove_after else {
+            return;
+        };
+        if !matches!(
+            watcher.encoding_state(),
+            FileEncodingState::Pending | FileEncodingState::Rejected
+        ) {
+            return;
+        }
+        if watcher.last_read_success().elapsed() < grace_period {
+            return;
+        }
+        match remove_file(&watcher.path).await {
+            Ok(()) => {
+                emitter.emit_file_deleted(&watcher.path);
+                watcher.set_dead();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                watcher.set_dead();
+            }
+            Err(error) => emitter.emit_file_delete_error(&watcher.path, error),
+        }
+    }
+
     async fn watch_new_file(
         &self,
         path: PathBuf,
@@ -472,6 +532,7 @@ where
             self.ignore_before,
             self.max_line_bytes,
             self.line_delimiter.clone(),
+            &self.encoding_mode,
         )
         .await
         {
@@ -598,4 +659,6 @@ pub struct Line {
     pub file_id: FileFingerprint,
     pub start_offset: u64,
     pub end_offset: u64,
+    /// Encoding Standard name when transcoding is required (`None` = already UTF-8 bytes).
+    pub encoding: Option<&'static str>,
 }
