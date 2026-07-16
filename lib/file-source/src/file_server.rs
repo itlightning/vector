@@ -286,10 +286,15 @@ where
             let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
                 if !watcher.should_read() {
-                    // Rejected skips read_line; still honor remove_after.
+                    // Rejected skips read_line; still honor remove_after. Pending
+                    // deletion is not allowed here: this branch runs without a
+                    // detection attempt (read-attempt throttle), so it would race
+                    // the idle force-decide and could delete data the next peek
+                    // would have shipped.
                     Self::maybe_remove_pending_or_rejected(
                         watcher,
                         self.remove_after,
+                        false,
                         &self.emitter,
                     )
                     .await;
@@ -306,9 +311,14 @@ where
                 // cleaned up compared to a fixed charset.
                 match watcher.ensure_encoding_ready(&self.emitter).await {
                     Ok(false) => {
+                        // A detection attempt just ran: a successful post-idle
+                        // peek always exits Pending, so a still-Pending file here
+                        // is unreadable or inode-mismatched. Pending deletion is
+                        // safe only on this path.
                         Self::maybe_remove_pending_or_rejected(
                             watcher,
                             self.remove_after,
+                            true,
                             &self.emitter,
                         )
                         .await;
@@ -479,9 +489,12 @@ where
         }
     }
 
+    /// `allow_pending` must be true only when a detection attempt ran in the
+    /// same server pass; callers without one may delete Rejected files only.
     async fn maybe_remove_pending_or_rejected(
         watcher: &mut FileWatcher,
         remove_after: Option<Duration>,
+        allow_pending: bool,
         emitter: &E,
     ) {
         let Some(grace_period) = remove_after else {
@@ -493,13 +506,21 @@ where
         ) {
             return;
         }
-        // A Pending file has not yet had its idle-timeout force-decide chance;
-        // removing it now would destroy data a fixed charset would have shipped.
-        // Once the idle decision runs, the normal grace period applies.
-        if matches!(watcher.encoding_state(), FileEncodingState::Pending)
-            && !watcher.pending_idle_elapsed()
-        {
-            return;
+        if matches!(watcher.encoding_state(), FileEncodingState::Pending) {
+            // Deleting an undecided file must follow a detection attempt in the
+            // same pass; without one (the throttled skip-read branch) deletion
+            // would race the idle force-decide, whose peeks can be ~10s apart,
+            // and destroy data the very next peek would have shipped.
+            if !allow_pending {
+                return;
+            }
+            // A Pending file has not yet had its idle-timeout force-decide
+            // chance; removing it now would destroy data a fixed charset would
+            // have shipped. Once the idle decision runs, the normal grace
+            // period applies.
+            if !watcher.pending_idle_elapsed() {
+                return;
+            }
         }
         // `last_read_success` is seeded from the file's mtime, which can predate
         // watching by more than the grace period. Anchoring the grace on watch
