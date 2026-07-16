@@ -3604,6 +3604,151 @@ mod tests {
         encoding_auto_remove_after_pending_impl
     );
 
+    // A sub-min Pending file whose mtime predates the `remove_after` grace period
+    // must still get its idle-timeout decision (and ship its content) before any
+    // deletion: the grace clock is anchored on watch start, not on mtime.
+    #[cfg(unix)] // uses unix-specific `futimes` to backdate the mtime
+    #[tokio::test]
+    async fn test_encoding_auto_remove_after_backdated_mtime_ships_first() {
+        use std::{os::unix::io::AsRawFd, time::SystemTime};
+
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(30),
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_idle_timeout_secs: Some(1),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("old.log");
+        {
+            let mut file = File::create(&path).unwrap();
+            writeln!(&mut file, "backdated but alive").unwrap();
+            file.flush().unwrap();
+
+            // Backdate the mtime well beyond the remove_after grace period.
+            let old = SystemTime::now() - std::time::Duration::from_secs(120);
+            let old_time = libc::timeval {
+                tv_sec: old
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as _,
+                tv_usec: 0,
+            };
+            let old_times = [old_time, old_time];
+            unsafe {
+                libc::futimes(file.as_raw_fd(), old_times.as_ptr());
+            }
+            file.sync_all().unwrap();
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // Re-peeks of a Pending file are throttled like read attempts, so
+                // the idle decision can take a full throttle interval to land.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 15_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains("backdated")),
+            "sub-min file must ship via idle decide before remove_after: {received:?}"
+        );
+        assert!(
+            path.exists(),
+            "grace anchored on watch start must not have elapsed yet"
+        );
+    }
+
+    // After a rename rotation the Pending watcher's path can point at a different
+    // file; `remove_after` must never delete that file based on the old watcher's
+    // state and clocks.
+    #[tokio::test]
+    async fn test_encoding_auto_remove_after_skips_replaced_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("watched.log");
+        let decoy = dir.path().join("decoy.log");
+        // Staged outside the glob (subdirectories are not matched).
+        let staging = dir.path().join(".data").join("replacement.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*.log")],
+            remove_after_secs: Some(2),
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_idle_timeout_secs: Some(3600),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                std::fs::write(&path, b"tiny pending\n").unwrap();
+                {
+                    let mut decoy_file = File::create(&decoy).unwrap();
+                    writeln!(&mut decoy_file, "{}", "d".repeat(1100)).unwrap();
+                }
+                // Decoy emission proves a full server pass ran: the watched file
+                // has a watcher by now and stays Pending (sub-min, huge idle).
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+
+                // Atomically replace the watched path with a different file: the
+                // old watcher's inode is unlinked and the path now belongs to the
+                // replacement (which gets its own watcher and emits).
+                std::fs::write(&staging, format!("{}\n", "r".repeat(1100))).unwrap();
+                std::fs::rename(&staging, &path).unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+
+                // Outlive the old watcher's grace period; periodic appends keep
+                // the replacement's own remove_after clock fresh.
+                let mut keep_alive = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                for i in 0..10 {
+                    writeln!(&mut keep_alive, "keep alive {i}").unwrap();
+                    keep_alive.flush().unwrap();
+                    sleep(Duration::from_millis(300)).await;
+                }
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('r')),
+            "replacement file must emit through its own watcher: {received:?}"
+        );
+        assert!(
+            !received.iter().any(|m| m.contains("tiny")),
+            "the replaced Pending file was never decided and must not emit: {received:?}"
+        );
+        assert!(
+            path.exists(),
+            "old Pending watcher must not delete the file now occupying its path"
+        );
+    }
+
     #[tokio::test]
     async fn test_encoding_auto_gzip_rotation_while_pending() {
         // Auto-detect on a gzip stream still below min_bytes, then rotate before
