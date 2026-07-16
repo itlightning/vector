@@ -476,7 +476,7 @@ mod tests {
     fn utf8_trim_incomplete_trail_accepts_split_four_byte() {
         // U+1F600 is f0 9f 98 80 in UTF-8; splits after 1..3 bytes must trim,
         // not fall through to the fallback charset.
-        let emoji = "😀".as_bytes();
+        let emoji = "\u{1F600}".as_bytes();
         assert_eq!(emoji.len(), 4);
 
         for split_at in 1..4 {
@@ -498,7 +498,7 @@ mod tests {
         // The max_bytes clip lands mid-way through a 4-byte sequence; the trimmed
         // window must still be accepted as UTF-8.
         let mut sniff = vec![b'x'; 64];
-        sniff.extend_from_slice("😀".as_bytes());
+        sniff.extend_from_slice("\u{1F600}".as_bytes());
         let outcome = detect_charset(&sniff, &cfg(32, 66, 0.33, UTF_8));
         match outcome {
             DetectOutcome::Decided { encoding, via } => {
