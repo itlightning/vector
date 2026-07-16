@@ -423,11 +423,14 @@ impl SourceConfig for FileConfig {
 
         let log_namespace = cx.log_namespace(self.log_namespace);
 
-        if let Some(ref encoding) = self.encoding {
-            encoding.validate_and_resolve()?;
-        }
+        // Single validation pass; `charset: auto` yields the resolved detection
+        // tunables consumed below.
+        let resolved_auto = match self.encoding.as_ref() {
+            Some(encoding) => encoding.validate_and_resolve()?,
+            None => None,
+        };
 
-        let resolved_encoding = resolve_file_encoding(self)?;
+        let resolved_encoding = resolve_file_encoding(self, resolved_auto)?;
 
         Ok(file_source(
             self,
@@ -497,35 +500,41 @@ pub struct ResolvedFileEncoding {
     pub mode: FileEncodingMode,
 }
 
-fn resolve_file_encoding(config: &FileConfig) -> crate::Result<ResolvedFileEncoding> {
-    let encoding_charset = config.encoding.clone().map(|e| e.charset);
-    match encoding_charset {
-        Some(CharsetMode::Auto) => {
-            let auto = config
-                .encoding
-                .as_ref()
-                .expect("charset auto requires encoding block")
-                .validate_and_resolve()?
-                .expect("auto mode resolves AutoDetectConfig");
-            let detector = std::sync::Arc::new(AutoFileEncodingDetector {
-                auto,
-                line_delimiter: config.line_delimiter.clone(),
-                sanitize_utf8: config.encoding.as_ref().is_some_and(|e| e.sanitize_utf8),
-            });
-            Ok(ResolvedFileEncoding {
-                line_delimiter: Bytes::from(config.line_delimiter.clone()),
-                mode: FileEncodingMode::Auto { detector },
-            })
-        }
-        Some(CharsetMode::Explicit(encoding)) => {
-            let delim = Encoder::new(encoding).encode_from_utf8(&config.line_delimiter);
-            Ok(ResolvedFileEncoding {
-                line_delimiter: delim,
-                mode: FileEncodingMode::Fixed {
-                    encoding_name: Some(encoding.name()),
-                },
-            })
-        }
+fn resolve_file_encoding(
+    config: &FileConfig,
+    resolved_auto: Option<AutoDetectConfig>,
+) -> crate::Result<ResolvedFileEncoding> {
+    match config.encoding.as_ref() {
+        Some(encoding) => match encoding.charset {
+            CharsetMode::Auto => {
+                // `validate_and_resolve` returns the auto config for `charset: auto`;
+                // a missing value here is a caller bug surfaced as a config error
+                // rather than a panic.
+                let Some(auto) = resolved_auto else {
+                    return Err(
+                        "charset auto requires resolved auto-detection settings".into(),
+                    );
+                };
+                let detector = std::sync::Arc::new(AutoFileEncodingDetector {
+                    auto,
+                    line_delimiter: config.line_delimiter.clone(),
+                    sanitize_utf8: encoding.sanitize_utf8,
+                });
+                Ok(ResolvedFileEncoding {
+                    line_delimiter: Bytes::from(config.line_delimiter.clone()),
+                    mode: FileEncodingMode::Auto { detector },
+                })
+            }
+            CharsetMode::Explicit(explicit) => {
+                let delim = Encoder::new(explicit).encode_from_utf8(&config.line_delimiter);
+                Ok(ResolvedFileEncoding {
+                    line_delimiter: delim,
+                    mode: FileEncodingMode::Fixed {
+                        encoding_name: Some(explicit.name()),
+                    },
+                })
+            }
+        },
         None => Ok(ResolvedFileEncoding {
             line_delimiter: Bytes::from(config.line_delimiter.clone()),
             mode: FileEncodingMode::Fixed {
@@ -3768,7 +3777,12 @@ mod tests {
             let (trigger_shutdown, shutdown, shutdown_done) = ShutdownSignal::new_wired();
             let data_dir = config.data_dir.clone().unwrap();
             let acks = !matches!(acking_mode, NoAcks);
-            let resolved_encoding = file::resolve_file_encoding(config).expect("test config");
+            let resolved_auto = config
+                .encoding
+                .as_ref()
+                .and_then(|e| e.validate_and_resolve().expect("test config"));
+            let resolved_encoding =
+                file::resolve_file_encoding(config, resolved_auto).expect("test config");
 
             tokio::spawn(file::file_source(
                 config,
