@@ -12,6 +12,20 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+/// How a charset decision was reached. Typed so consumers can branch on it
+/// without comparing the display label in `via`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectViaKind {
+    /// Byte-order mark.
+    Bom,
+    /// UTF-16 NUL-parity heuristic.
+    Utf16Heuristic,
+    /// Strict UTF-8 validation.
+    Utf8Valid,
+    /// Detection inconclusive; the configured fallback charset was applied.
+    Fallback,
+}
+
 /// Result of running auto-detection on a sniff window.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodingDetectOutcome {
@@ -21,7 +35,10 @@ pub enum EncodingDetectOutcome {
     Decided {
         /// `None` when bytes are already UTF-8 (zero-copy downstream).
         encoding_name: Option<&'static str>,
+        /// Display label for internal events and logs only.
         via: &'static str,
+        /// Typed counterpart of `via` for behavior decisions.
+        via_kind: DetectViaKind,
         line_delimiter: Bytes,
         /// Leading BOM bytes to skip on the held reader when `encoding_name` is `None`.
         bom_skip_bytes: u16,
