@@ -33,7 +33,9 @@ use crate::{
         DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
         log_schema,
     },
-    encoding_detect::{AutoDetectConfig, DetectOutcome, detect_charset, detect_charset_idle_force},
+    encoding_detect::{
+        AutoDetectConfig, DetectOutcome, DetectVia, detect_charset, detect_charset_idle_force,
+    },
     encoding_transcode::{Decoder, Encoder},
     event::{BatchNotifier, BatchStatus, LogEvent},
     internal_events::{
@@ -853,7 +855,13 @@ impl FileEncodingDetector for AutoFileEncodingDetector {
                     .filter(|(enc, _)| *enc == encoding_rs::UTF_8)
                     .map(|(_, len)| len as u16)
                     .unwrap_or(0);
-                let zero_copy_utf8 = encoding == encoding_rs::UTF_8;
+                // Zero-copy only when the sniff proved the bytes are UTF-8 (a UTF-8
+                // BOM or strict validation). A fallback decision means the window was
+                // NOT valid UTF-8 even when the fallback charset is UTF-8, so those
+                // files must flow through the decoder to get U+FFFD substitution and
+                // the malformed-input warning, matching explicit `charset: utf-8`.
+                let zero_copy_utf8 = encoding == encoding_rs::UTF_8
+                    && matches!(via, DetectVia::Bom | DetectVia::Utf8Valid);
                 EncodingDetectOutcome::Decided {
                     encoding_name: if zero_copy_utf8 {
                         None
@@ -3247,15 +3255,24 @@ mod tests {
         })
         .await;
 
-        let received = extract_messages_string(received);
-        assert_eq!(received.len(), 1, "under-threshold FFFD must not Reject: {received:?}");
+        // Assert on raw message bytes: `to_string_lossy` would introduce U+FFFD at
+        // display time and mask whether the decode path actually sanitized the line.
+        let received = extract_messages_value(received);
+        assert_eq!(
+            received.len(),
+            1,
+            "under-threshold FFFD must not Reject: {received:?}"
+        );
+        let bytes = received[0].as_bytes().expect("message must be bytes");
+        let text = std::str::from_utf8(bytes)
+            .expect("fallback-decided UTF-8 must be decoded, not passed through raw");
         assert!(
-            received[0].contains('a'),
-            "expected ASCII payload to survive: {received:?}"
+            text.contains('a'),
+            "expected ASCII payload to survive: {text:?}"
         );
         assert!(
-            received[0].contains('\u{FFFD}'),
-            "fixture should surface replacements (proves allow-path, not reject): {received:?}"
+            text.contains('\u{FFFD}'),
+            "fixture should surface replacements (proves allow-path, not reject): {text:?}"
         );
     }
 
