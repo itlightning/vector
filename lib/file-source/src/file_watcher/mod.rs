@@ -321,7 +321,7 @@ impl FileWatcher {
         }
 
         let sniff = if self.gzipped {
-            let decoder = GzipDecoder::new(BufReader::new(file));
+            let decoder = gzip_multiple_decoder(BufReader::new(file));
             let mut limited = decoder.take(max_bytes as u64);
             let mut buf = Vec::new();
             limited.read_to_end(&mut buf).await?;
