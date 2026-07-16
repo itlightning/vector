@@ -3182,8 +3182,10 @@ mod tests {
                 sleep(Duration::from_millis(200)).await;
                 assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-                // Sub-min UTF-16 (a few code units, no newline): still Pending.
-                write_whole(&path, &utf16le_bytes("abcdefghij"), gzip);
+                // Sub-min UTF-16, newline-terminated so the file fingerprints and
+                // gets a watcher: "stays Pending" is then enforced by the encoding
+                // gate, not by the fingerprinter refusing to watch.
+                write_whole(&path, &utf16le_bytes("abcdefghij\n"), gzip);
                 sleep(Duration::from_millis(400)).await;
                 assert_eq!(
                     counter.load(Ordering::SeqCst),
@@ -3191,19 +3193,21 @@ mod tests {
                     "must stay Pending below auto_detect_min_bytes"
                 );
 
-                // Cross min and complete a line.
-                let mut payload = utf16le_bytes("abcdefghij");
+                // Cross min with a second complete line (same first line keeps the
+                // fingerprint stable).
+                let mut payload = utf16le_bytes("abcdefghij\n");
                 payload.extend(utf16le_bytes(&format!("{}\n", "k".repeat(40))));
                 write_whole(&path, &payload, gzip);
-                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
             },
         )
         .await;
 
         let received = extract_messages_string(received);
-        assert_eq!(received.len(), 1);
-        assert!(received[0].contains('k'));
-        assert!(!received[0].contains('\0'));
+        assert_eq!(received.len(), 2, "both lines drain after deciding");
+        assert_eq!(received[0], "abcdefghij");
+        assert!(received[1].contains('k'));
+        assert!(received.iter().all(|m| !m.contains('\0')));
     }
 
     encoding_auto_plain_and_gzip!(
@@ -3524,7 +3528,10 @@ mod tests {
 
             {
                 let mut file = TestLogSink::create(&path, gzip).unwrap();
-                write!(&mut file, "tiny").unwrap();
+                // Newline-terminated so the checksum fingerprinter creates a
+                // watcher; without one the file never enters the Pending state
+                // this test exists to exercise.
+                writeln!(&mut file, "tiny").unwrap();
                 file.flush().unwrap();
             }
             sleep(Duration::from_millis(200)).await;
@@ -3568,7 +3575,9 @@ mod tests {
         };
 
         let line = format!("{}\n", "y".repeat(4200));
-        write_whole(&path, b"stay pending", gzip);
+        // Newline-terminated so the fingerprinter creates a watcher and the file
+        // actually reaches the Pending state that remove_after must reap.
+        write_whole(&path, b"stay pending\n", gzip);
         write_whole(&decoy, line.as_bytes(), gzip);
 
         let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
@@ -3748,7 +3757,7 @@ mod tests {
         // deciding; generation two must emit without rejecting during the inode change.
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
-            include: vec![dir.path().join("app.log")],
+            include: vec![dir.path().join("app.log"), dir.path().join("decoy.log")],
             encoding: Some(EncodingConfig {
                 auto_detect_min_bytes: Some(64),
                 ..EncodingConfig::auto()
@@ -3758,6 +3767,7 @@ mod tests {
 
         let path = dir.path().join("app.log");
         let rotated = dir.path().join("app.log.1");
+        let decoy = dir.path().join("decoy.log");
         let counter = Arc::new(AtomicUsize::new(0));
         let received = run_file_source(
             &config,
@@ -3768,15 +3778,24 @@ mod tests {
             async {
                 {
                     let mut gen1 = TestLogSink::create(&path, true).unwrap();
-                    let sub_min = "x".repeat(20);
-                    gen1.write_all(sub_min.as_bytes()).unwrap();
+                    // Newline-terminated so gen1 fingerprints and actually enters
+                    // Pending; still below min_bytes.
+                    writeln!(&mut gen1, "{}", "x".repeat(20)).unwrap();
                     gen1.flush().unwrap();
                 }
-                sleep(Duration::from_millis(300)).await;
+                // Causal checkpoint: a decoy written after gen1 emits only once a
+                // full server pass has processed both files, so asserting the
+                // counter afterwards proves gen1 stayed Pending (no timing guess).
+                {
+                    let mut decoy_sink = TestLogSink::create(&decoy, true).unwrap();
+                    writeln!(&mut decoy_sink, "{}", "d".repeat(70)).unwrap();
+                    decoy_sink.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
                 assert_eq!(
                     counter.load(Ordering::SeqCst),
-                    0,
-                    "sub-min pending gzip must not emit"
+                    1,
+                    "sub-min pending gzip must not emit; only the decoy may"
                 );
 
                 std::fs::rename(&path, &rotated).unwrap();
@@ -3787,7 +3806,7 @@ mod tests {
                     gen2.write_all(&payload).unwrap();
                     gen2.flush().unwrap();
                 }
-                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
             },
         )
         .await;
@@ -3801,7 +3820,7 @@ mod tests {
             received.iter().all(|m| !m.contains('\u{FFFD}')),
             "must not reject during rotation: {received:?}"
         );
-        assert!(counter.load(Ordering::SeqCst) >= 1);
+        assert!(counter.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]
