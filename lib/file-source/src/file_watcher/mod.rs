@@ -71,6 +71,10 @@ pub struct FileWatcher {
     reached_eof: bool,
     last_read_attempt: Instant,
     last_read_success: Instant,
+    /// When this watcher was created. Unlike `last_read_success`, which is seeded
+    /// from the file's mtime, this is a wall-clock "we started watching" mark and
+    /// is the floor for any age-based cleanup of files that never shipped a line.
+    watch_start: Instant,
     read_retry_delay: Duration,
     last_seen: Instant,
     max_line_bytes: usize,
@@ -201,6 +205,7 @@ impl FileWatcher {
             reached_eof: false,
             last_read_attempt: ts,
             last_read_success: ts,
+            watch_start: Instant::now(),
             read_retry_delay: EOF_READ_BACKOFF_MIN,
             last_seen: ts,
             max_line_bytes,
@@ -282,6 +287,16 @@ impl FileWatcher {
 
     pub fn get_file_position(&self) -> FilePosition {
         self.file_position
+    }
+
+    /// Whether the path still refers to the watched device+inode.
+    ///
+    /// `Ok(false)` means another file (for example a rotation successor) now
+    /// occupies the path; destructive path-based operations must be skipped.
+    pub async fn path_matches_watched_inode(&self) -> io::Result<bool> {
+        let file = File::open(&self.path).await?;
+        let file_info = file.file_info().await?;
+        Ok((file_info.portable_dev(), file_info.portable_ino()) == (self.devno, self.inode))
     }
 
     /// Path-open peek with inode verify on the same handle (shared by detect and idle force-decide).
@@ -510,6 +525,11 @@ impl FileWatcher {
     #[inline]
     pub fn last_read_success(&self) -> Instant {
         self.last_read_success
+    }
+
+    #[inline]
+    pub fn watch_start(&self) -> Instant {
+        self.watch_start
     }
 
     #[inline]
