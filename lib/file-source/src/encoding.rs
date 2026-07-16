@@ -1,8 +1,12 @@
 //! Optional per-file character-set auto-detection for the file source.
 //!
-//! Detection itself lives in the Vector crate (`encoding_detect`). This module
-//! only carries lifecycle state and a detector trait so `file-source` does not
-//! depend on `encoding_rs`.
+//! The detection ladder lives in the Vector crate (`encoding_detect`); this
+//! module only carries the per-file lifecycle state and a `FileEncodingDetector`
+//! trait that the Vector crate implements. That split is deliberate: it keeps
+//! `file-source` free of an `encoding_rs` dependency, so charsets cross the
+//! boundary as opaque `&'static str` names and line delimiters as pre-encoded
+//! `Bytes`. The trait implementation in the Vector crate owns the delimiter
+//! encoding and the UTF-8 zero-copy decision.
 
 use std::sync::Arc;
 
