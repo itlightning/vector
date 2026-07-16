@@ -163,7 +163,6 @@ pub struct EncodingConfig {
     ///
     /// Only valid when `charset` is `auto`. Defaults to `false`.
     #[serde(default)]
-    #[configurable(metadata(docs::examples = true))]
     pub sanitize_utf8: bool,
 }
 
