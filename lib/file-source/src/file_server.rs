@@ -369,7 +369,18 @@ where
                                 self.emitter.emit_file_deleted(&watcher.path);
                                 watcher.set_dead();
                             }
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            // An already-missing file counts as removed under
+                            // auto-detection, where a vanished path is also how
+                            // never-decided watchers get reaped. Fixed mode keeps
+                            // the long-standing retry-with-error behavior so
+                            // enabling nothing changes nothing.
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::NotFound
+                                    && matches!(
+                                        self.encoding_mode,
+                                        FileEncodingMode::Auto { .. }
+                                    ) =>
+                            {
                                 watcher.set_dead();
                             }
                             Err(error) => {
