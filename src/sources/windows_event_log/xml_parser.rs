@@ -580,9 +580,7 @@ fn parse_section(
             Ok(XmlEvent::Empty(_)) => {
                 // Self-closing element carries no text, so it is never a
                 // value-bearing leaf, but it does make its parent a wrapper.
-                if inside_section
-                    && let Some(top) = stack.last_mut()
-                {
+                if inside_section && let Some(top) = stack.last_mut() {
                     top.had_child = true;
                 }
             }
@@ -1222,13 +1220,22 @@ mod tests {
         let config = WindowsEventLogConfig::default();
         let result = extract_event_data(xml, &config);
 
-        assert_eq!(result.user_data.get("PolicyName").map(String::as_str), Some("EXE"));
+        assert_eq!(
+            result.user_data.get("PolicyName").map(String::as_str),
+            Some("EXE")
+        );
         assert_eq!(
             result.user_data.get("FullFilePath").map(String::as_str),
             Some(r"C:\App\bad.exe")
         );
-        assert_eq!(result.user_data.get("RuleName").map(String::as_str), Some("Deny bad.exe"));
-        assert_eq!(result.user_data.get("PolicyNameLength").map(String::as_str), Some("3"));
+        assert_eq!(
+            result.user_data.get("RuleName").map(String::as_str),
+            Some("Deny bad.exe")
+        );
+        assert_eq!(
+            result.user_data.get("PolicyNameLength").map(String::as_str),
+            Some("3")
+        );
         // The wrapper element itself is not a leaf and must not appear.
         assert!(!result.user_data.contains_key("RuleAndFileData"));
     }
@@ -1258,7 +1265,10 @@ mod tests {
             result.user_data.get("TaskName").map(String::as_str),
             Some(r"\Microsoft\Windows\Defrag\ScheduledDefrag")
         );
-        assert_eq!(result.user_data.get("ResultCode").map(String::as_str), Some("0"));
+        assert_eq!(
+            result.user_data.get("ResultCode").map(String::as_str),
+            Some("0")
+        );
         assert!(!result.user_data.contains_key("EventInfo"));
         assert!(!result.user_data.contains_key("TaskSchedulerEvent"));
     }
@@ -1282,8 +1292,14 @@ mod tests {
         let config = WindowsEventLogConfig::default();
         let result = extract_event_data(xml, &config);
 
-        assert_eq!(result.user_data.get("ErrorCode").map(String::as_str), Some("0x5"));
-        assert_eq!(result.user_data.get("Reason").map(String::as_str), Some("AccessDenied"));
+        assert_eq!(
+            result.user_data.get("ErrorCode").map(String::as_str),
+            Some("0x5")
+        );
+        assert_eq!(
+            result.user_data.get("Reason").map(String::as_str),
+            Some("AccessDenied")
+        );
     }
 
     #[test]
@@ -1304,7 +1320,10 @@ mod tests {
         let config = WindowsEventLogConfig::default();
         let result = extract_event_data(xml, &config);
 
-        assert_eq!(result.user_data.get("Item").map(String::as_str), Some("first"));
+        assert_eq!(
+            result.user_data.get("Item").map(String::as_str),
+            Some("first")
+        );
     }
 
     #[test]
@@ -1329,8 +1348,14 @@ mod tests {
         let result = extract_event_data(&xml, &config);
 
         let value = result.user_data.get("FilePath").unwrap();
-        assert!(value.ends_with("...[truncated]"), "Oversized leaf should be truncated");
-        assert!(value.len() <= 32 + "...[truncated]".len(), "Truncated leaf should respect limit");
+        assert!(
+            value.ends_with("...[truncated]"),
+            "Oversized leaf should be truncated"
+        );
+        assert!(
+            value.len() <= 32 + "...[truncated]".len(),
+            "Truncated leaf should respect limit"
+        );
     }
 
     #[test]
@@ -1355,7 +1380,11 @@ mod tests {
             </UserData>
         </Event>
         "#;
-        assert!(extract_event_data(blank_leaves, &config).user_data.is_empty());
+        assert!(
+            extract_event_data(blank_leaves, &config)
+                .user_data
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1378,9 +1407,15 @@ mod tests {
         let config = WindowsEventLogConfig::default();
         let result = extract_event_data(xml, &config);
 
-        assert_eq!(result.structured_data.get("LogonType").map(String::as_str), Some("2"));
         assert_eq!(
-            result.structured_data.get("TargetUserName").map(String::as_str),
+            result.structured_data.get("LogonType").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            result
+                .structured_data
+                .get("TargetUserName")
+                .map(String::as_str),
             Some("alice")
         );
         assert_eq!(result.string_inserts, vec!["positional".to_string()]);
