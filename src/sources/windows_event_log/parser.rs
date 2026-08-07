@@ -9,7 +9,7 @@ use vector_lib::event::LogEvent;
 use super::{
     config::{EventDataFormat, WindowsEventLogConfig},
     error::*,
-    xml_parser::{MessageSource, WindowsEvent},
+    xml_parser::WindowsEvent,
 };
 
 /// Fixed marker appended to the message text of an event whose publisher
@@ -524,6 +524,7 @@ impl EventLogParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::windows_event_log::xml_parser::MessageSource;
     use chrono::Utc;
     use std::collections::HashMap;
 
