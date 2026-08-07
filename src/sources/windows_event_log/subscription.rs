@@ -1308,19 +1308,16 @@ impl EventLogSubscription {
                                 event.opcode_name = display.opcode_name;
                                 event.keyword_names = display.keyword_names;
 
-                                // Exact in-process boundary. The generated
-                                // XPath predicate floors to the millisecond and
-                                // therefore over-delivers; trimming here at
-                                // full (TimeCreated, RecordId) resolution is
-                                // what makes precision contribute zero
-                                // duplicates on every resume path. It is also
-                                // where a deliberately skipped poison record is
-                                // dropped.
-                                // `past_boundary` separates the two reasons a
-                                // record is not emitted: an over-delivered
-                                // duplicate (the XPath floors to the
-                                // millisecond) versus the deliberate one-shot
-                                // poison skip. Only the latter has to be made
+                                // Exact in-process boundary. The generated XPath
+                                // predicate floors to the millisecond and
+                                // therefore over-delivers; trimming here at full
+                                // (TimeCreated, RecordId) resolution is what
+                                // makes precision contribute zero duplicates on
+                                // every resume path. It is also where a
+                                // deliberately skipped poison record is dropped,
+                                // and `past_boundary` is what separates the two:
+                                // an over-delivered duplicate needs nothing,
+                                // while the one-shot poison skip has to be made
                                 // durable.
                                 let past_boundary = channel_sub
                                     .resume
