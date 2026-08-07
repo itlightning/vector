@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use snafu::{ResultExt, Snafu};
@@ -48,15 +48,64 @@ use crate::{
 };
 
 const DROPPED: &str = "dropped";
-type CacheKey = (TableRegistry, schema::Definition);
-type CacheValue = (Program, String, MeaningList);
+
+/// Everything a compiled program depends on, so two compilations sharing a key produce the same
+/// program: the two context values the compiler can store inside the program (the enrichment table
+/// registry and the metrics storage), the initial type state (derived from the merged schema
+/// definition), and the program text.
+///
+/// Both context values are compared by identity: `TableRegistry` through its own pessimistic
+/// `Arc::ptr_eq` `PartialEq`, because its tables are opaque and can be huge, and the metrics
+/// storage through the address of its shared cache. Identity is what correctness needs, because an
+/// enrichment function records its index requirement on the registry it compiled against and
+/// stores a read handle to that registry's tables inside the program, and a metrics function
+/// likewise captures the storage it compiled against, so a program may only be reused against the
+/// same instances.
+type CacheKey = (TableRegistry, usize, schema::Definition, String);
+type CacheValue = (Arc<Program>, String, MeaningList);
+
+struct CachedProgram {
+    key: CacheKey,
+    result: std::result::Result<CacheValue, String>,
+}
+
+/// Memo of compiled VRL programs, shared across config instances for the duration of one build.
+///
+/// A `remap` program is compiled several times while a topology is assembled: once per `outputs()`
+/// call as schema definitions are resolved, once in `validate_env`, and again in `build`. `build`
+/// compiles from a clone of the config, so a cache stored on `self` can never serve it, and
+/// compilation dominates startup for large programs. Keying on the compilation inputs instead of
+/// on the config instance removes those repeats.
+///
+/// The program is held behind an `Arc`, so a hit shares the compiled program with the topology
+/// rather than copying it, and the memo is emptied around every build cycle
+/// ([`clear_compiled_program_cache`]), so nothing is retained speculatively past the cycle that
+/// produced it. Between cycles the only live programs are the ones the running topology holds.
+///
+/// A `Vec` rather than a map because `TableRegistry` is neither hashable nor orderable; the scan is
+/// over a handful of entries and the identity comparisons come first.
+static PROGRAM_CACHE: OnceLock<Mutex<Vec<CachedProgram>>> = OnceLock::new();
+
+fn program_cache() -> &'static Mutex<Vec<CachedProgram>> {
+    PROGRAM_CACHE.get_or_init(Default::default)
+}
+
+/// Drops every memoized program. Called by the topology builder around a build or reload cycle:
+/// the memo exists to deduplicate compilations *within* one cycle, and a program compiled for a
+/// previous cycle can never be reused anyway, because its key pins the enrichment registry
+/// generation and the config text it was built from. Clearing bounds retention to the cycle in
+/// flight instead of the process lifetime, which matters for the long-running service; under
+/// `vector validate` the process exits immediately and the distinction does not arise.
+pub fn clear_compiled_program_cache() {
+    program_cache().lock().expect("Data poisoned").clear();
+}
 
 /// Configuration for the `remap` transform.
 #[configurable_component(transform(
     "remap",
     "Modify your observability data as it passes through your topology using Vector Remap Language (VRL)."
 ))]
-#[derive(Derivative)]
+#[derive(Clone, Derivative)]
 #[serde(deny_unknown_fields)]
 #[derivative(Default, Debug)]
 pub struct RemapConfig {
@@ -156,31 +205,6 @@ pub struct RemapConfig {
     #[configurable(derived, metadata(docs::hidden))]
     #[serde(default)]
     pub runtime: VrlRuntime,
-
-    #[configurable(derived, metadata(docs::hidden))]
-    #[serde(skip)]
-    #[derivative(Debug = "ignore")]
-    /// Cache can't be `BTreeMap` or `HashMap` because of `TableRegistry`, which doesn't allow us to inspect tables inside it.
-    /// And even if we allowed the inspection, the tables can be huge, resulting in a long comparison or hash computation
-    /// while using `Vec` allows us to use just a shallow comparison
-    pub cache: Mutex<Vec<(CacheKey, std::result::Result<CacheValue, String>)>>,
-}
-
-impl Clone for RemapConfig {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            file: self.file.clone(),
-            files: self.files.clone(),
-            metric_tag_values: self.metric_tag_values,
-            timezone: self.timezone,
-            drop_on_error: self.drop_on_error,
-            drop_on_abort: self.drop_on_abort,
-            reroute_dropped: self.reroute_dropped,
-            runtime: self.runtime,
-            cache: Mutex::new(Default::default()),
-        }
-    }
 }
 
 impl RemapConfig {
@@ -189,17 +213,7 @@ impl RemapConfig {
         enrichment_tables: TableRegistry,
         metrics_storage: MetricsStorage,
         merged_schema_definition: schema::Definition,
-    ) -> Result<(Program, String, MeaningList)> {
-        if let Some((_, res)) = self
-            .cache
-            .lock()
-            .expect("Data poisoned")
-            .iter()
-            .find(|v| v.0.0 == enrichment_tables && v.0.1 == merged_schema_definition)
-        {
-            return res.clone().map_err(Into::into);
-        }
-
+    ) -> Result<CacheValue> {
         let source = match (&self.source, &self.file, &self.files) {
             (Some(source), None, None) => source.to_owned(),
             (None, Some(path), None) => Self::read_file(path)?,
@@ -214,6 +228,26 @@ impl RemapConfig {
             }
             _ => return Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
         };
+
+        // Reading `file`/`files` happens before the lookup because the text is part of the key.
+        // The read is negligible next to a compilation, which is what the memo is protecting.
+        // The text is kept in the key rather than a hash of it: an exact comparison cannot serve
+        // the wrong program, and the memo only lives for one build cycle.
+        let metrics_storage_id = Arc::as_ptr(&metrics_storage.cache) as usize;
+        if let Some(entry) = program_cache()
+            .lock()
+            .expect("Data poisoned")
+            .iter()
+            .find(|entry| {
+                entry.key.1 == metrics_storage_id
+                    && entry.key.3 == source
+                    && entry.key.0 == enrichment_tables
+                    && entry.key.2 == merged_schema_definition
+            })
+        {
+            return entry.result.clone().map_err(Into::into);
+        }
+        let started = std::time::Instant::now();
 
         let state = TypeState {
             local: Default::default(),
@@ -232,16 +266,29 @@ impl RemapConfig {
             .map_err(|diagnostics| format_vrl_diagnostics(&source, diagnostics))
             .map(|result| {
                 (
-                    result.program,
+                    Arc::new(result.program),
                     format_vrl_diagnostics(&source, result.warnings),
                     result.config.get_custom::<MeaningList>().unwrap().clone(),
                 )
             });
 
-        self.cache
-            .lock()
-            .expect("Data poisoned")
-            .push(((enrichment_tables, merged_schema_definition), res.clone()));
+        debug!(
+            message = "Compiled a VRL program.",
+            elapsed_ms = started.elapsed().as_millis(),
+            source_bytes = source.len(),
+            ok = res.is_ok(),
+        );
+        let mut cache = program_cache().lock().expect("Data poisoned");
+        cache.push(CachedProgram {
+            key: (
+                enrichment_tables,
+                metrics_storage_id,
+                merged_schema_definition,
+                source,
+            ),
+            result: res.clone(),
+        });
+        drop(cache);
 
         res.map_err(Into::into)
     }
@@ -416,7 +463,9 @@ where
     Runner: VrlRunner,
 {
     component_key: Option<ComponentKey>,
-    program: Program,
+    // Shared with the compilation memo, so a memo hit costs a refcount rather than a copy of the
+    // whole program.
+    program: Arc<Program>,
     timezone: TimeZone,
     drop_on_error: bool,
     drop_on_abort: bool,
@@ -485,7 +534,7 @@ where
     fn new(
         config: RemapConfig,
         context: &TransformContext,
-        program: Program,
+        program: Arc<Program>,
         runner: Runner,
     ) -> crate::Result<Self> {
         Ok(Remap {

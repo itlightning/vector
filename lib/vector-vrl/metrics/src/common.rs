@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::time::interval;
-use tokio_stream::{wrappers::IntervalStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::IntervalStream};
 use vector_common::shutdown::ShutdownSignal;
 use vrl::{
     diagnostic::Label,
@@ -43,11 +43,27 @@ impl DiagnosticMessage for Error {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct MetricsStorage {
     // Made pub only for vrl-test module
     #[doc(hidden)]
     pub cache: Arc<ArcSwap<Vec<Metric>>>,
+}
+
+/// The storage mirrors the process-wide metrics `Controller`, so a process only ever needs one of
+/// them, and only one of them is ever refreshed. Handing out clones of a single instance keeps
+/// every VRL program that captures the storage at compile time bound to the one that receives
+/// updates, rather than to a throwaway built by a `TransformContext::default()` that stays empty
+/// for the lifetime of the process.
+impl Default for MetricsStorage {
+    fn default() -> Self {
+        static SHARED: std::sync::OnceLock<MetricsStorage> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| Self {
+                cache: Arc::default(),
+            })
+            .clone()
+    }
 }
 
 impl MetricsStorage {
@@ -205,8 +221,8 @@ mod tests {
     };
     use vrl::{
         compiler::{
-            runtime::{Runtime, Terminate},
             CompilationResult, CompileConfig,
+            runtime::{Runtime, Terminate},
         },
         diagnostic::DiagnosticList,
     };
