@@ -484,6 +484,7 @@ windows-service = "0.8.0"
 windows = { version = "0.58", features = ["Win32_System_EventLog", "Win32_Foundation", "Win32_System_Com", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem"], optional = true }
 quick-xml = { version = "0.31", default-features = false, features = ["serialize"], optional = true }
 rdkafka = { workspace = true, features = ["cmake_build"], optional = true }
+mimalloc = { version = "=0.1.52", default-features = false, features = ["secure"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -577,6 +578,10 @@ default-musl = ["enable-api-client", "sources-dnstap", "tikv-jemallocator", "ven
 default-no-api-client = ["base", "sources-dnstap", "tikv-jemallocator", "vendored"]
 
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+
+# Use mimalloc (secure mode) as the global allocator. Intended for builds that do not
+# enable `tikv-jemallocator` (e.g. Windows); jemalloc wins if both are enabled on unix.
+mimalloc-allocator = ["dep:mimalloc"]
 
 # VRL functions control features
 vrl-functions-env = ["vrl/enable_env_functions"]

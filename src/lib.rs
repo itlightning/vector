@@ -51,6 +51,16 @@ static ALLOC: self::internal_telemetry::allocations::Allocator<tikv_jemallocator
         tikv_jemallocator::Jemalloc,
     );
 
+#[cfg(all(
+    feature = "mimalloc-allocator",
+    not(all(unix, feature = "tikv-jemallocator"))
+))]
+// Plain static, not `get_grouped_tracing_allocator`: the grouped tracing allocator lives in
+// `internal_telemetry::allocations`, which is `#[cfg(unix)]`, and this allocator is for the
+// non-jemalloc (Windows) case.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[allow(unreachable_pub)]
 pub mod internal_telemetry;
 
