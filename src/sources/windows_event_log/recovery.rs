@@ -301,11 +301,15 @@ impl ResumeState {
             Rung::FutureOnly => Rung::FutureOnly,
         };
 
-        if self.rung == Rung::SkipRecord {
-            // Arm the one-shot. The record we mean is the one immediately past
-            // the boundary, which is the first record the next resume delivers.
-            self.skip_next_record = true;
-        }
+        // Total, not conditional: the flag must always describe the rung the
+        // ladder is actually on. Arming means the record immediately past the
+        // boundary, which is the first record the next resume delivers.
+        // Disarming matters when the ladder moves past the skip rung without a
+        // record ever arriving to consume it: the poison sat at the `EvtNext`
+        // level, nothing was delivered, and the time rung is now the skip
+        // mechanism. A stale one-shot there would eat a good event on top of
+        // the window we already meant to discard.
+        self.skip_next_record = self.rung == Rung::SkipRecord;
 
         self.rung
     }
@@ -756,6 +760,44 @@ mod tests {
                 "record {id} must be delivered; the skip is one-shot"
             );
         }
+    }
+
+    /// The one-shot is armed by landing on the skip rung, so it must be
+    /// disarmed by leaving it.
+    ///
+    /// This is the `EvtNext`-level poison: the failure is upstream of record
+    /// delivery, so no record ever arrives to consume the arm. The ladder keeps
+    /// escalating and reaches the time rung with the skip still pending. If the
+    /// arm survived, the first good record past the new time floor would be
+    /// silently dropped, one event lost on top of the window the time rung
+    /// already discards, in the one path where the time advance IS the skip.
+    #[test]
+    fn advancing_past_the_skip_rung_disarms_the_one_shot() {
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(ts(1_700_000_000, 0), 42);
+
+        assert_eq!(resume.advance_rung(), Rung::IsolateOne);
+        assert_eq!(resume.advance_rung(), Rung::SkipRecord);
+        assert!(resume.skip_next_record, "the skip rung arms the one-shot");
+
+        // Nothing is delivered: the poison is at the `EvtNext` level, so the
+        // arm is never consumed and the channel goes stuck again.
+        assert_eq!(
+            resume.advance_rung(),
+            Rung::TimeAdvance(TimeRung::BoundaryTick)
+        );
+        assert!(
+            !resume.skip_next_record,
+            "leaving the skip rung must disarm the unconsumed one-shot"
+        );
+
+        // The time floor advanced and records flow again. The first one past
+        // the new floor is a good event and must be admitted.
+        assert!(
+            resume.admit(ts(1_700_000_001, 0), 43),
+            "the first record past the new time floor must be admitted"
+        );
+        assert!(resume.admit(ts(1_700_000_002, 0), 44));
     }
 
     /// A dead bookmark is not a poison event. There is no offending record, so a
