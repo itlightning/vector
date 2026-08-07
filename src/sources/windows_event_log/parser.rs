@@ -12,12 +12,22 @@ use super::{
     xml_parser::WindowsEvent,
 };
 
-/// Fixed marker appended to the message text of an event whose publisher
-/// template could not be rendered.
+/// Separator between whatever inserts we salvaged and the honesty suffix.
+pub(super) const UNRENDERABLE_MESSAGE_JOIN: &str = " | ";
+
+/// Honesty suffix for an event whose publisher template could not be rendered,
+/// naming the provider that is missing.
 ///
-/// A fixed literal on purpose: downstream consumers strip it deterministically,
-/// and the `message_source` field, not this text, is what they key on.
-pub(super) const UNRENDERABLE_MESSAGE_SUFFIX: &str = " [message template unavailable]";
+/// Shape is fixed so a consumer can strip it deterministically, and it carries
+/// no brackets so it reads as prose and extracts cleanly. The provider name is
+/// the actionable part: the reason there is no description is that this provider
+/// is not registered on this host, which is a fact about the host and not about
+/// the event.
+///
+/// The `message_source` field, not this text, remains what consumers key on.
+pub(super) fn unrenderable_message_suffix(provider: &str) -> String {
+    format!("no description; provider {provider} is not registered on this host")
+}
 
 /// Parser for converting Windows Event Log events to Vector LogEvents
 pub struct EventLogParser {
@@ -345,17 +355,17 @@ impl EventLogParser {
     /// The text therefore carries a fixed honesty marker, including in the
     /// single-insert case.
     ///
-    /// Shape: one insert renders as the insert plus the suffix; two or more
-    /// join in order with `; ` plus the suffix; none renders as the suffix
-    /// alone. The suffix is a fixed literal so a downstream consumer can strip
-    /// it deterministically, and `message_source` remains the authoritative
-    /// field to key on.
+    /// Shape: inserts join in order with `; `, then ` | `, then the suffix; no
+    /// inserts renders as the suffix alone. Never empty: an empty message is
+    /// worse than a degraded one, because it hides a real signal about the host.
+    /// `message_source` remains the authoritative field to key on.
     fn degraded_message(&self, event: &WindowsEvent) -> String {
+        let suffix = unrenderable_message_suffix(&event.provider_name);
         let body = self.extract_message_from_event_data(event);
         if body.is_empty() {
-            UNRENDERABLE_MESSAGE_SUFFIX.trim_start().to_string()
+            suffix
         } else {
-            format!("{body}{UNRENDERABLE_MESSAGE_SUFFIX}")
+            format!("{body}{UNRENDERABLE_MESSAGE_JOIN}{suffix}")
         }
     }
 
@@ -810,26 +820,28 @@ mod tests {
         let mut event = create_test_event();
         event.rendered_message = None;
         event.event_data.clear();
+        event.provider_name = "Contoso-Widget".to_string();
 
-        // No inserts: the suffix alone, with no leading space.
+        // No inserts: the suffix alone. Never empty, and never a bracketed
+        // marker: the text states the actual host condition.
         event.string_inserts = Vec::new();
         assert_eq!(
             parser.degraded_message(&event),
-            UNRENDERABLE_MESSAGE_SUFFIX.trim_start()
+            "no description; provider Contoso-Widget is not registered on this host"
         );
 
-        // One insert: the insert plus the suffix.
+        // One insert: the insert, then the suffix.
         event.string_inserts = vec!["1815".to_string()];
         assert_eq!(
             parser.degraded_message(&event),
-            format!("1815{UNRENDERABLE_MESSAGE_SUFFIX}")
+            "1815 | no description; provider Contoso-Widget is not registered on this host"
         );
 
         // Two or more: joined in order with "; ", then the suffix.
         event.string_inserts = vec!["alpha".to_string(), "beta".to_string()];
         assert_eq!(
             parser.degraded_message(&event),
-            format!("alpha; beta{UNRENDERABLE_MESSAGE_SUFFIX}")
+            "alpha; beta | no description; provider Contoso-Widget is not registered on this host"
         );
     }
 

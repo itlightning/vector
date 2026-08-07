@@ -21,6 +21,17 @@ pub(super) fn render_event_xml(
 ) -> Result<String, WindowsEventLogError> {
     const MAX_BUFFER_SIZE: u32 = 10 * 1024 * 1024; // 10MB limit
 
+    // Test-only fault injection for the unprocessable-event path (D19). A real
+    // malformed event is not producible on demand, and the behavior under test
+    // (skip the event, keep the subscription, advance past it) is exactly what
+    // must not be asserted from the implementation.
+    #[cfg(test)]
+    if super::subscription::FAIL_ALL_RENDERS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(WindowsEventLogError::ReadEventError {
+            source: windows::core::Error::from_hresult(windows::core::HRESULT(13)),
+        });
+    }
+
     let buffer_size = render_buffer.len() as u32;
     let mut buffer_used = 0u32;
     let mut property_count = 0u32;

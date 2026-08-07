@@ -103,10 +103,6 @@ pub(super) enum DrainOutcome {
     Drained,
     /// Stop reading this channel for this subscription generation.
     SkipChannel(SkipReason),
-    /// A cancel we issued ourselves as part of teardown. Never a reconnect
-    /// trigger: without distinguishing it, intentional teardown causes a
-    /// reconnect storm.
-    Cancelled,
     /// Halve the batch size and reopen from the bookmark: the batch was too
     /// large for the API to marshal.
     ReduceBatch,
@@ -165,7 +161,6 @@ pub(super) fn classify_evt_next(
     code: u32,
     returned: u32,
     query_origin: QueryOrigin,
-    self_cancelled: bool,
 ) -> DrainOutcome {
     match code {
         c if c == ERROR_NO_MORE_ITEMS.0 => DrainOutcome::Drained,
@@ -180,15 +175,19 @@ pub(super) fn classify_evt_next(
             }
         }
 
-        c if c == ERROR_CANCELLED.0 => {
-            if self_cancelled {
-                DrainOutcome::Cancelled
-            } else {
-                // A service-side cancel is a real interruption, not our
-                // shutdown, so it must rebuild.
-                DrainOutcome::Rebuild
-            }
-        }
+        // A cancel seen HERE is always someone else's. We never call
+        // `EvtCancel`, and the subscription is moved into the blocking task by
+        // ownership transfer, so no other thread can cancel a drain that is in
+        // flight: shutdown signals a separate Windows event object instead. A
+        // service-side cancel is a real interruption and must rebuild.
+        //
+        // The design allowed for a self-cancel flag to keep intentional teardown
+        // from causing a reconnect storm. There is no call site that can set it
+        // truthfully under ownership transfer, so it is not carried: a flag that
+        // is provably always false reads like a live guard and is not one. If a
+        // cross-thread `EvtCancel` is ever introduced, the flag comes back with
+        // it.
+        c if c == ERROR_CANCELLED.0 => DrainOutcome::Rebuild,
 
         c if c == ERROR_EVT_INVALID_CHANNEL_PATH.0 => {
             DrainOutcome::SkipChannel(SkipReason::InvalidChannelPath)
@@ -326,7 +325,7 @@ mod tests {
     #[test]
     fn no_more_items_is_a_benign_drain_terminator() {
         assert_eq!(
-            classify_evt_next(259, 0, QueryOrigin::Operator, false),
+            classify_evt_next(259, 0, QueryOrigin::Operator),
             DrainOutcome::Drained
         );
     }
@@ -339,11 +338,11 @@ mod tests {
     #[test]
     fn invalid_operation_is_discriminated_on_the_returned_count() {
         assert_eq!(
-            classify_evt_next(4317, 0, QueryOrigin::Operator, false),
+            classify_evt_next(4317, 0, QueryOrigin::Operator),
             DrainOutcome::Drained
         );
         assert_eq!(
-            classify_evt_next(4317, 3, QueryOrigin::Operator, false),
+            classify_evt_next(4317, 3, QueryOrigin::Operator),
             DrainOutcome::Rebuild
         );
     }
@@ -352,7 +351,7 @@ mod tests {
     fn unknown_codes_rebuild_rather_than_retrying_the_same_handle() {
         for code in [6u32, 87, 1717, 1722, 1726, 1818, 15007, 15011, 15012, 60123] {
             assert_eq!(
-                classify_evt_next(code, 0, QueryOrigin::Operator, false),
+                classify_evt_next(code, 0, QueryOrigin::Operator),
                 DrainOutcome::Rebuild,
                 "code {code} must rebuild"
             );
@@ -362,19 +361,18 @@ mod tests {
     #[test]
     fn oversized_batch_reduces_rather_than_rebuilding_blindly() {
         assert_eq!(
-            classify_evt_next(1734, 0, QueryOrigin::Operator, false),
+            classify_evt_next(1734, 0, QueryOrigin::Operator),
             DrainOutcome::ReduceBatch
         );
     }
 
+    /// We never issue `EvtCancel`, and ownership transfer means no other thread
+    /// can cancel a drain in flight, so a cancel seen at `EvtNext` is always a
+    /// service-side interruption and rebuilding is the only correct response.
     #[test]
-    fn self_issued_cancel_is_not_a_reconnect_trigger() {
+    fn a_cancel_at_evt_next_is_always_service_side_and_rebuilds() {
         assert_eq!(
-            classify_evt_next(1223, 0, QueryOrigin::Operator, true),
-            DrainOutcome::Cancelled
-        );
-        assert_eq!(
-            classify_evt_next(1223, 0, QueryOrigin::Operator, false),
+            classify_evt_next(1223, 0, QueryOrigin::Operator),
             DrainOutcome::Rebuild
         );
     }
@@ -382,7 +380,7 @@ mod tests {
     #[test]
     fn invalid_query_splits_by_origin() {
         assert_eq!(
-            classify_evt_next(15001, 0, QueryOrigin::Operator, false),
+            classify_evt_next(15001, 0, QueryOrigin::Operator),
             DrainOutcome::SkipChannel(SkipReason::OperatorQueryInvalid)
         );
         assert_eq!(
@@ -398,7 +396,7 @@ mod tests {
     #[test]
     fn access_denied_skips_the_generation_rather_than_looping() {
         assert_eq!(
-            classify_evt_next(5, 0, QueryOrigin::Operator, false),
+            classify_evt_next(5, 0, QueryOrigin::Operator),
             DrainOutcome::SkipChannel(SkipReason::AccessDenied)
         );
         assert_eq!(
