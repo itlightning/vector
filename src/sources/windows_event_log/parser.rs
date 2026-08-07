@@ -9,8 +9,15 @@ use vector_lib::event::LogEvent;
 use super::{
     config::{EventDataFormat, WindowsEventLogConfig},
     error::*,
-    xml_parser::WindowsEvent,
+    xml_parser::{MessageSource, WindowsEvent},
 };
+
+/// Fixed marker appended to the message text of an event whose publisher
+/// template could not be rendered.
+///
+/// A fixed literal on purpose: downstream consumers strip it deterministically,
+/// and the `message_source` field, not this text, is what they key on.
+pub(super) const UNRENDERABLE_MESSAGE_SUFFIX: &str = " [message template unavailable]";
 
 /// Parser for converting Windows Event Log events to Vector LogEvents
 pub struct EventLogParser {
@@ -68,7 +75,7 @@ impl EventLogParser {
                 .rendered_message
                 .as_ref()
                 .cloned()
-                .unwrap_or_else(|| self.extract_message_from_event_data(event));
+                .unwrap_or_else(|| self.degraded_message(event));
 
             log_event.try_insert(message_key, Value::Bytes(message.into()));
         }
@@ -102,7 +109,7 @@ impl EventLogParser {
                 .rendered_message
                 .as_ref()
                 .cloned()
-                .unwrap_or_else(|| self.extract_message_from_event_data(event));
+                .unwrap_or_else(|| self.degraded_message(event));
 
             log_event.try_insert(message_key, Value::Bytes(message.into()));
         }
@@ -136,6 +143,13 @@ impl EventLogParser {
         log_event.insert(
             event_path!("level"),
             Value::Bytes(event.level_name().into()),
+        );
+
+        // Authoritative for consumers: the honesty suffix in the message text
+        // is for humans, this field is what a consumer branches on.
+        log_event.insert(
+            event_path!("message_source"),
+            Value::Bytes(event.message_source.as_str().into()),
         );
 
         log_event.insert(
@@ -322,6 +336,29 @@ impl EventLogParser {
         as_bytes()
     }
 
+    /// Message text for an event whose publisher template was unavailable.
+    ///
+    /// The publisher template is what turns raw inserts into a sentence, so
+    /// without it the inserts are not a message: some applications define a
+    /// real message table where the single insert is a bare numeric parameter,
+    /// and presenting that alone as the event message is actively misleading.
+    /// The text therefore carries a fixed honesty marker, including in the
+    /// single-insert case.
+    ///
+    /// Shape: one insert renders as the insert plus the suffix; two or more
+    /// join in order with `; ` plus the suffix; none renders as the suffix
+    /// alone. The suffix is a fixed literal so a downstream consumer can strip
+    /// it deterministically, and `message_source` remains the authoritative
+    /// field to key on.
+    fn degraded_message(&self, event: &WindowsEvent) -> String {
+        let body = self.extract_message_from_event_data(event);
+        if body.is_empty() {
+            UNRENDERABLE_MESSAGE_SUFFIX.trim_start().to_string()
+        } else {
+            format!("{body}{UNRENDERABLE_MESSAGE_SUFFIX}")
+        }
+    }
+
     fn extract_message_from_event_data(&self, event: &WindowsEvent) -> String {
         // Try to find a message in named event data fields
         for (key, value) in &event.event_data {
@@ -330,18 +367,22 @@ impl EventLogParser {
             }
         }
 
-        // Try string inserts (unnamed <Data> elements, e.g. from eventcreate)
-        if let Some(first) = event.string_inserts.first() {
-            if !first.is_empty() {
-                return first.clone();
-            }
+        // String inserts (unnamed <Data> elements, e.g. from eventcreate),
+        // joined in order. Order is meaningful: it is the order the template
+        // would have consumed them in.
+        let inserts: Vec<&str> = event
+            .string_inserts
+            .iter()
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !inserts.is_empty() {
+            return inserts.join("; ");
         }
 
-        // Fall back to generic message
-        format!(
-            "Event ID {} from {} on {}",
-            event.event_id, event.provider_name, event.computer
-        )
+        // Nothing usable. The caller supplies the honesty marker; inventing a
+        // synthetic sentence here would read as a real event message.
+        String::new()
     }
 
     fn apply_field_filtering(&self, log_event: &mut LogEvent) -> Result<(), WindowsEventLogError> {
@@ -523,6 +564,7 @@ mod tests {
             version: Some(1),
             qualifiers: Some(0),
             string_inserts: vec!["value1".to_string(), "value2".to_string()],
+            message_source: MessageSource::Publisher,
         }
     }
 
@@ -616,6 +658,7 @@ mod tests {
             version: Some(2),
             qualifiers: None,
             string_inserts: vec![],
+            message_source: MessageSource::Publisher,
         };
 
         let log_event = parser.parse_event(event).unwrap();
@@ -750,6 +793,66 @@ mod tests {
 
         let message = parser.extract_message_from_event_data(&event);
         assert_eq!(message, "Custom message");
+    }
+
+    /// Degradation shape when the publisher template is unavailable.
+    ///
+    /// The suffix is present in every case, including the single-insert one:
+    /// some applications define a real message table where the single insert is
+    /// a bare numeric parameter, so an unmarked insert reads as a message when
+    /// it is not one.
+    #[test]
+    fn unrenderable_message_degradation_shape() {
+        let config = WindowsEventLogConfig::default();
+        let parser = EventLogParser::new(&config, LogNamespace::Legacy);
+
+        let mut event = create_test_event();
+        event.rendered_message = None;
+        event.event_data.clear();
+
+        // No inserts: the suffix alone, with no leading space.
+        event.string_inserts = Vec::new();
+        assert_eq!(
+            parser.degraded_message(&event),
+            UNRENDERABLE_MESSAGE_SUFFIX.trim_start()
+        );
+
+        // One insert: the insert plus the suffix.
+        event.string_inserts = vec!["1815".to_string()];
+        assert_eq!(
+            parser.degraded_message(&event),
+            format!("1815{UNRENDERABLE_MESSAGE_SUFFIX}")
+        );
+
+        // Two or more: joined in order with "; ", then the suffix.
+        event.string_inserts = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(
+            parser.degraded_message(&event),
+            format!("alpha; beta{UNRENDERABLE_MESSAGE_SUFFIX}")
+        );
+    }
+
+    /// The suffix is a fixed literal so a downstream consumer can strip it
+    /// deterministically, and `message_source` is the field it keys on.
+    #[test]
+    fn message_source_is_the_authoritative_field() {
+        let config = WindowsEventLogConfig::default();
+        let parser = EventLogParser::new(&config, LogNamespace::Legacy);
+
+        let mut event = create_test_event();
+        event.message_source = MessageSource::Inserts;
+        event.rendered_message = None;
+        event.event_data.clear();
+        event.string_inserts = vec!["alpha".to_string()];
+
+        let log_event = parser.parse_event(event).unwrap();
+        assert_eq!(
+            log_event.get(event_path!("message_source")),
+            Some(&Value::Bytes("inserts".into()))
+        );
+
+        assert_eq!(MessageSource::Publisher.as_str(), "publisher");
+        assert_eq!(MessageSource::None.as_str(), "none");
     }
 
     #[test]

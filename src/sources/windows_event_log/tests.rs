@@ -90,6 +90,7 @@ fn create_test_event() -> WindowsEvent {
         version: Some(1),
         qualifiers: Some(0),
         string_inserts: vec!["admin".to_string(), "2".to_string()],
+        message_source: MessageSource::Publisher,
     }
 }
 
@@ -1440,30 +1441,39 @@ mod message_rendering_tests {
 
     #[test]
     fn test_render_message_false_uses_fallback() {
-        // When render_message is false, the parser should use fallback message
+        // When render_message is false there is no publisher template, so the
+        // message degrades to the honesty marker rather than to a synthetic
+        // sentence. A synthetic "Event ID X from Y on Z" reads as a real event
+        // message when no message was actually available, which is the thing
+        // the marker exists to prevent. The structured fields still carry the
+        // event id and provider.
         let config = WindowsEventLogConfig {
             render_message: false,
             ..Default::default()
         };
         let parser = EventLogParser::new(&config, LogNamespace::Legacy);
 
-        // Create event without rendered_message
         let mut event = create_test_event();
         event.rendered_message = None;
-        event.event_data.clear(); // No message in event_data either
-        event.string_inserts.clear(); // Clear string inserts to reach fallback path
+        event.message_source = MessageSource::None;
+        event.event_data.clear();
+        event.string_inserts.clear();
 
         let log_event = parser.parse_event(event.clone()).unwrap();
 
-        // Should have fallback message format: "Event ID X from Provider on Computer"
-        if let Some(message) = log_event.get(event_path!("message")) {
-            let msg_str = message.to_string_lossy();
-            assert!(
-                msg_str.contains("Event ID") || msg_str.contains(&event.event_id.to_string()),
-                "Fallback message should contain Event ID: got '{}'",
-                msg_str
-            );
-        }
+        let message = log_event
+            .get(event_path!("message"))
+            .expect("a message must always be present");
+        assert_eq!(message.to_string_lossy(), "[message template unavailable]");
+        assert_eq!(
+            log_event.get(event_path!("message_source")),
+            Some(&Value::Bytes("none".into())),
+            "the structured field, not the text, is what consumers key on"
+        );
+        assert_eq!(
+            log_event.get(event_path!("event_id")),
+            Some(&Value::Integer(i64::from(event.event_id)))
+        );
     }
 
     #[test]
