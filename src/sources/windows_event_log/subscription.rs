@@ -81,52 +81,17 @@ impl Drop for PublisherHandle {
 /// every rebuild discards handles that `EvtNext` may have populated even while
 /// failing. Counting opens and closes lets a test assert the balance returns to
 /// baseline after N forced rebuilds, which needs no special build and targets
-/// exactly that risk. `#[cfg(test)]`; never compiled into shipped binaries.
-#[cfg(test)]
-pub(super) mod handle_seam {
-    use std::sync::atomic::{AtomicI64, Ordering};
-
-    pub(crate) static SUBSCRIPTION_OPENS: AtomicI64 = AtomicI64::new(0);
-    pub(crate) static SUBSCRIPTION_CLOSES: AtomicI64 = AtomicI64::new(0);
-    pub(crate) static EVENT_HANDLE_CLOSES: AtomicI64 = AtomicI64::new(0);
-
-    pub(crate) fn reset() {
-        SUBSCRIPTION_OPENS.store(0, Ordering::SeqCst);
-        SUBSCRIPTION_CLOSES.store(0, Ordering::SeqCst);
-        EVENT_HANDLE_CLOSES.store(0, Ordering::SeqCst);
-    }
-
-    /// Open subscription handles outstanding. Must return to its baseline after
-    /// any number of rebuilds.
-    pub(crate) fn outstanding_subscriptions() -> i64 {
-        SUBSCRIPTION_OPENS.load(Ordering::SeqCst) - SUBSCRIPTION_CLOSES.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn event_handle_closes() -> i64 {
-        EVENT_HANDLE_CLOSES.load(Ordering::SeqCst)
-    }
-}
-
-#[inline]
-fn note_subscription_open() {
-    #[cfg(test)]
-    handle_seam::SUBSCRIPTION_OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[inline]
-fn note_subscription_close() {
-    #[cfg(test)]
-    handle_seam::SUBSCRIPTION_CLOSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-}
-
+/// exactly that risk.
+///
+/// The counters live on the channel rather than in a global, so a test asserting
+/// on them cannot be perturbed by any other test opening subscriptions in
+/// parallel. They are `#[cfg(test)]` and never compile into shipped binaries.
 /// Close an event handle returned by `EvtNext`, accounting for it.
 ///
 /// `EvtNext` can return an error with handles already populated. Every path
 /// that abandons a batch must run these handles through here or we leak.
 #[inline]
 fn close_event_handle(handle: EVT_HANDLE) {
-    #[cfg(test)]
-    handle_seam::EVENT_HANDLE_CLOSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // A null handle is what the fault-injection seam produces for a scripted
     // count; it is accounted for above but must not reach the API.
     if handle.0 != 0 {
@@ -247,10 +212,7 @@ impl SubscriptionFactory {
         };
 
         match result {
-            Ok(handle) => {
-                note_subscription_open();
-                Ok((handle, origin))
-            }
+            Ok(handle) => Ok((handle, origin)),
             Err(e) => Err((e, origin)),
         }
     }
@@ -296,6 +258,15 @@ struct ChannelSubscription {
     /// The active query filters events, so record ids skip by construction and
     /// gap detection cannot mean anything on this channel.
     query_filters: bool,
+    /// Test-only handle accounting, per channel so parallel tests cannot
+    /// perturb each other. `opens - closes` must return to its baseline after
+    /// any number of rebuilds.
+    #[cfg(test)]
+    subscription_opens: i64,
+    #[cfg(test)]
+    subscription_closes: i64,
+    #[cfg(test)]
+    event_handle_closes: i64,
     /// Pre-registered counter for events read on this channel.
     events_read_counter: Counter,
     /// Pre-registered counter for render errors on this channel.
@@ -340,7 +311,10 @@ impl ChannelSubscription {
     fn close_current(&mut self) {
         if let Some(handle) = self.subscription_handle.take() {
             self.self_cancelling = true;
-            note_subscription_close();
+            #[cfg(test)]
+            {
+                self.subscription_closes += 1;
+            }
             unsafe {
                 let _ = EvtClose(handle);
             }
@@ -365,6 +339,10 @@ impl ChannelSubscription {
         ) {
             Ok((handle, origin)) => {
                 self.close_current();
+                #[cfg(test)]
+                {
+                    self.subscription_opens += 1;
+                }
                 self.subscription_handle = Some(handle);
                 self.active_query_origin = origin;
                 self.skipped_this_generation = None;
@@ -570,6 +548,15 @@ impl ChannelSubscription {
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
             last_record_id: self.resume.last_record_id,
         })
+    }
+
+    /// Close a handle returned by `EvtNext`, accounting for it.
+    fn discard_event_handle(&mut self, handle: EVT_HANDLE) {
+        #[cfg(test)]
+        {
+            self.event_handle_closes += 1;
+        }
+        close_event_handle(handle);
     }
 
     /// Gap-detection applicability for this channel.
@@ -788,6 +775,12 @@ impl EventLogSubscription {
                 last_event_at: None,
                 last_record_id_seen: None,
                 query_filters,
+                #[cfg(test)]
+                subscription_opens: 0,
+                #[cfg(test)]
+                subscription_closes: 0,
+                #[cfg(test)]
+                event_handle_closes: 0,
                 events_read_counter: counter!(
                     "windows_event_log_events_read_total",
                     "channel" => channel.clone()
@@ -1059,7 +1052,7 @@ impl EventLogSubscription {
                     // (Winlogbeat #3076).
                     if !matches!(outcome, DrainOutcome::Drained) {
                         for &raw in &event_handles[..returned as usize] {
-                            close_event_handle(EVT_HANDLE(raw));
+                            channel_sub.discard_event_handle(EVT_HANDLE(raw));
                         }
                     }
 
@@ -1164,7 +1157,7 @@ impl EventLogSubscription {
                             {
                                 counter!("windows_event_log_events_filtered_total", "reason" => "event_id_prefilter")
                                     .increment(1);
-                                close_event_handle(event_handle);
+                                channel_sub.discard_event_handle(event_handle);
                                 continue;
                             }
                             if self
@@ -1174,7 +1167,7 @@ impl EventLogSubscription {
                             {
                                 counter!("windows_event_log_events_filtered_total", "reason" => "event_id_prefilter")
                                     .increment(1);
-                                close_event_handle(event_handle);
+                                channel_sub.discard_event_handle(event_handle);
                                 continue;
                             }
 
@@ -1238,7 +1231,7 @@ impl EventLogSubscription {
                                         "reason" => "resume_boundary"
                                     )
                                     .increment(1);
-                                    close_event_handle(event_handle);
+                                    channel_sub.discard_event_handle(event_handle);
                                     continue;
                                 }
 
@@ -1306,10 +1299,10 @@ impl EventLogSubscription {
                                     // Events already in all_events will still be delivered
                                     // (at-least-once semantics — see doc comment on pull_events).
                                     // Close current handle normally
-                                    close_event_handle(event_handle);
+                                    channel_sub.discard_event_handle(event_handle);
                                     // Close remaining unprocessed handles to prevent leak
                                     for &h in &batch_handles[idx + 1..] {
-                                        close_event_handle(EVT_HANDLE(h));
+                                        channel_sub.discard_event_handle(EVT_HANDLE(h));
                                     }
                                     break 'drain;
                                 }
@@ -1335,7 +1328,7 @@ impl EventLogSubscription {
                         }
                     }
 
-                    close_event_handle(event_handle);
+                    channel_sub.discard_event_handle(event_handle);
                 }
 
                 // The batch read cleanly. Reset the ladder and give the batch
@@ -1408,6 +1401,18 @@ impl EventLogSubscription {
     #[cfg(test)]
     pub(super) fn first_channel_is_live(&self) -> bool {
         self.channels[0].is_live()
+    }
+
+    /// Test-only: open subscription handles outstanding on the first channel.
+    #[cfg(test)]
+    pub(super) fn first_channel_handle_balance(&self) -> i64 {
+        self.channels[0].subscription_opens - self.channels[0].subscription_closes
+    }
+
+    /// Test-only: how many `EvtNext` handles the first channel has discarded.
+    #[cfg(test)]
+    pub(super) fn first_channel_event_handle_closes(&self) -> i64 {
+        self.channels[0].event_handle_closes
     }
 
     /// Returns a reference to the rate limiter, if configured.
@@ -2104,8 +2109,8 @@ mod tests {
     async fn handle_count_returns_to_baseline_after_forced_rebuilds() {
         let (mut subscription, _temp_dir) = application_subscription().await;
 
-        handle_seam::reset();
-        let baseline = handle_seam::outstanding_subscriptions();
+        let baseline = subscription.first_channel_handle_balance();
+        assert_eq!(baseline, 1, "startup must leave exactly one open handle");
 
         for _ in 0..8 {
             subscription.force_rebuild_all();
@@ -2113,20 +2118,12 @@ mod tests {
                 subscription.first_channel_is_live(),
                 "a rebuild against a live Application channel must succeed"
             );
+            assert_eq!(
+                subscription.first_channel_handle_balance(),
+                baseline,
+                "every rebuild must close exactly the handle it replaced"
+            );
         }
-
-        assert_eq!(
-            handle_seam::outstanding_subscriptions(),
-            baseline,
-            "every rebuild must close exactly the handle it replaced"
-        );
-
-        drop(subscription);
-        assert_eq!(
-            handle_seam::outstanding_subscriptions(),
-            baseline - 1,
-            "drop must release the channel's remaining subscription handle"
-        );
     }
 
     /// `EvtNext` can return an error with handles already populated. Those
@@ -2138,7 +2135,6 @@ mod tests {
     async fn evt_next_error_with_populated_handles_discards_them() {
         let (mut subscription, _temp_dir) = application_subscription().await;
 
-        handle_seam::reset();
         let _guard = ScriptGuard::install(&[(15011, 4)]);
 
         let events = subscription
@@ -2147,7 +2143,7 @@ mod tests {
         assert!(events.is_empty());
 
         assert_eq!(
-            handle_seam::event_handle_closes(),
+            subscription.first_channel_event_handle_closes(),
             4,
             "all four handles returned alongside the error must be discarded"
         );
@@ -2167,7 +2163,6 @@ mod tests {
     async fn benign_invalid_operation_does_not_tear_down() {
         let (mut subscription, _temp_dir) = application_subscription().await;
 
-        handle_seam::reset();
         let _guard = ScriptGuard::install(&[(4317, 0)]);
 
         let _ = subscription
@@ -2177,7 +2172,7 @@ mod tests {
             subscription.first_channel_is_live(),
             "4317 with a zero returned count must leave the subscription alone"
         );
-        assert_eq!(handle_seam::event_handle_closes(), 0);
+        assert_eq!(subscription.first_channel_event_handle_closes(), 0);
     }
 
     /// An unknown code rebuilds rather than retrying the same handle, and the
@@ -2187,7 +2182,6 @@ mod tests {
     async fn unknown_codes_rebuild_and_recover() {
         let (mut subscription, _temp_dir) = application_subscription().await;
 
-        handle_seam::reset();
         {
             let _guard = ScriptGuard::install(&[(60123, 0)]);
             let _ = subscription.pull_events(100).expect("must not error out");
