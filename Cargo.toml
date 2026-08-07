@@ -481,7 +481,11 @@ byteorder = "1.5.0"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }
 windows-service = "0.8.0"
-windows = { version = "0.58", features = ["Win32_System_EventLog", "Win32_Foundation", "Win32_System_Com", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem"], optional = true }
+# Win32_System_Rpc supplies the RPC_S_* status constants the windows_event_log
+# source classifies EvtNext failures against. Binding them beats transcribing
+# them: every one of the four constants this source originally hand-copied was
+# wrong, and one of those errors wedged a production agent for nine hours.
+windows = { version = "0.58", features = ["Win32_System_EventLog", "Win32_Foundation", "Win32_System_Com", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Rpc"], optional = true }
 quick-xml = { version = "0.31", default-features = false, features = ["serialize"], optional = true }
 rdkafka = { workspace = true, features = ["cmake_build"], optional = true }
 

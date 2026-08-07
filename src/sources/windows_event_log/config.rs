@@ -183,6 +183,23 @@ pub struct WindowsEventLogConfig {
     #[serde(default = "default_render_message")]
     pub render_message: bool,
 
+    /// Interval in seconds at which each channel subscription is torn down and
+    /// rebuilt from its bookmark.
+    ///
+    /// Rebuilding from a bookmark is clean by construction: no gap and no
+    /// duplicates. The refresh therefore costs close to nothing and bounds
+    /// unknown-unknown degradation on subscriptions that would otherwise live
+    /// for weeks. It is also what retries a channel that was skipped for access
+    /// denied, so a transient ACL change heals within one interval instead of
+    /// requiring a restart.
+    ///
+    /// Set to 0 to disable.
+    #[serde(default = "default_subscription_refresh_secs")]
+    #[configurable(metadata(docs::examples = 86400))]
+    #[configurable(metadata(docs::examples = 3600))]
+    #[configurable(metadata(docs::examples = 0))]
+    pub subscription_refresh_secs: u64,
+
     /// Controls how acknowledgements are handled for this source.
     ///
     /// When enabled, the source will wait for downstream sinks to acknowledge
@@ -286,7 +303,22 @@ impl Default for WindowsEventLogConfig {
             max_event_data_length: default_max_event_data_length(),
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
             render_message: default_render_message(),
+            subscription_refresh_secs: default_subscription_refresh_secs(),
             acknowledgements: Default::default(),
+        }
+    }
+}
+
+impl WindowsEventLogConfig {
+    /// Periodic subscription refresh interval.
+    ///
+    /// Zero disables the refresh; it is expressed as an effectively infinite
+    /// interval so the call site has no second code path to get wrong.
+    pub(super) const fn subscription_refresh_interval(&self) -> std::time::Duration {
+        if self.subscription_refresh_secs == 0 {
+            std::time::Duration::from_secs(u64::MAX / 2)
+        } else {
+            std::time::Duration::from_secs(self.subscription_refresh_secs)
         }
     }
 }
@@ -593,6 +625,11 @@ const fn default_render_message() -> bool {
     true
 }
 
+/// Default ON at 24 hours (D9).
+const fn default_subscription_refresh_secs() -> u64 {
+    86_400
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +718,7 @@ mod tests {
             max_event_data_length: 0,
             checkpoint_interval_secs: 5,
             render_message: true,
+            subscription_refresh_secs: 86_400,
             acknowledgements: SourceAcknowledgementsConfig::from(true),
         };
 

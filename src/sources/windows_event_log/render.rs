@@ -4,7 +4,6 @@
 //! subscription lifecycle and event pulling.
 
 use metrics::Gauge;
-use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords, EvtOpenLog,
     EvtRender, EvtRenderEventXml,
@@ -12,6 +11,7 @@ use windows::Win32::System::EventLog::{
 use windows::core::HSTRING;
 
 use super::error::WindowsEventLogError;
+use super::win32_errors::{RenderDisposition, classify_render, win32_code};
 
 /// Render an event handle to XML using reusable buffers.
 pub(super) fn render_event_xml(
@@ -38,7 +38,11 @@ pub(super) fn render_event_xml(
     };
 
     if let Err(e) = result {
-        if e.code() == ERROR_INSUFFICIENT_BUFFER.into() {
+        // Classified on the render path, whose disposition type has no
+        // subscription-rebuild arm at all. ERROR_INSUFFICIENT_BUFFER is routine
+        // here on every size probe; routing it anywhere near the drain
+        // classifier would tear down subscriptions on normal buffer growth.
+        if classify_render(win32_code(&e)) == RenderDisposition::GrowBuffer {
             if buffer_used == 0 {
                 return Ok(String::new());
             }
