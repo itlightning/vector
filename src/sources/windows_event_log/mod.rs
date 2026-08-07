@@ -485,7 +485,13 @@ impl WindowsEventLogSource {
                         timeout_count = 0;
                         let (total, active) = subscription.channel_health_summary();
                         if active < total {
-                            warn!(
+                            // DEBUG, not WARN. A channel that is down already
+                            // emitted its onset ERROR once and will emit its
+                            // recovery WARN once; this 30s pulse would turn one
+                            // episode into a warn-band line every half minute,
+                            // which is the noise D4 exists to prevent. Exactly
+                            // two warn-band lines per episode, no more.
+                            debug!(
                                 message = "Some channel subscriptions are inactive.",
                                 total_channels = total,
                                 active_channels = active,
@@ -523,7 +529,13 @@ impl WindowsEventLogSource {
                             // Healthy cycle: reset backoff so the next transient
                             // error starts fresh.
                             error_backoff = std::time::Duration::from_millis(100);
-                            warn!(
+                            // DEBUG, not WARN. The speculative pull is a
+                            // self-heal that works: it recovering events is the
+                            // mechanism functioning, not a fault. It also fires
+                            // routinely on the batch right after a rebuild,
+                            // which put a third and fourth warn-band line on a
+                            // single unregister episode in the lab.
+                            debug!(
                                 message = "Speculative timeout pull recovered events; possible lost wakeup detected.",
                                 event_count = events.len(),
                             );

@@ -1464,7 +1464,15 @@ mod message_rendering_tests {
         let message = log_event
             .get(event_path!("message"))
             .expect("a message must always be present");
-        assert_eq!(message.to_string_lossy(), "[message template unavailable]");
+        assert_eq!(
+            message.to_string_lossy(),
+            format!(
+                "no description; provider {} is not registered on this host",
+                event.provider_name
+            ),
+            "a degraded message must never render empty: an empty message hides \
+             a real signal about the host"
+        );
         assert_eq!(
             log_event.get(event_path!("message_source")),
             Some(&Value::Bytes("none".into())),

@@ -112,6 +112,35 @@ pub(super) static EVT_NEXT_SCRIPT: std::sync::Mutex<
     Option<std::collections::VecDeque<(u32, u32)>>,
 > = std::sync::Mutex::new(None);
 
+/// Test-only script that replaces the `EvtSubscribe` result with a win32 code.
+///
+/// A failed rebuild is otherwise unreachable from a test on a healthy host, and
+/// the interesting case is precisely a failure that arrives while the current
+/// subscription is still serving events (D22).
+#[cfg(test)]
+pub(super) static EVT_SUBSCRIBE_SCRIPT: std::sync::Mutex<Option<std::collections::VecDeque<u32>>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only: force `render_event_xml` to fail, so the unprocessable-event path
+/// (D19) can be exercised without a real malformed event.
+#[cfg(test)]
+pub(super) static FAIL_ALL_RENDERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Why a rebuild is happening, which decides what a failure is allowed to cost.
+///
+/// The distinction is the whole of D22: rebuilding a channel that is already
+/// dead has nothing to preserve, but a proactive rebuild (periodic refresh,
+/// batch reduction) runs against a HEALTHY subscription, and tearing that down
+/// because its replacement failed to open is a self-inflicted outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildKind {
+    /// There is no working subscription to lose.
+    FromDead,
+    /// The current subscription is serving events and must survive a failure.
+    Proactive,
+}
+
 /// Builds subscriptions for one channel.
 ///
 /// Holding the subscription behind a factory rather than a raw handle is the
@@ -211,6 +240,31 @@ impl SubscriptionFactory {
             )
         };
 
+        // Test-only fault injection: replaces the API result with a scripted
+        // win32 code. A successfully opened handle is closed here so the
+        // injection cannot leak it.
+        #[cfg(test)]
+        let result = {
+            let scripted = EVT_SUBSCRIBE_SCRIPT
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(std::collections::VecDeque::pop_front);
+            match scripted {
+                Some(code) => {
+                    if let Ok(handle) = result {
+                        unsafe {
+                            let _ = EvtClose(handle);
+                        }
+                    }
+                    Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                        code as i32,
+                    )))
+                }
+                None => result,
+            }
+        };
+
         match result {
             Ok(handle) => Ok((handle, origin)),
             Err(e) => Err((e, origin)),
@@ -241,10 +295,6 @@ struct ChannelSubscription {
     episode: EpisodeState,
     /// Earliest instant at which a rebuild may be attempted.
     retry_at: Option<std::time::Instant>,
-    /// Set while we are tearing this channel down on purpose, so a resulting
-    /// `ERROR_CANCELLED` is read as shutdown rather than as a fault. Without
-    /// this, intentional teardown causes a reconnect storm.
-    self_cancelling: bool,
     /// Skipped for this subscription generation. The periodic refresh is what
     /// retries it, so an ACL flap heals within a day with no special case.
     skipped_this_generation: Option<SkipReason>,
@@ -306,11 +356,12 @@ impl ChannelSubscription {
 
     /// Close the current subscription handle, if any, accounting for it.
     ///
-    /// Sets the self-cancel flag across the close so that an `ERROR_CANCELLED`
-    /// produced by our own teardown is never read as a fault.
+    /// No self-cancel flag rides this close: the subscription is moved into the
+    /// blocking task by ownership transfer, so there is never a drain in flight
+    /// on another thread for this close to be misread by. See the
+    /// `ERROR_CANCELLED` arm in `win32_errors`.
     fn close_current(&mut self) {
         if let Some(handle) = self.subscription_handle.take() {
-            self.self_cancelling = true;
             #[cfg(test)]
             {
                 self.subscription_closes += 1;
@@ -318,7 +369,6 @@ impl ChannelSubscription {
             unsafe {
                 let _ = EvtClose(handle);
             }
-            self.self_cancelling = false;
         }
     }
 
@@ -328,7 +378,13 @@ impl ChannelSubscription {
     /// after a close-first leaves the channel stranded with nothing, which is a
     /// self-inflicted outage. On success the old handle is closed only after
     /// the new one exists.
-    fn rebuild(&mut self, cause: &str) -> bool {
+    ///
+    /// `kind` decides what a FAILURE is allowed to cost. Build-new-then-swap is
+    /// not only about the order of two calls: a proactive rebuild runs against a
+    /// live subscription, so a failed replacement must leave that subscription
+    /// serving events and be retried later. Closing it would be exactly the
+    /// strand D22 exists to prevent.
+    fn rebuild(&mut self, cause: &str, kind: RebuildKind) -> bool {
         self.retry_at = None;
 
         match self.factory.build(
@@ -387,6 +443,25 @@ impl ChannelSubscription {
             }
             Err((error, origin)) => {
                 let code = win32_code(&error);
+
+                // D22. A proactive rebuild's replacement failed, but the current
+                // subscription is healthy and still serving events. Keep it,
+                // say so at DEBUG (this is not an episode: nothing is down), and
+                // come back to it on a backoff-spaced schedule.
+                if kind == RebuildKind::Proactive && self.subscription_handle.is_some() {
+                    let retry_in = self.backoff.next_delay();
+                    self.next_refresh = std::time::Instant::now() + retry_in;
+                    debug!(
+                        message = "Proactive Windows Event Log rebuild failed; keeping the live subscription.",
+                        channel = %self.channel,
+                        cause = cause,
+                        win32_error = code,
+                        win32_error_name = describe(code).unwrap_or("unknown"),
+                        retry_in_ms = retry_in.as_millis() as u64,
+                    );
+                    return false;
+                }
+
                 self.close_current();
                 self.subscription_active_gauge.set(0.0);
 
@@ -394,35 +469,21 @@ impl ChannelSubscription {
                     SubscribeOutcome::SkipChannel(reason) => {
                         self.skip_channel(reason, code, &error);
                     }
-                    SubscribeOutcome::BookmarkDead | SubscribeOutcome::GeneratedQueryInvalid => {
-                        // Retrying the same position forever is exactly the
-                        // wedge. Advance one rung, and never retry the
-                        // predicate that just failed.
+                    SubscribeOutcome::BookmarkDead => {
+                        // Not a poison event: the stored position no longer
+                        // resolves, so there is no offending record to skip and
+                        // nothing to isolate. Go to the time rung directly, or
+                        // to future-only when there is no stored time at all.
+                        let rung = self.resume.bookmark_dead();
+                        self.bookmark_positioned = false;
+                        self.log_rung_advance(rung, code, "bookmark_dead");
+                        self.schedule_retry(code, &error, cause);
+                    }
+                    SubscribeOutcome::GeneratedQueryInvalid => {
+                        // Our own ladder predicate is invalid. Advance exactly
+                        // one rung (D21) and never retry the same predicate.
                         let rung = self.resume.advance_rung();
-                        if rung == Rung::FutureOnly {
-                            // Deliberate loss of the entire backlog: make it
-                            // visible rather than silently accepting it.
-                            error!(
-                                message = format!(
-                                    "Windows Event Log channel fell back to future-events-only; \
-                                     backlog for this channel is not recoverable (channel={}).",
-                                    self.channel
-                                ),
-                                error_type = "resume_future_only",
-                                channel = %self.channel,
-                                win32_error = code,
-                                internal_log_rate_limit = false,
-                            );
-                        } else {
-                            warn!(
-                                message = "Advancing Windows Event Log resume ladder.",
-                                channel = %self.channel,
-                                rung = rung.as_str(),
-                                win32_error = code,
-                                win32_error_name = describe(code).unwrap_or("unknown"),
-                                internal_log_rate_limit = false,
-                            );
-                        }
+                        self.log_rung_advance(rung, code, "generated_query_invalid");
                         if rung == Rung::IsolateOne {
                             self.batch.isolate();
                         }
@@ -432,6 +493,36 @@ impl ChannelSubscription {
                 }
                 false
             }
+        }
+    }
+
+    /// Announce a resume-ladder move. Every rung is deliberate data loss and
+    /// must be visible; the terminal rung discards the whole backlog and is
+    /// therefore an ERROR (D16).
+    fn log_rung_advance(&self, rung: Rung, code: u32, reason: &str) {
+        if rung == Rung::FutureOnly {
+            error!(
+                message = format!(
+                    "Windows Event Log channel fell back to future-events-only; \
+                     backlog for this channel is not recoverable (channel={}).",
+                    self.channel
+                ),
+                error_type = "resume_future_only",
+                channel = %self.channel,
+                reason = reason,
+                win32_error = code,
+                internal_log_rate_limit = false,
+            );
+        } else {
+            warn!(
+                message = "Advancing Windows Event Log resume ladder.",
+                channel = %self.channel,
+                rung = rung.as_str(),
+                reason = reason,
+                win32_error = code,
+                win32_error_name = describe(code).unwrap_or("unknown"),
+                internal_log_rate_limit = false,
+            );
         }
     }
 
@@ -722,6 +813,7 @@ impl EventLogSubscription {
             {
                 resume.observe_event(time, record_id);
             }
+            let resume_seed_time = resume.last_event_time;
 
             // Create manual-reset signal event, initially signaled.
             // Initially signaled ensures the first iteration drains any buffered events.
@@ -769,10 +861,14 @@ impl EventLogSubscription {
                 batch: BatchAdaptation::new(config.batch_size as usize),
                 episode: EpisodeState::default(),
                 retry_at: None,
-                self_cancelling: false,
                 skipped_this_generation: None,
                 next_refresh: std::time::Instant::now() + refresh_interval,
-                last_event_at: None,
+                // Seeded from the checkpoint, not left unknown until the first
+                // event arrives. An onset ERROR raised right after a restart
+                // would otherwise report `last_event_at=never` on a channel
+                // that has been collecting for weeks, which is the opposite of
+                // the triage fact D29 exists to carry.
+                last_event_at: resume_seed_time,
                 last_record_id_seen: None,
                 query_filters,
                 #[cfg(test)]
@@ -805,7 +901,7 @@ impl EventLogSubscription {
             // failure. Vector never gives up on its own: it keeps rebuilding
             // with backoff and the agent decides when to stop asking. The
             // original wedge was the opposite polarity.
-            channel_sub.rebuild("startup");
+            channel_sub.rebuild("startup", RebuildKind::FromDead);
             channel_subscriptions.push(channel_sub);
         }
 
@@ -952,8 +1048,13 @@ impl EventLogSubscription {
             // skipped earlier for access denied.
             if now >= channel_sub.next_refresh {
                 channel_sub.next_refresh = now + self.refresh_interval;
+                let kind = if channel_sub.subscription_handle.is_some() {
+                    RebuildKind::Proactive
+                } else {
+                    RebuildKind::FromDead
+                };
                 channel_sub.skipped_this_generation = None;
-                channel_sub.rebuild("periodic_refresh");
+                channel_sub.rebuild("periodic_refresh", kind);
             }
 
             // A channel that is down waits out its backoff. Backoff carries
@@ -967,7 +1068,7 @@ impl EventLogSubscription {
                 match channel_sub.retry_at {
                     Some(at) if now < at => continue,
                     _ => {
-                        if !channel_sub.rebuild("retry") {
+                        if !channel_sub.rebuild("retry", RebuildKind::FromDead) {
                             continue;
                         }
                     }
@@ -1037,12 +1138,8 @@ impl EventLogSubscription {
 
                 if let Err(err) = result {
                     let code = win32_code(&err);
-                    let outcome = classify_evt_next(
-                        code,
-                        returned,
-                        channel_sub.active_query_origin,
-                        channel_sub.self_cancelling,
-                    );
+                    let outcome =
+                        classify_evt_next(code, returned, channel_sub.active_query_origin);
 
                     // EvtNext can return an error with handles already
                     // populated. Whatever we do next, those handles are ours
@@ -1061,12 +1158,6 @@ impl EventLogSubscription {
                             channel_drained = true;
                             break;
                         }
-                        DrainOutcome::Cancelled => {
-                            // Our own teardown. Not a fault, and specifically
-                            // not a reconnect trigger.
-                            channel_drained = true;
-                            break;
-                        }
                         DrainOutcome::SkipChannel(reason) => {
                             channel_sub.skip_channel(reason, code, &err);
                             channel_drained = true;
@@ -1082,7 +1173,10 @@ impl EventLogSubscription {
                                 win32_error_name = describe(code).unwrap_or("unknown"),
                                 internal_log_rate_limit = false,
                             );
-                            channel_sub.rebuild("batch_reduction");
+                            // The current subscription is healthy: the batch was
+                            // simply too large for the API to marshal. A failed
+                            // replacement must not cost us the live one.
+                            channel_sub.rebuild("batch_reduction", RebuildKind::Proactive);
                             channel_drained = true;
                             break;
                         }
@@ -1111,7 +1205,7 @@ impl EventLogSubscription {
                                     error_type = "poison_escape",
                                     channel = %channel_sub.channel,
                                     rung = rung.as_str(),
-                                    skipped_record_id = channel_sub.resume.skipped_record_id,
+                                    skipping_next_record = channel_sub.resume.skip_next_record,
                                     win32_error = code,
                                     internal_log_rate_limit = false,
                                 );
@@ -1222,10 +1316,36 @@ impl EventLogSubscription {
                                 // duplicates on every resume path. It is also
                                 // where a deliberately skipped poison record is
                                 // dropped.
+                                // `past_boundary` separates the two reasons a
+                                // record is not emitted: an over-delivered
+                                // duplicate (the XPath floors to the
+                                // millisecond) versus the deliberate one-shot
+                                // poison skip. Only the latter has to be made
+                                // durable.
+                                let past_boundary = channel_sub
+                                    .resume
+                                    .should_emit(event.time_created, event.record_id);
                                 if !channel_sub
                                     .resume
-                                    .should_emit(event.time_created, event.record_id)
+                                    .admit(event.time_created, event.record_id)
                                 {
+                                    if past_boundary {
+                                        // The poison skip. Advance the bookmark
+                                        // and the boundary past it so a restart
+                                        // does not resume onto the same record
+                                        // and repeat the whole escape.
+                                        if channel_sub.bookmark.update(event_handle).is_ok() {
+                                            channel_sub.bookmark_positioned = true;
+                                        }
+                                        channel_sub
+                                            .resume
+                                            .observe_event(event.time_created, event.record_id);
+                                        // The rung WARN already reported this
+                                        // skip; leaving the gap detector behind
+                                        // would report it a second time as an
+                                        // unexplained gap.
+                                        channel_sub.last_record_id_seen = Some(event.record_id);
+                                    }
                                     counter!(
                                         "windows_event_log_events_filtered_total",
                                         "reason" => "resume_boundary"
@@ -1319,10 +1439,25 @@ impl EventLogSubscription {
                             // turn a single malformed event into a channel
                             // outage.
                             channel_sub.render_errors_counter.increment(1);
+
+                            // Advance the bookmark PAST the skipped event. The
+                            // bookmark is updated from the event handle, which
+                            // needs no successful render, so this works on
+                            // exactly the event we could not process. Without
+                            // it a restart resumes onto the same event, fails
+                            // again, and skips it again forever: the event is
+                            // never delivered and never passed, which is not
+                            // "one bad event costs one event", it is a channel
+                            // that can never make progress past it.
+                            let advanced = channel_sub.bookmark.update(event_handle).is_ok();
+                            if advanced {
+                                channel_sub.bookmark_positioned = true;
+                            }
                             warn!(
                                 message = "Failed to render event XML; skipping this event and continuing the batch.",
                                 channel = %channel_sub.channel,
                                 batch_index = idx,
+                                bookmark_advanced = advanced,
                                 error = %e
                             );
                         }
@@ -1393,7 +1528,17 @@ impl EventLogSubscription {
     #[cfg(test)]
     pub(super) fn force_rebuild_all(&mut self) {
         for channel in &mut self.channels {
-            channel.rebuild("test_forced");
+            channel.rebuild("test_forced", RebuildKind::FromDead);
+        }
+    }
+
+    /// Test-only: run a PROACTIVE rebuild on every channel, the way the periodic
+    /// refresh and batch reduction do, i.e. against a subscription that is
+    /// currently healthy.
+    #[cfg(test)]
+    pub(super) fn force_proactive_rebuild_all(&mut self) {
+        for channel in &mut self.channels {
+            channel.rebuild("test_proactive", RebuildKind::Proactive);
         }
     }
 
@@ -2088,15 +2233,279 @@ mod tests {
     }
 
     async fn application_subscription() -> (EventLogSubscription, tempfile::TempDir) {
+        let (checkpointer, temp_dir) = create_test_checkpointer().await;
+        let subscription = application_subscription_with(checkpointer).await;
+        (subscription, temp_dir)
+    }
+
+    /// Same, but against a caller-supplied checkpointer, so a test can simulate
+    /// a restart by building a second subscription over the same checkpoint.
+    async fn application_subscription_with(
+        checkpointer: Arc<Checkpointer>,
+    ) -> EventLogSubscription {
         let mut config = WindowsEventLogConfig::default();
         config.channels = vec!["Application".to_string()];
         config.read_existing_events = true;
         config.event_timeout_ms = 500;
-        let (checkpointer, temp_dir) = create_test_checkpointer().await;
-        let subscription = EventLogSubscription::new(&config, checkpointer, false)
+        EventLogSubscription::new(&config, checkpointer, false)
             .await
-            .expect("subscription creation should succeed");
-        (subscription, temp_dir)
+            .expect("subscription creation should succeed")
+    }
+
+    /// Installs a scripted `EvtSubscribe` failure sequence for a test.
+    struct SubscribeScriptGuard;
+
+    impl SubscribeScriptGuard {
+        fn install(codes: &[u32]) -> Self {
+            *EVT_SUBSCRIBE_SCRIPT.lock().unwrap() = Some(codes.iter().copied().collect());
+            Self
+        }
+    }
+
+    impl Drop for SubscribeScriptGuard {
+        fn drop(&mut self) {
+            *EVT_SUBSCRIBE_SCRIPT.lock().unwrap() = None;
+        }
+    }
+
+    /// Forces every render to fail, exercising the unprocessable-event path.
+    struct RenderFailGuard;
+
+    impl RenderFailGuard {
+        fn install() -> Self {
+            FAIL_ALL_RENDERS.store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for RenderFailGuard {
+        fn drop(&mut self) {
+            FAIL_ALL_RENDERS.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Counts warn-band (WARN and ERROR) tracing events on this thread.
+    ///
+    /// The episode contract is a statement about what an operator sees, so it
+    /// has to be asserted on emitted log records, not on the flags the code
+    /// keeps.
+    #[derive(Clone, Default)]
+    struct WarnBandCounter {
+        warns: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnBandCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let level = *event.metadata().level();
+            if level <= tracing::Level::WARN {
+                self.warns
+                    .lock()
+                    .unwrap()
+                    .push(format!("{level} {}", event.metadata().target()));
+            }
+        }
+    }
+
+    /// A failed PROACTIVE rebuild must leave the live subscription serving
+    /// events (D22).
+    ///
+    /// The periodic refresh (D9) and batch reduction (D11) both rebuild while
+    /// the current subscription is HEALTHY. Closing it because its replacement
+    /// failed to open is a self-inflicted outage, and it is the exact failure
+    /// mode build-new-then-swap exists to prevent.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_proactive_rebuild_keeps_the_live_subscription() {
+        let (mut subscription, _temp_dir) = application_subscription().await;
+        assert!(subscription.first_channel_is_live());
+        let baseline = subscription.first_channel_handle_balance();
+
+        {
+            // RPC_S_SERVER_UNAVAILABLE: transient, and the kind of failure a
+            // refresh really does hit on a service that is restarting.
+            let _guard = SubscribeScriptGuard::install(&[1722]);
+            subscription.force_proactive_rebuild_all();
+        }
+
+        assert!(
+            subscription.first_channel_is_live(),
+            "a failed proactive rebuild must not close the working subscription"
+        );
+        assert_eq!(
+            subscription.first_channel_handle_balance(),
+            baseline,
+            "the live handle must still be the one we started with"
+        );
+
+        let events = subscription
+            .pull_events(usize::MAX)
+            .expect("the surviving subscription must still read");
+        assert!(
+            !events.is_empty(),
+            "the previous subscription must still be serving events after the \
+             failed rebuild"
+        );
+    }
+
+    /// A rebuild from a DEAD subscription has nothing to preserve, so a failure
+    /// there legitimately leaves the channel down and retrying.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_rebuild_from_dead_leaves_the_channel_down() {
+        let (mut subscription, _temp_dir) = application_subscription().await;
+
+        {
+            let _guard = ScriptGuard::install(&[(15007, 0)]);
+            let _ = subscription.pull_events(100).expect("must not error out");
+        }
+        assert!(!subscription.first_channel_is_live());
+
+        {
+            let _guard = SubscribeScriptGuard::install(&[15007]);
+            subscription.force_rebuild_all();
+        }
+        assert!(
+            !subscription.first_channel_is_live(),
+            "nothing was live to preserve; the channel stays down and retries"
+        );
+    }
+
+    /// D19: an event we cannot process costs exactly that event, ONCE.
+    ///
+    /// Skipping it without advancing the bookmark past it means a restart reads
+    /// it again and skips it again, forever: the channel can never make progress
+    /// past the bad event, which is a permanent stall dressed up as a skip.
+    #[tokio::test]
+    #[serial]
+    async fn a_skipped_unrenderable_event_is_not_redelivered_after_a_restart() {
+        let _ = std::process::Command::new("eventcreate")
+            .args([
+                "/T",
+                "INFORMATION",
+                "/ID",
+                "102",
+                "/L",
+                "APPLICATION",
+                "/SO",
+                "VectorTestRenderSkip",
+                "/D",
+                "seed event for the render-skip bookmark advance assertion",
+            ])
+            .output();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Baseline: what is in the backlog right now, read normally.
+        let (mut baseline_sub, _baseline_dir) = application_subscription().await;
+        let backlog: std::collections::HashSet<u64> = baseline_sub
+            .pull_events(usize::MAX)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| e.record_id)
+            .collect();
+        assert!(
+            !backlog.is_empty(),
+            "the Application backlog must be readable, otherwise this proves nothing"
+        );
+        drop(baseline_sub);
+
+        // Same backlog, but every event is unprocessable.
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+        let mut skipping = application_subscription_with(Arc::clone(&checkpointer)).await;
+        {
+            let _guard = RenderFailGuard::install();
+            let delivered = skipping.pull_events(usize::MAX).unwrap_or_default();
+            assert!(
+                delivered.is_empty(),
+                "unprocessable events are not delivered"
+            );
+            assert!(
+                skipping.first_channel_is_live(),
+                "one bad event must never tear down the subscription"
+            );
+        }
+        skipping
+            .flush_bookmarks()
+            .await
+            .expect("bookmarks must flush");
+        drop(skipping);
+
+        // Restart over the same checkpoint.
+        let mut restarted = application_subscription_with(checkpointer).await;
+        let after_restart: Vec<u64> = restarted
+            .pull_events(usize::MAX)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| e.record_id)
+            .collect();
+
+        for record_id in &after_restart {
+            assert!(
+                !backlog.contains(record_id),
+                "record {record_id} was skipped as unrenderable and then read \
+                 again after a restart; the bookmark never advanced past it"
+            );
+        }
+    }
+
+    /// The episode contract, in the vocabulary an operator sees: one unavailable
+    /// episode produces exactly one warn-band onset and exactly one warn-band
+    /// recovery. Everything in between is DEBUG.
+    ///
+    /// The original incident shipped 12,650 error rows for one condition, and
+    /// the lab's single unregister episode still logged four warn-band lines
+    /// against a design that calls for two.
+    #[tokio::test]
+    #[serial]
+    async fn one_episode_produces_exactly_one_onset_and_one_recovery() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (mut subscription, _temp_dir) = application_subscription().await;
+
+        let counter = WarnBandCounter::default();
+        let collector = tracing_subscriber::registry().with(counter.clone());
+
+        tracing::subscriber::with_default(collector, || {
+            // Onset: the channel goes away underneath us.
+            {
+                let _guard = ScriptGuard::install(&[(15007, 0)]);
+                let _ = subscription.pull_events(100).expect("must not error out");
+            }
+            assert!(!subscription.first_channel_is_live());
+
+            // The down window: repeated failed rebuilds. Every one of these is
+            // the same condition already reported, so none of them may reach the
+            // warn band.
+            {
+                let _guard = SubscribeScriptGuard::install(&[15007; 6]);
+                for _ in 0..6 {
+                    subscription.force_rebuild_all();
+                    assert!(!subscription.first_channel_is_live());
+                }
+            }
+
+            // Recovery.
+            subscription.force_rebuild_all();
+            assert!(subscription.first_channel_is_live());
+        });
+
+        let lines = counter.warns.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one episode must produce exactly one onset and one recovery, got: {lines:#?}"
+        );
+        assert!(
+            lines[0].starts_with("ERROR"),
+            "the onset is an ERROR, got: {lines:#?}"
+        );
+        assert!(
+            lines[1].starts_with("WARN"),
+            "the recovery is a WARN, got: {lines:#?}"
+        );
     }
 
     /// Handle accounting across forced rebuilds.

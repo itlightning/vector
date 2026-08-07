@@ -210,8 +210,15 @@ pub(super) struct ResumeState {
     /// `EventRecordID` of the last good event, paired with the time above to
     /// make position identity exact.
     pub(super) last_record_id: Option<u64>,
-    /// A record id the poison ladder decided to skip.
-    pub(super) skipped_record_id: Option<u64>,
+    /// One-shot: drop the first record delivered after this resume.
+    ///
+    /// The poison record's id is unknowable by construction. `EvtNext` failed,
+    /// so no handle came back and nothing identified it; the only thing we know
+    /// is that it is the record sitting immediately past the resume boundary.
+    /// Keying the skip on `last_record_id` would be a no-op, because the
+    /// boundary below already drops everything at or before the last good
+    /// event.
+    pub(super) skip_next_record: bool,
     /// Position identity at the last rebuild, used to detect a stuck position.
     stuck_position: Option<(DateTime<Utc>, u64)>,
     stuck_count: u32,
@@ -226,7 +233,7 @@ impl ResumeState {
             rung: Rung::Bookmark,
             last_event_time: None,
             last_record_id: None,
-            skipped_record_id: None,
+            skip_next_record: false,
             stuck_position: None,
             stuck_count: 0,
             record_identity_usable,
@@ -243,7 +250,7 @@ impl ResumeState {
     /// transient cause never leaves a channel permanently coarse or slow.
     pub(super) fn observe_clean_read(&mut self) {
         self.rung = Rung::Bookmark;
-        self.skipped_record_id = None;
+        self.skip_next_record = false;
         self.stuck_position = None;
         self.stuck_count = 0;
     }
@@ -295,9 +302,39 @@ impl ResumeState {
         };
 
         if self.rung == Rung::SkipRecord {
-            self.skipped_record_id = self.last_record_id;
+            // Arm the one-shot. The record we mean is the one immediately past
+            // the boundary, which is the first record the next resume delivers.
+            self.skip_next_record = true;
         }
 
+        self.rung
+    }
+
+    /// The stored position no longer resolves.
+    ///
+    /// This is NOT a poison event and must not walk the poison ladder: there is
+    /// no offending record, so a single-record skip is meaningless and isolating
+    /// the batch to one record accomplishes nothing. The correct response is the
+    /// time rung, or future-events-only when there is no stored time to fall
+    /// back to (D16: that rung is deliberate loss of the whole backlog and its
+    /// caller emits ERROR).
+    pub(super) fn bookmark_dead(&mut self) -> Rung {
+        self.stuck_count = 0;
+        self.skip_next_record = false;
+        self.rung = if self.last_event_time.is_some() {
+            match self.rung {
+                // Already escalating by time: take the next window rather than
+                // restarting at the bottom.
+                Rung::TimeAdvance(t) => match t.next() {
+                    Some(next) => Rung::TimeAdvance(next),
+                    None => Rung::FutureOnly,
+                },
+                Rung::FutureOnly => Rung::FutureOnly,
+                _ => Rung::TimeAdvance(TimeRung::BoundaryTick),
+            }
+        } else {
+            Rung::FutureOnly
+        };
         self.rung
     }
 
@@ -321,15 +358,35 @@ impl ResumeState {
     }
 
     /// Exact in-process boundary: drop anything at or before the last good
-    /// event, and drop a record the poison ladder deliberately skipped.
+    /// event.
+    ///
+    /// Pure and side-effect free, so the boundary arithmetic stays testable on
+    /// its own. The poison skip is deliberately NOT here: it is a one-shot that
+    /// has to be consumed, and mixing a consuming decision into a predicate is
+    /// how the previous version came to be a no-op.
     pub(super) fn should_emit(&self, time: DateTime<Utc>, record_id: u64) -> bool {
-        if self.skipped_record_id == Some(record_id) {
-            return false;
-        }
         match (self.last_event_time, self.last_record_id) {
             (Some(last_time), Some(last_record)) => (time, record_id) > (last_time, last_record),
             _ => true,
         }
+    }
+
+    /// Decide whether one delivered record is emitted, consuming the one-shot
+    /// poison skip if it is armed.
+    ///
+    /// This is the drain loop's single admission gate. Returns false for records
+    /// at or before the boundary, and false exactly once more when the ladder is
+    /// on the skip rung: that first record past the boundary is the poison event
+    /// we could not name, and dropping it costs exactly one event.
+    pub(super) fn admit(&mut self, time: DateTime<Utc>, record_id: u64) -> bool {
+        if !self.should_emit(time, record_id) {
+            return false;
+        }
+        if self.skip_next_record {
+            self.skip_next_record = false;
+            return false;
+        }
+        true
     }
 }
 
@@ -580,7 +637,6 @@ mod tests {
 
         assert_eq!(resume.advance_rung(), Rung::IsolateOne);
         assert_eq!(resume.advance_rung(), Rung::SkipRecord);
-        assert_eq!(resume.skipped_record_id, Some(42));
         assert_eq!(
             resume.advance_rung(),
             Rung::TimeAdvance(TimeRung::BoundaryTick)
@@ -602,7 +658,9 @@ mod tests {
             resume.advance_rung(),
             Rung::TimeAdvance(TimeRung::BoundaryTick)
         );
-        assert_eq!(resume.skipped_record_id, None);
+        // No single-record skip was armed, so the next record past the boundary
+        // is still delivered: the time rung is what does the discarding here.
+        assert!(resume.admit(ts(1_700_000_001, 0), 43));
     }
 
     #[test]
@@ -624,7 +682,9 @@ mod tests {
         resume.advance_rung();
         resume.observe_clean_read();
         assert_eq!(resume.rung, Rung::Bookmark);
-        assert_eq!(resume.skipped_record_id, None);
+        // A clean read disarms the pending skip: the next record past the
+        // boundary is a normal event again, not something to discard.
+        assert!(resume.admit(ts(1_700_000_001, 0), 43));
     }
 
     /// The XPath floors to the millisecond so it over-delivers; the exact
@@ -653,14 +713,95 @@ mod tests {
         assert!(resume.should_emit(ts(1_700_000_000, 123_456_800), 11));
     }
 
+    /// The behavior D17 buys: at the skip rung the poison event is dropped and
+    /// the very next good event is delivered, so escaping one bad record costs
+    /// one record and never a time window.
+    ///
+    /// The poison record's id is unknowable: `EvtNext` failed, so no handle came
+    /// back. What is knowable is its position, immediately past the boundary.
     #[test]
-    fn skipped_record_is_never_re_emitted() {
+    fn poison_escape_drops_the_poison_event_and_delivers_the_next_one() {
+        let mut resume = ResumeState::new(true);
+        // Last good event: record 42.
+        resume.observe_event(ts(1_700_000_000, 0), 42);
+
+        assert_eq!(resume.advance_rung(), Rung::IsolateOne);
+        assert_eq!(resume.advance_rung(), Rung::SkipRecord);
+
+        // Record 43 is the poison: the first record the resume delivers.
+        assert!(
+            !resume.admit(ts(1_700_000_001, 0), 43),
+            "the poison event must not be delivered"
+        );
+        // And the escape costs exactly that one record.
+        assert!(
+            resume.admit(ts(1_700_000_002, 0), 44),
+            "the next good event must be delivered"
+        );
+    }
+
+    /// The skip is a one-shot, not a mode. A second escape has to be a second
+    /// stuck detection, otherwise a channel would bleed events silently.
+    #[test]
+    fn the_poison_skip_is_consumed_once() {
         let mut resume = ResumeState::new(true);
         resume.observe_event(ts(1_700_000_000, 0), 42);
         resume.advance_rung();
         resume.advance_rung();
-        assert_eq!(resume.skipped_record_id, Some(42));
-        assert!(!resume.should_emit(ts(1_700_000_000, 0), 42));
+
+        assert!(!resume.admit(ts(1_700_000_001, 0), 43));
+        for id in 44..50u64 {
+            assert!(
+                resume.admit(ts(1_700_000_000 + id as i64, 0), id),
+                "record {id} must be delivered; the skip is one-shot"
+            );
+        }
+    }
+
+    /// A dead bookmark is not a poison event. There is no offending record, so a
+    /// single-record skip is meaningless and isolating the batch accomplishes
+    /// nothing: the correct response is the time rung.
+    #[test]
+    fn dead_bookmark_resumes_by_time_and_consumes_no_skip() {
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(ts(1_700_000_000, 0), 42);
+
+        let rung = resume.bookmark_dead();
+        assert_eq!(rung, Rung::TimeAdvance(TimeRung::BoundaryTick));
+        assert_eq!(rung.resumed_from(), ResumedFrom::TimeFallback);
+        assert!(
+            resume.admit(ts(1_700_000_001, 0), 43),
+            "a dead bookmark must not silently eat a record on top of the resume"
+        );
+    }
+
+    /// Nothing to fall back to: the stranded-bookmark rung. Deliberate loss of
+    /// the whole backlog, which is why its caller emits ERROR (D16).
+    #[test]
+    fn dead_bookmark_without_a_stored_time_goes_future_only() {
+        let mut resume = ResumeState::new(true);
+        assert_eq!(resume.bookmark_dead(), Rung::FutureOnly);
+        assert_eq!(resume.rung.resumed_from(), ResumedFrom::FutureOnly);
+    }
+
+    /// Repeated bookmark death escalates the window rather than sticking at the
+    /// boundary tick forever.
+    #[test]
+    fn repeated_bookmark_death_widens_the_time_window() {
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(ts(1_700_000_000, 0), 42);
+        assert_eq!(
+            resume.bookmark_dead(),
+            Rung::TimeAdvance(TimeRung::BoundaryTick)
+        );
+        assert_eq!(
+            resume.bookmark_dead(),
+            Rung::TimeAdvance(TimeRung::OneSecond)
+        );
+        for _ in 0..10 {
+            resume.bookmark_dead();
+        }
+        assert_eq!(resume.rung, Rung::FutureOnly);
     }
 
     #[test]
