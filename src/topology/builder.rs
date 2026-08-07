@@ -180,10 +180,23 @@ impl<'a> Builder<'a> {
     /// Builds the new pieces of the topology found in `self.diff`.
     async fn build(mut self) -> Result<TopologyPieces, Vec<String>> {
         let _enrichment_tables_load_guard = ENRICHMENT_TABLES_LOAD_LOCK.lock().await;
+
+        // A remap program is compiled once while schema definitions are resolved and again when
+        // the transform is built; the memo collapses those into one compilation. It is scoped to
+        // this cycle: entries from a previous build can never match anyway (their key pins the
+        // enrichment registry and the program text), and keeping them alive would retain a dead
+        // copy of every program for the lifetime of a long-running process. Clearing on the way in
+        // as well as on the way out keeps the bound even when a build fails partway.
+        #[cfg(feature = "transforms-remap")]
+        crate::transforms::remap::clear_compiled_program_cache();
+
         let enrichment_tables = self.load_enrichment_tables().await;
         let source_tasks = self.build_sources(enrichment_tables).await;
         self.build_transforms(enrichment_tables).await;
         self.build_sinks(enrichment_tables).await;
+
+        #[cfg(feature = "transforms-remap")]
+        crate::transforms::remap::clear_compiled_program_cache();
 
         if self.errors.is_empty() {
             // We should have all the data for the enrichment tables loaded now, so switch them over to
