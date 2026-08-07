@@ -52,6 +52,36 @@ pub struct EventDataResult {
     pub user_data: HashMap<String, String>,
 }
 
+/// Where an event's `message` text came from.
+///
+/// This is the authoritative signal for downstream consumers. The honesty
+/// suffix that appears in the message text is for humans reading the line; a
+/// consumer that needs to branch keys on this field and never on the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageSource {
+    /// Rendered by the publisher (or delivered pre-rendered in
+    /// `<RenderingInfo>`). The message means what it says.
+    Publisher,
+    /// The publisher template was unavailable, so the message is assembled from
+    /// the raw string inserts. Some applications define a real message table
+    /// where the single insert is a bare numeric parameter, so this text can be
+    /// nonsense without the template. That is why it is marked rather than
+    /// presented as an ordinary message.
+    Inserts,
+    /// Neither a template nor any inserts were available.
+    None,
+}
+
+impl MessageSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publisher => "publisher",
+            Self::Inserts => "inserts",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Represents a Windows Event Log event.
 #[derive(Debug, Clone)]
 pub struct WindowsEvent {
@@ -83,6 +113,9 @@ pub struct WindowsEvent {
     pub version: Option<u8>,
     pub qualifiers: Option<u16>,
     pub string_inserts: Vec<String>,
+    /// How `rendered_message` was obtained, or would have to be reconstructed.
+    /// Authoritative for consumers; see [`MessageSource`].
+    pub message_source: MessageSource,
 }
 
 impl WindowsEvent {
@@ -395,6 +428,14 @@ pub fn build_event(
 
     let event_data_result = extract_event_data(&xml, config);
 
+    let message_source = if rendered_message.is_some() {
+        MessageSource::Publisher
+    } else if event_data_result.string_inserts.is_empty() {
+        MessageSource::None
+    } else {
+        MessageSource::Inserts
+    };
+
     let event = WindowsEvent {
         record_id,
         event_id,
@@ -433,6 +474,7 @@ pub fn build_event(
         version: system_fields.version,
         qualifiers: system_fields.qualifiers,
         string_inserts: event_data_result.string_inserts,
+        message_source,
     };
 
     Ok(Some(event))
@@ -839,6 +881,7 @@ mod tests {
             version: Some(1),
             qualifiers: Some(0),
             string_inserts: vec![],
+            message_source: MessageSource::Publisher,
         };
 
         assert_eq!(event.level_name(), "Error");
@@ -874,6 +917,7 @@ mod tests {
             version: Some(2),
             qualifiers: Some(0),
             string_inserts: vec![],
+            message_source: MessageSource::Publisher,
         };
 
         assert_eq!(event.level_name(), "Information");

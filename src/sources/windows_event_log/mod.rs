@@ -677,6 +677,7 @@ impl SourceConfig for WindowsEventLogConfig {
                         "user_data".into(),
                         Kind::object(std::collections::BTreeMap::new()).or_undefined(),
                     ),
+                    ("message_source".into(), Kind::bytes().or_undefined()),
                     ("task_name".into(), Kind::bytes().or_undefined()),
                     ("opcode_name".into(), Kind::bytes().or_undefined()),
                     (
