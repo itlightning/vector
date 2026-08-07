@@ -17,9 +17,12 @@ cfg_if::cfg_if! {
         pub mod error;
         mod metadata;
         mod parser;
+        mod recovery;
         mod render;
+        mod rendering_info;
         mod sid_resolver;
         mod subscription;
+        mod win32_errors;
         mod xml_parser;
 
         use std::path::PathBuf;
@@ -71,8 +74,8 @@ if #[cfg(windows)] {
 /// the batch since a single batch may span multiple channels.
 #[derive(Debug, Clone)]
 struct FinalizerEntry {
-    /// Channel bookmarks: (channel_name, bookmark_xml) pairs
-    bookmarks: Vec<(String, String)>,
+    /// Checkpoint positions for every channel represented in the batch.
+    positions: Vec<checkpoint::ChannelPosition>,
 }
 
 /// Shared checkpointer type for use with the finalizer
@@ -104,7 +107,7 @@ impl Finalizer {
             crate::spawn_in_current_span(async move {
                 while let Some((status, entry)) = ack_stream.next().await {
                     if status == BatchStatus::Delivered {
-                        if let Err(e) = checkpointer.set_batch(entry.bookmarks.clone()).await {
+                        if let Err(e) = checkpointer.set_batch(entry.positions.clone()).await {
                             warn!(
                                 message = "Failed to update checkpoint after acknowledgement.",
                                 error = %e
@@ -112,7 +115,7 @@ impl Finalizer {
                         } else {
                             debug!(
                                 message = "Checkpoint updated after acknowledgement.",
-                                channels = entry.bookmarks.len()
+                                channels = entry.positions.len()
                             );
                         }
                     } else {
@@ -137,7 +140,7 @@ impl Finalizer {
     async fn finalize(&self, entry: FinalizerEntry, receiver: Option<BatchStatusReceiver>) {
         match (self, receiver) {
             (Self::Sync(checkpointer), None) => {
-                if let Err(e) = checkpointer.set_batch(entry.bookmarks.clone()).await {
+                if let Err(e) = checkpointer.set_batch(entry.positions.clone()).await {
                     warn!(
                         message = "Failed to update checkpoint.",
                         error = %e
@@ -227,17 +230,13 @@ async fn process_event_batch(
         }
 
         // Register checkpoint entry with the finalizer.
-        let bookmarks: Vec<(String, String)> = channels_in_batch
+        let positions: Vec<checkpoint::ChannelPosition> = channels_in_batch
             .into_iter()
-            .filter_map(|channel| {
-                subscription
-                    .get_bookmark_xml(&channel)
-                    .map(|xml| (channel, xml))
-            })
+            .filter_map(|channel| subscription.channel_position(&channel))
             .collect();
 
-        if !bookmarks.is_empty() {
-            let entry = FinalizerEntry { bookmarks };
+        if !positions.is_empty() {
+            let entry = FinalizerEntry { positions };
             finalizer.finalize(entry, receiver).await;
         }
     }
@@ -438,8 +437,14 @@ impl WindowsEventLogSource {
                             }
                         }
                         Err(e) => {
+                            // Per-channel failures never reach here: they are
+                            // classified, logged with the real channel name,
+                            // and recovered inside the subscription. What is
+                            // left is source-level, so it is attributed to the
+                            // source rather than to a fictitious channel named
+                            // "all".
                             emit!(WindowsEventLogQueryError {
-                                channel: "all".to_string(),
+                                channel: "<source>".to_string(),
                                 query: None,
                                 error: e.to_string(),
                             });
@@ -539,8 +544,14 @@ impl WindowsEventLogSource {
                             }
                         }
                         Err(e) => {
+                            // Per-channel failures never reach here: they are
+                            // classified, logged with the real channel name,
+                            // and recovered inside the subscription. What is
+                            // left is source-level, so it is attributed to the
+                            // source rather than to a fictitious channel named
+                            // "all".
                             emit!(WindowsEventLogQueryError {
-                                channel: "all".to_string(),
+                                channel: "<source>".to_string(),
                                 query: None,
                                 error: e.to_string(),
                             });

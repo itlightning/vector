@@ -31,6 +31,49 @@ pub struct ChannelCheckpoint {
     /// Timestamp when this checkpoint was last updated (for debugging)
     #[serde(default)]
     pub updated_at: String,
+
+    /// `TimeCreated` of the last processed event, at full FILETIME (100ns)
+    /// resolution.
+    ///
+    /// Additive and skipped when absent, so checkpoints written by an older
+    /// binary still load and checkpoints written by this one stay readable by
+    /// an older binary. The bookmark remains the primary position; this is the
+    /// fallback the resume ladder needs when the bookmark is dead, and full
+    /// precision is what lets the exact in-process boundary contribute zero
+    /// duplicates after a millisecond-floored XPath.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_time: Option<String>,
+
+    /// `EventRecordID` of the last processed event, paired with
+    /// `last_event_time` to make the resume position exactly identifiable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_record_id: Option<u64>,
+}
+
+/// A checkpoint update for one channel.
+///
+/// The time and record id travel with the bookmark rather than beside it,
+/// because a bookmark written without its position fallback is exactly the
+/// state the resume ladder cannot recover from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelPosition {
+    pub channel: String,
+    pub bookmark_xml: String,
+    pub last_event_time: Option<String>,
+    pub last_record_id: Option<u64>,
+}
+
+impl ChannelPosition {
+    /// A position carrying only a bookmark, for callers that have nothing else.
+    #[cfg(test)]
+    pub fn bookmark_only(channel: String, bookmark_xml: String) -> Self {
+        Self {
+            channel,
+            bookmark_xml,
+            last_event_time: None,
+            last_record_id: None,
+        }
+    }
 }
 
 /// Container for all channel checkpoints
@@ -113,6 +156,8 @@ impl Checkpointer {
             channel: channel.clone(),
             bookmark_xml,
             updated_at: chrono::Utc::now().to_rfc3339(),
+            last_event_time: None,
+            last_record_id: None,
         };
 
         state.channels.insert(channel.clone(), checkpoint);
@@ -139,7 +184,7 @@ impl Checkpointer {
     /// and avoids per-event disk I/O overhead.
     pub async fn set_batch(
         &self,
-        updates: Vec<(String, String)>,
+        updates: Vec<ChannelPosition>,
     ) -> Result<(), WindowsEventLogError> {
         if updates.is_empty() {
             return Ok(());
@@ -148,13 +193,15 @@ impl Checkpointer {
         let mut state = self.state.lock().await;
         let timestamp = chrono::Utc::now().to_rfc3339();
 
-        for (channel, bookmark_xml) in &updates {
+        for position in &updates {
             let checkpoint = ChannelCheckpoint {
-                channel: channel.clone(),
-                bookmark_xml: bookmark_xml.clone(),
+                channel: position.channel.clone(),
+                bookmark_xml: position.bookmark_xml.clone(),
                 updated_at: timestamp.clone(),
+                last_event_time: position.last_event_time.clone(),
+                last_record_id: position.last_record_id,
             };
-            state.channels.insert(channel.clone(), checkpoint);
+            state.channels.insert(position.channel.clone(), checkpoint);
         }
 
         // Single disk write for all channels
@@ -501,9 +548,9 @@ mod tests {
         // Batch update all channels at once
         checkpointer
             .set_batch(vec![
-                ("System".to_string(), system_bookmark.clone()),
-                ("Application".to_string(), app_bookmark.clone()),
-                ("Security".to_string(), security_bookmark.clone()),
+                ChannelPosition::bookmark_only("System".to_string(), system_bookmark.clone()),
+                ChannelPosition::bookmark_only("Application".to_string(), app_bookmark.clone()),
+                ChannelPosition::bookmark_only("Security".to_string(), security_bookmark.clone()),
             ])
             .await
             .unwrap();
@@ -521,6 +568,59 @@ mod tests {
             checkpointer.get("Security").await.unwrap().bookmark_xml,
             security_bookmark
         );
+    }
+
+    /// The time and record id are additive: a checkpoint file written by an
+    /// older binary must still load, and a file written by this one must stay
+    /// readable by an older binary (the extra keys are simply unknown to it).
+    #[tokio::test]
+    async fn test_position_fields_are_additive_in_both_directions() {
+        let temp_dir = TempDir::new().unwrap();
+        let checkpoint_path = temp_dir.path().join(CHECKPOINT_FILENAME);
+
+        // A file in the old shape, with no position fields at all.
+        let legacy = r#"{"version":1,"channels":{"System":{"channel":"System",
+            "bookmark_xml":"<BookmarkList/>","updated_at":"2026-01-01T00:00:00Z"}}}"#;
+        fs::write(&checkpoint_path, legacy.as_bytes())
+            .await
+            .unwrap();
+
+        let checkpointer = Checkpointer::new(temp_dir.path()).await.unwrap();
+        let loaded = checkpointer.get("System").await.expect("legacy must load");
+        assert_eq!(loaded.last_event_time, None);
+        assert_eq!(loaded.last_record_id, None);
+
+        // Writing without a position must not emit the keys at all, so an
+        // older binary sees a byte-identical shape to what it wrote.
+        checkpointer
+            .set_batch(vec![ChannelPosition::bookmark_only(
+                "System".to_string(),
+                "<BookmarkList/>".to_string(),
+            )])
+            .await
+            .unwrap();
+        let written = fs::read_to_string(&checkpoint_path).await.unwrap();
+        assert!(!written.contains("last_event_time"));
+        assert!(!written.contains("last_record_id"));
+
+        // With a position, both round-trip at full precision.
+        checkpointer
+            .set_batch(vec![ChannelPosition {
+                channel: "System".to_string(),
+                bookmark_xml: "<BookmarkList/>".to_string(),
+                last_event_time: Some("2026-08-07T14:03:11.1234567Z".to_string()),
+                last_record_id: Some(91827),
+            }])
+            .await
+            .unwrap();
+
+        let reopened = Checkpointer::new(temp_dir.path()).await.unwrap();
+        let loaded = reopened.get("System").await.unwrap();
+        assert_eq!(
+            loaded.last_event_time.as_deref(),
+            Some("2026-08-07T14:03:11.1234567Z")
+        );
+        assert_eq!(loaded.last_record_id, Some(91827));
     }
 
     #[tokio::test]
@@ -546,8 +646,8 @@ mod tests {
             let checkpointer = Checkpointer::new(temp_dir.path()).await.unwrap();
             checkpointer
                 .set_batch(vec![
-                    ("System".to_string(), system_bookmark.clone()),
-                    ("Application".to_string(), app_bookmark.clone()),
+                    ChannelPosition::bookmark_only("System".to_string(), system_bookmark.clone()),
+                    ChannelPosition::bookmark_only("Application".to_string(), app_bookmark.clone()),
                 ])
                 .await
                 .unwrap();

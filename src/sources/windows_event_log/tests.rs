@@ -31,6 +31,7 @@ fn create_test_config() -> WindowsEventLogConfig {
         checkpoint_interval_secs: 5,
         acknowledgements: Default::default(),
         render_message: false,
+        subscription_refresh_secs: 86_400,
     }
 }
 
