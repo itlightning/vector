@@ -22,6 +22,10 @@ cfg_if::cfg_if! {
         mod rendering_info;
         mod sid_resolver;
         mod subscription;
+        /// Invariants of the pure decision layer over randomly generated
+        /// `(call site, code, returned count)` triples. Needs no Windows.
+        #[cfg(test)]
+        mod property_tests;
         /// Exclusive access to the process-global fault-injection seams. Any
         /// test that installs a seam or creates a subscription must hold a
         /// `SeamSession`; the requirement is enforced, not documented.
