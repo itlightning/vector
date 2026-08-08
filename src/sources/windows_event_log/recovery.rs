@@ -361,36 +361,27 @@ impl ResumeState {
         Some(advanced - chrono::Duration::nanoseconds(i64::from(nanos % 1_000_000)))
     }
 
-    /// Exact in-process boundary: drop anything at or before the last good
-    /// event.
+    /// Consume the one-shot poison skip, if it is armed.
     ///
-    /// Pure and side-effect free, so the boundary arithmetic stays testable on
-    /// its own. The poison skip is deliberately NOT here: it is a one-shot that
-    /// has to be consumed, and mixing a consuming decision into a predicate is
-    /// how the previous version came to be a no-op.
-    pub(super) fn should_emit(&self, time: DateTime<Utc>, record_id: u64) -> bool {
-        match (self.last_event_time, self.last_record_id) {
-            (Some(last_time), Some(last_record)) => (time, record_id) > (last_time, last_record),
-            _ => true,
-        }
-    }
-
-    /// Decide whether one delivered record is emitted, consuming the one-shot
-    /// poison skip if it is armed.
+    /// This is the ONLY reason this type can withhold an event, and it is
+    /// deliberately blind to the event: it takes no time and no record id,
+    /// because nothing about an event may decide whether the event is sent
+    /// (section 4.0 rules 8 and 31). It returns true exactly once per arming, for the first record
+    /// delivered after the resume, which is the poison record we could not name.
     ///
-    /// This is the drain loop's single admission gate. Returns false for records
-    /// at or before the boundary, and false exactly once more when the ladder is
-    /// on the skip rung: that first record past the boundary is the poison event
-    /// we could not name, and dropping it costs exactly one event.
-    pub(super) fn admit(&mut self, time: DateTime<Utc>, record_id: u64) -> bool {
-        if !self.should_emit(time, record_id) {
-            return false;
-        }
+    /// There is no time boundary here and there must never be one again. The
+    /// version that compared `(TimeCreated, RecordId)` against the last sent
+    /// event discarded real events in production: `EvtNext` delivers in RECORD
+    /// order, the provider writes the time, and the two are not ordered
+    /// together (35 inversions in 2820 events, worst step 984 ms). The gate
+    /// suppressed at most one millisecond of duplicates on a rare fallback path
+    /// and paid with silent, unrecoverable loss on the common one (D31).
+    pub(super) const fn take_poison_skip(&mut self) -> bool {
         if self.skip_next_record {
             self.skip_next_record = false;
-            return false;
+            return true;
         }
-        true
+        false
     }
 }
 
@@ -662,9 +653,9 @@ mod tests {
             resume.advance_rung(),
             Rung::TimeAdvance(TimeRung::BoundaryTick)
         );
-        // No single-record skip was armed, so the next record past the boundary
-        // is still delivered: the time rung is what does the discarding here.
-        assert!(resume.admit(ts(1_700_000_001, 0), 43));
+        // No single-record skip was armed, so the next record delivered is
+        // still sent: the time rung is what does the discarding here.
+        assert!(!resume.take_poison_skip());
     }
 
     #[test]
@@ -686,9 +677,9 @@ mod tests {
         resume.advance_rung();
         resume.observe_clean_read();
         assert_eq!(resume.rung, Rung::Bookmark);
-        // A clean read disarms the pending skip: the next record past the
-        // boundary is a normal event again, not something to discard.
-        assert!(resume.admit(ts(1_700_000_001, 0), 43));
+        // A clean read disarms the pending skip: the next record delivered is
+        // a normal event again, not something to discard.
+        assert!(!resume.take_poison_skip());
     }
 
     /// The XPath floors to the millisecond so it over-delivers; the exact
@@ -702,19 +693,39 @@ mod tests {
         assert_eq!(floor.timestamp_subsec_nanos(), 123_000_000);
     }
 
+    /// Rules 28 to 31: the stored time and the stored record number are inputs
+    /// to the fallback query and to gap reporting, and they decide nothing
+    /// about delivery.
+    ///
+    /// This replaces an assertion that the stored pair TRIMMED events at an
+    /// exact `(TimeCreated, RecordId)` boundary. That trim was the production
+    /// defect: it discarded 7 of 38 real records on the captured field shape.
+    /// The stored values themselves are kept, so the test is now that they are
+    /// held and are inert.
     #[test]
-    fn in_process_boundary_is_exact_at_100ns() {
+    fn the_stored_position_is_recorded_and_never_withholds_an_event() {
         let mut resume = ResumeState::new(true);
         let last = ts(1_700_000_000, 123_456_700);
         resume.observe_event(last, 10);
 
-        // Same millisecond, earlier tick: the XPath over-delivered it, the
-        // boundary must trim it.
-        assert!(!resume.should_emit(ts(1_700_000_000, 123_000_000), 9));
-        // The event itself.
-        assert!(!resume.should_emit(last, 10));
-        // One tick later.
-        assert!(resume.should_emit(ts(1_700_000_000, 123_456_800), 11));
+        assert_eq!(resume.last_event_time, Some(last));
+        assert_eq!(resume.last_record_id, Some(10));
+
+        // An event inside the same millisecond, an event at the stored
+        // position, and an event a full second behind it. None of them is
+        // withheld, because nothing but the poison one-shot can withhold.
+        assert!(!resume.take_poison_skip());
+        resume.observe_event(ts(1_700_000_000, 123_000_000), 9);
+        assert!(!resume.take_poison_skip());
+        resume.observe_event(ts(1_699_999_999, 0), 11);
+        assert!(!resume.take_poison_skip());
+
+        // And the stored values track the last event SENT, not the maximum
+        // time seen: rules 19 and 29 build the floor time from the last event the
+        // source sent, so a lower time there over-delivers, which is the safe
+        // direction.
+        assert_eq!(resume.last_event_time, Some(ts(1_699_999_999, 0)));
+        assert_eq!(resume.last_record_id, Some(11));
     }
 
     /// The behavior D17 buys: at the skip rung the poison event is dropped and
@@ -734,12 +745,12 @@ mod tests {
 
         // Record 43 is the poison: the first record the resume delivers.
         assert!(
-            !resume.admit(ts(1_700_000_001, 0), 43),
+            resume.take_poison_skip(),
             "the poison event must not be delivered"
         );
         // And the escape costs exactly that one record.
         assert!(
-            resume.admit(ts(1_700_000_002, 0), 44),
+            !resume.take_poison_skip(),
             "the next good event must be delivered"
         );
     }
@@ -753,10 +764,10 @@ mod tests {
         resume.advance_rung();
         resume.advance_rung();
 
-        assert!(!resume.admit(ts(1_700_000_001, 0), 43));
+        assert!(resume.take_poison_skip());
         for id in 44..50u64 {
             assert!(
-                resume.admit(ts(1_700_000_000 + id as i64, 0), id),
+                !resume.take_poison_skip(),
                 "record {id} must be delivered; the skip is one-shot"
             );
         }
@@ -792,12 +803,12 @@ mod tests {
         );
 
         // The time floor advanced and records flow again. The first one past
-        // the new floor is a good event and must be admitted.
+        // the new floor is a good event and must be sent.
         assert!(
-            resume.admit(ts(1_700_000_001, 0), 43),
-            "the first record past the new time floor must be admitted"
+            !resume.take_poison_skip(),
+            "the first record past the new time floor must be sent"
         );
-        assert!(resume.admit(ts(1_700_000_002, 0), 44));
+        assert!(!resume.take_poison_skip());
     }
 
     /// A dead bookmark is not a poison event. There is no offending record, so a
@@ -812,7 +823,7 @@ mod tests {
         assert_eq!(rung, Rung::TimeAdvance(TimeRung::BoundaryTick));
         assert_eq!(rung.resumed_from(), ResumedFrom::TimeFallback);
         assert!(
-            resume.admit(ts(1_700_000_001, 0), 43),
+            !resume.take_poison_skip(),
             "a dead bookmark must not silently eat a record on top of the resume"
         );
     }

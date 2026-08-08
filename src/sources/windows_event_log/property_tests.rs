@@ -455,6 +455,137 @@ fn bookmark_death_also_reaches_the_terminal_rung() {
     );
 }
 
+/// A batch as the API delivers it: record numbers ascending, times arbitrary.
+///
+/// Times are drawn over a wide range including values before the epoch and are
+/// NOT sorted, which is the whole point. Generating ordered times is how 16
+/// million property cases missed an admission gate that discarded every event
+/// whose provider-written time went backwards.
+fn arbitrary_batch() -> impl Strategy<Value = Vec<(DateTime<Utc>, u64)>> {
+    proptest::collection::vec(
+        (-2_000_000_000i64..4_000_000_000i64, 0u32..1_000_000_000),
+        1..64usize,
+    )
+    .prop_map(|times| {
+        times
+            .into_iter()
+            .enumerate()
+            .map(|(index, (secs, nanos))| {
+                let time = DateTime::from_timestamp(secs, nanos).unwrap_or_else(a_time);
+                (time, 1_000 + index as u64)
+            })
+            .collect()
+    })
+}
+
+/// Replay one batch through the source's delivery decision, returning the
+/// record numbers sent and the record numbers withheld.
+fn replay(resume: &mut ResumeState, batch: &[(DateTime<Utc>, u64)]) -> (Vec<u64>, Vec<u64>) {
+    let mut sent = Vec::new();
+    let mut withheld = Vec::new();
+    for (time, record_id) in batch {
+        // The drain loop, rule for rule: the poison one-shot is the only thing
+        // consulted, and a sent event updates the stored position.
+        if resume.take_poison_skip() {
+            withheld.push(*record_id);
+            continue;
+        }
+        sent.push(*record_id);
+        resume.observe_event(*time, *record_id);
+    }
+    (sent, withheld)
+}
+
+/// Rules 3 to 8 and rule 31, over arbitrary times: every event in the batch is
+/// sent, and the poison one-shot is the only thing that can withhold one.
+///
+/// The render skip (rule 5) is not reachable from the pure layer, so this
+/// property speaks for rule 6 and for the absence of any other exception.
+#[test]
+fn every_event_is_sent_unless_the_poison_one_shot_withholds_it() {
+    check(
+        "every_event_is_sent_unless_the_poison_one_shot_withholds_it",
+        (
+            rung(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            arbitrary_batch(),
+        ),
+        |(start, identity_usable, have_time, armed, batch)| {
+            let mut resume = resume_state(start, identity_usable, Some(500), have_time);
+            resume.skip_next_record = armed;
+
+            let (sent, withheld) = replay(&mut resume, &batch);
+
+            prop_assert_eq!(
+                sent.len() + withheld.len(),
+                batch.len(),
+                "every delivered record is either sent or explicitly withheld; \
+                 nothing may disappear between the two"
+            );
+            prop_assert_eq!(
+                withheld.len(),
+                usize::from(armed),
+                "the one-shot withholds exactly one record when armed and none \
+                 when not, whatever the times are"
+            );
+            let expected: Vec<u64> = batch
+                .iter()
+                .map(|(_, record_id)| *record_id)
+                .skip(usize::from(armed))
+                .collect();
+            prop_assert_eq!(sent, expected, "the rest of the batch is sent in order");
+            Ok(())
+        },
+    );
+}
+
+/// Rule 8 as a total claim: the times have NO effect.
+///
+/// Two batches with the same record numbers and completely different times
+/// produce the same delivery decisions. A single comparison on an event time
+/// anywhere in the path breaks this, whatever form it takes and whichever
+/// direction it points.
+#[test]
+fn changing_every_event_time_changes_nothing_about_delivery() {
+    check(
+        "changing_every_event_time_changes_nothing_about_delivery",
+        (
+            rung(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            arbitrary_batch(),
+            arbitrary_batch(),
+        ),
+        |(start, identity_usable, have_time, armed, first, second)| {
+            // Same record numbers, different times: only the times differ.
+            let restamped: Vec<(DateTime<Utc>, u64)> = first
+                .iter()
+                .enumerate()
+                .map(|(index, (_, record_id))| {
+                    let (time, _) = second[index % second.len()];
+                    (time, *record_id)
+                })
+                .collect();
+
+            let mut left = resume_state(start, identity_usable, Some(500), have_time);
+            left.skip_next_record = armed;
+            let mut right = resume_state(start, identity_usable, Some(500), have_time);
+            right.skip_next_record = armed;
+
+            prop_assert_eq!(
+                replay(&mut left, &first),
+                replay(&mut right, &restamped),
+                "the same records under different times must produce the same \
+                 sent and withheld sets"
+            );
+            Ok(())
+        },
+    );
+}
+
 /// Backoff is bounded by the 60s cap, non-decreasing in its computed delay, and
 /// jitter stays inside the stated band.
 ///

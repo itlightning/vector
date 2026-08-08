@@ -1448,44 +1448,42 @@ impl EventLogSubscription {
                                 event.opcode_name = display.opcode_name;
                                 event.keyword_names = display.keyword_names;
 
-                                // Exact in-process boundary. The generated XPath
-                                // predicate floors to the millisecond and
-                                // therefore over-delivers; trimming here at full
-                                // (TimeCreated, RecordId) resolution is what
-                                // makes precision contribute zero duplicates on
-                                // every resume path. It is also where a
-                                // deliberately skipped poison record is dropped,
-                                // and `past_boundary` is what separates the two:
-                                // an over-delivered duplicate needs nothing,
-                                // while the one-shot poison skip has to be made
-                                // durable.
-                                let past_boundary = channel_sub
-                                    .resume
-                                    .should_emit(event.time_created, event.record_id);
-                                if !channel_sub
-                                    .resume
-                                    .admit(event.time_created, event.record_id)
-                                {
-                                    if past_boundary {
-                                        // The poison skip. Advance the bookmark
-                                        // and the boundary past it so a restart
-                                        // does not resume onto the same record
-                                        // and repeat the whole escape.
-                                        if channel_sub.bookmark.update(event_handle).is_ok() {
-                                            channel_sub.bookmark_positioned = true;
-                                        }
-                                        channel_sub
-                                            .resume
-                                            .observe_event(event.time_created, event.record_id);
-                                        // The rung WARN already reported this
-                                        // skip; leaving the gap detector behind
-                                        // would report it a second time as an
-                                        // unexplained gap.
-                                        channel_sub.last_record_id_seen = Some(event.record_id);
+                                // The ONLY reason an event that rendered is not
+                                // sent (D31, rules 6 and 7). There is no time
+                                // comparison here and there must never be one:
+                                // the API delivers in record order, the
+                                // provider writes the time, and a gate on time
+                                // silently discards real events. Duplicates
+                                // from the millisecond-floored XPath are
+                                // accepted instead, because loss is
+                                // unrecoverable and duplication is not.
+                                if channel_sub.resume.take_poison_skip() {
+                                    // Advance the bookmark and the stored
+                                    // position past it so a restart does not
+                                    // resume onto the same record and repeat
+                                    // the whole escape.
+                                    if channel_sub.bookmark.update(event_handle).is_ok() {
+                                        channel_sub.bookmark_positioned = true;
                                     }
+                                    channel_sub
+                                        .resume
+                                        .observe_event(event.time_created, event.record_id);
+                                    // The rung WARN already reported this
+                                    // skip; leaving the gap detector behind
+                                    // would report it a second time as an
+                                    // unexplained gap.
+                                    channel_sub.last_record_id_seen = Some(event.record_id);
+                                    warn!(
+                                        message = "Windows Event Log poison-event escape skipped one record.",
+                                        error_type = "poison_record_skipped",
+                                        channel = %channel_sub.channel,
+                                        record_id = event.record_id,
+                                        rung = channel_sub.resume.rung.as_str(),
+                                        internal_log_rate_limit = false,
+                                    );
                                     counter!(
                                         CounterName::WindowsEventLogEventsFilteredTotal,
-                                        "reason" => "resume_boundary"
+                                        "reason" => "poison_skip"
                                     )
                                     .increment(1);
                                     channel_sub.discard_event_handle(event_handle);
@@ -3403,16 +3401,18 @@ mod tests {
         );
     }
 
-    /// The admission gate emits new events and drops only what it has already
-    /// seen. Inverting it delivers nothing while looking, from the outside, like
-    /// a quiet channel.
+    /// Rule 3: the source sends every event in the batch.
     ///
     /// Asserted against the count `EvtNext` handed back, which is the only
-    /// oracle in reach that does not itself pass through the gate. "Delivered
-    /// something" is the weak assertion this whole exercise exists to
-    /// eliminate, and so is a comparison against a second drain: both sides run
-    /// the same gate, so a gate that drops uniformly degrades both and the
-    /// comparison stays green.
+    /// oracle in reach that does not itself pass through the drain's own
+    /// decisions. "Delivered something" is the weak assertion this whole
+    /// exercise exists to eliminate, and so is a comparison against a second
+    /// drain: both sides run the same code, so a decision that drops uniformly
+    /// degrades both and the comparison stays green.
+    ///
+    /// The assertion is EQUALITY. It used to be "more than half", which is what
+    /// let the time-comparison gate discard 3% of a real Application backlog
+    /// while the suite stayed green.
     #[tokio::test]
     async fn the_admission_gate_emits_every_record_evtnext_returns() {
         let _seams = SeamSession::acquire();
@@ -3435,19 +3435,16 @@ mod tests {
                 "record {record_id} was delivered twice within one drain"
             );
         }
-        // Not an equality: the exact in-process boundary legitimately trims
-        // records that arrive out of `(TimeCreated, RecordId)` order, which on
-        // a real Application log is a small tail (measured at roughly 3% on the
-        // development host). The claim being pinned is that the gate passes the
-        // BULK of what the API returns. An inverted gate delivers only that
-        // out-of-order tail, which is why a non-empty check cannot see it and a
-        // proportion can.
+        // Equality, on a healthy host with no injected render failure and no
+        // armed poison skip: rules 5 and 6 are the only subtractions and
+        // neither is in play here, so rule 7 leaves nothing else to subtract.
         let returned = request_log.returned_total();
-        assert!(
-            delivered.len() as u64 * 2 > returned,
-            "the admission gate emitted {} of the {returned} records the API \
-             returned; trimming the out-of-order tail is expected, dropping the \
-             bulk of a backlog is an inverted gate",
+        assert_eq!(
+            delivered.len() as u64,
+            returned,
+            "the source sent {} of the {returned} records the API returned. \
+             Nothing may be withheld here: no render failed and no poison skip \
+             was armed",
             delivered.len()
         );
     }
@@ -4413,6 +4410,438 @@ mod tests {
             "a single-record skip is not expressible against interleaved \
              forwarded record ids and the ladder must go straight to the time \
              rungs"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // D31, section 4.0: every event `EvtNext` returns is sent.
+    //
+    // Event time never decides delivery. The API delivers in RECORD order and
+    // the time is written by the PROVIDER, so the two are not ordered together:
+    // measured on one ordinary Application channel, 35 of 2820 events carried a
+    // time before the event ahead of them, worst step 984 ms.
+    //
+    // The seam below supplies caller-chosen times as an INPUT to the real parse
+    // path rather than stubbing a decision. Windows cannot be asked to stamp a
+    // chosen time on an event, and the whole defect class is about times the
+    // provider chose, so the times have to be injectable or the property is
+    // only ever tested against whatever order the host happened to produce.
+    // ---------------------------------------------------------------------
+
+    /// First id of the synthetic record sequence. Far above any real
+    /// `Application` record id, so a rewrite that silently failed to apply
+    /// cannot be mistaken for one that did.
+    const INJECTED_FIRST_RECORD_ID: u64 = 900_000_000;
+
+    /// Replace `TimeCreated`, and optionally `EventRecordID`, in rendered event
+    /// XML. Everything downstream derives both by parsing this string.
+    fn rewrite_time_and_record(
+        xml: &str,
+        time: chrono::DateTime<chrono::Utc>,
+        record_id: Option<u64>,
+    ) -> String {
+        let mut out = xml.to_string();
+        let stamp = time.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        if let Some(start) = out.find("<TimeCreated")
+            && let Some(rest) = out.get(start..)
+            && let Some(end) = rest.find("/>")
+        {
+            out.replace_range(
+                start..start + end + 2,
+                &format!("<TimeCreated SystemTime='{stamp}'/>"),
+            );
+        }
+        if let Some(record_id) = record_id
+            && let Some(start) = out.find("<EventRecordID>")
+            && let Some(rest) = out.get(start..)
+            && let Some(end) = rest.find("</EventRecordID>")
+        {
+            out.replace_range(
+                start..start + end + "</EventRecordID>".len(),
+                &format!("<EventRecordID>{record_id}</EventRecordID>"),
+            );
+        }
+        out
+    }
+
+    /// Delivers the channel's real backlog under a caller-specified timeline:
+    /// ascending record numbers, arbitrary times.
+    ///
+    /// Offsets are microseconds from a fixed base and are consumed in delivery
+    /// order. Past the end of the script the timeline continues ascending at
+    /// one second per event, so the zero-loss claim covers the WHOLE backlog
+    /// rather than only its scripted head.
+    struct InjectedTimeline {
+        _guard: XmlRewriteGuard,
+        applied: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl InjectedTimeline {
+        /// `offset_us` maps a zero-based delivery index to the event's time, as
+        /// microseconds from `base`. It is total, so the timeline covers the
+        /// whole backlog rather than only its head.
+        fn install(_seams: &SeamSession, offset_us: fn(usize) -> i64) -> Self {
+            // Six hours back: comfortably inside every age guard, and far
+            // enough from now that a future-dated case is unambiguous.
+            Self::install_from(
+                _seams,
+                chrono::Utc::now() - chrono::Duration::hours(6),
+                offset_us,
+            )
+        }
+
+        /// Same, against a caller-chosen base. A test whose claim is "behind
+        /// the stored resume position" has to place its times relative to that
+        /// position, not relative to now: the head of a real backlog can be
+        /// weeks old, and a timeline anchored to the clock would sit AHEAD of
+        /// it and prove nothing.
+        fn install_from(
+            _seams: &SeamSession,
+            base: chrono::DateTime<chrono::Utc>,
+            offset_us: fn(usize) -> i64,
+        ) -> Self {
+            let applied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = std::sync::Arc::clone(&applied);
+            let guard = XmlRewriteGuard::install(std::sync::Arc::new(move |xml: String| {
+                let index = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                rewrite_time_and_record(
+                    &xml,
+                    base + chrono::Duration::microseconds(offset_us(index)),
+                    Some(INJECTED_FIRST_RECORD_ID + index as u64),
+                )
+            }));
+            Self {
+                _guard: guard,
+                applied,
+            }
+        }
+
+        /// How many events the timeline actually rewrote. A rewrite that never
+        /// applied would make every assertion below vacuous.
+        fn applied(&self) -> usize {
+            self.applied.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Captures `error_type` for every warn-band record raised inside `f`.
+    fn warn_band_error_types<F: FnOnce() -> T, T>(f: F) -> (T, Vec<(String, String)>) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = ErrorTypeCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
+        let value = tracing::subscriber::with_default(collector, f);
+        let seen = capture.seen.lock().unwrap().clone();
+        (value, seen)
+    }
+
+    /// Assert the contract on one injected drain: every record the API returned
+    /// was sent, in the order it was returned, and nothing was reported missing.
+    fn assert_zero_loss(
+        label: &str,
+        delivered: &[u64],
+        timeline: &InjectedTimeline,
+        request_log: &RequestLog,
+        warns: &[(String, String)],
+    ) {
+        let returned = request_log.returned_total();
+        assert!(
+            returned >= 10,
+            "{label}: the Application backlog must hold several records for a \
+             partial delivery to be distinguishable from a complete one, got \
+             {returned}"
+        );
+        assert_eq!(
+            timeline.applied() as u64,
+            returned,
+            "{label}: the injected timeline must have rewritten every record the \
+             API returned, otherwise the times under test are the host's and not \
+             the ones this test specified"
+        );
+
+        // Reported as the first divergence plus a sample of what is missing:
+        // the backlog runs to tens of thousands of records, and a whole-vector
+        // diff buries the answer.
+        let sent: std::collections::HashSet<u64> = delivered.iter().copied().collect();
+        let missing: Vec<u64> = (0..returned)
+            .map(|index| INJECTED_FIRST_RECORD_ID + index)
+            .filter(|id| !sent.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{label}: the source must send every event EvtNext returned. Sent {} \
+             of {returned}; {} were dropped, first ten at offsets {:?}",
+            delivered.len(),
+            missing.len(),
+            missing
+                .iter()
+                .take(10)
+                .map(|id| id - INJECTED_FIRST_RECORD_ID)
+                .collect::<Vec<_>>()
+        );
+        for (index, id) in delivered.iter().enumerate() {
+            assert_eq!(
+                *id,
+                INJECTED_FIRST_RECORD_ID + index as u64,
+                "{label}: record order is the API's delivery order; position \
+                 {index} carried the wrong record"
+            );
+        }
+
+        assert!(
+            !warns
+                .iter()
+                .any(|(_, kind)| kind == "record_id_gap" || kind == "record_id_gap_expected"),
+            "{label}: record numbers were contiguous, so any gap report is the \
+             source describing its own dropped events as missing records: {warns:#?}"
+        );
+    }
+
+    /// One drain of the whole backlog under an injected timeline.
+    fn drain_injected(
+        seams: &SeamSession,
+        subscription: &mut EventLogSubscription,
+        offset_us: fn(usize) -> i64,
+    ) -> (
+        Vec<u64>,
+        InjectedTimeline,
+        RequestLog,
+        Vec<(String, String)>,
+    ) {
+        let request_log = RequestLog::install(seams);
+        let timeline = InjectedTimeline::install(seams, offset_us);
+        let (delivered, warns) = warn_band_error_types(|| drain_all(subscription));
+        (delivered, timeline, request_log, warns)
+    }
+
+    /// Same, with the timeline anchored to a caller-chosen base.
+    fn drain_injected_from(
+        seams: &SeamSession,
+        subscription: &mut EventLogSubscription,
+        base: chrono::DateTime<chrono::Utc>,
+        offset_us: fn(usize) -> i64,
+    ) -> (
+        Vec<u64>,
+        InjectedTimeline,
+        RequestLog,
+        Vec<(String, String)>,
+    ) {
+        let request_log = RequestLog::install(seams);
+        let timeline = InjectedTimeline::install_from(seams, base, offset_us);
+        let (delivered, warns) = warn_band_error_types(|| drain_all(subscription));
+        (delivered, timeline, request_log, warns)
+    }
+
+    /// One injected drain of a fresh subscription over the Application backlog,
+    /// asserted against the contract.
+    async fn assert_injected_timeline_loses_nothing(
+        seams: &SeamSession,
+        label: &str,
+        offset_us: fn(usize) -> i64,
+    ) {
+        let mut subscription = subscription_from(&application_config()).await;
+        let (delivered, timeline, request_log, warns) =
+            drain_injected(seams, &mut subscription, offset_us);
+        assert_zero_loss(label, &delivered, &timeline, &request_log, &warns);
+    }
+
+    /// The captured shape, verbatim: 38 consecutive `Application` records read
+    /// from a production host, as microsecond offsets from the first one.
+    ///
+    /// Record numbers ascend; provider times do not. The steps backwards at
+    /// index 5 (-254 ms), 15 (-12 ms) and 29 (-870 ms) are the real defect, and
+    /// all 38 of these records existed in the channel while the source was
+    /// reporting a gap over them.
+    const CAPTURED_OFFSETS_US: &[i64] = &[
+        0,
+        30_035_549,
+        30_035_549,
+        1_288_896_284,
+        1_289_240_520,
+        1_288_986_321,
+        1_289_186_612,
+        1_289_731_755,
+        1_289_731_958,
+        1_289_775_632,
+        1_292_214_698,
+        1_292_589_706,
+        1_292_589_706,
+        1_292_589_706,
+        1_296_714_704,
+        1_296_702_787,
+        1_296_703_142,
+        1_296_705_045,
+        1_296_731_724,
+        1_423_089_927,
+        1_423_105_529,
+        1_424_158_472,
+        1_424_191_833,
+        1_424_363_158,
+        1_426_701_762,
+        1_426_905_897,
+        1_426_905_897,
+        1_426_937_112,
+        1_427_798_132,
+        1_426_927_745,
+        1_426_929_626,
+        1_800_043_802,
+        1_800_348_576,
+        1_800_379_744,
+        1_800_379_744,
+        1_800_395_368,
+        1_830_483_883,
+        1_830_593_477,
+    ];
+
+    /// The production defect, replayed from the data that exposed it.
+    ///
+    /// Every one of these records exists and every one must be sent. This test
+    /// fails against an admission gate that compares event times: such a gate
+    /// discards the inverted records and then reports the hole it made as a
+    /// record-id gap.
+    #[tokio::test]
+    async fn the_captured_out_of_order_backlog_loses_no_events() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+
+        let (delivered, timeline, request_log, warns) =
+            drain_injected(&_seams, &mut subscription, |index| {
+                CAPTURED_OFFSETS_US.get(index).copied().unwrap_or_else(|| {
+                    // Past the captured shape the timeline keeps ascending, so
+                    // the zero-loss claim covers the whole backlog and not just
+                    // its scripted head.
+                    CAPTURED_OFFSETS_US.last().copied().unwrap_or(0) + (index as i64) * 1_000_000
+                })
+            });
+
+        assert_zero_loss(
+            "captured field shape",
+            &delivered,
+            &timeline,
+            &request_log,
+            &warns,
+        );
+    }
+
+    /// Every event in the batch is older than the one before it: the pathology
+    /// at full strength rather than at the 1% the field happened to show.
+    #[tokio::test]
+    async fn times_decreasing_across_a_whole_batch_lose_no_events() {
+        let _seams = SeamSession::acquire();
+        assert_injected_timeline_loses_nothing(&_seams, "monotonically decreasing", |index| {
+            -(index as i64) * 1_000_000
+        })
+        .await;
+    }
+
+    /// Ascending inside each batch, then a step backwards at the boundary.
+    ///
+    /// The batch boundary is where a resume position is written and read, so an
+    /// order assumption that survives within a batch can still fail across one.
+    #[tokio::test]
+    async fn times_decreasing_across_a_batch_boundary_lose_no_events() {
+        let _seams = SeamSession::acquire();
+        const BATCH: i64 = 4;
+        let mut config = application_config();
+        config.batch_size = BATCH as u32;
+        let mut subscription = subscription_from(&config).await;
+
+        let (delivered, timeline, request_log, warns) =
+            drain_injected(&_seams, &mut subscription, |index| {
+                let index = index as i64;
+                // Rises inside a batch, drops a full second at every boundary.
+                (index % BATCH) * 1_000 - (index / BATCH) * 1_000_000
+            });
+
+        assert_zero_loss(
+            "descending across batch boundaries",
+            &delivered,
+            &timeline,
+            &request_log,
+            &warns,
+        );
+        assert!(
+            request_log.sizes().contains(&(BATCH as usize)),
+            "the batch size under test must actually reach the API, otherwise \
+             the boundaries this test is about were never crossed: {:?}",
+            request_log.sizes()
+        );
+    }
+
+    /// Every event carries the same time. A comparison gate that admits only a
+    /// strictly greater time keeps the first and discards the rest, which is
+    /// what a burst from one provider looks like: the field capture has three
+    /// runs of identical times in 38 records.
+    #[tokio::test]
+    async fn events_sharing_one_time_lose_no_events() {
+        let _seams = SeamSession::acquire();
+        assert_injected_timeline_loses_nothing(&_seams, "one shared time", |_| 0).await;
+    }
+
+    /// A clock-skewed provider stamps events days ahead, then the channel
+    /// returns to normal. A running maximum poisoned by the future block would
+    /// discard everything after it, permanently.
+    #[tokio::test]
+    async fn times_far_in_the_future_then_back_to_normal_lose_no_events() {
+        let _seams = SeamSession::acquire();
+        assert_injected_timeline_loses_nothing(&_seams, "future block then normal", |index| {
+            const THIRTY_DAYS_US: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+            if (10..20).contains(&index) {
+                THIRTY_DAYS_US + (index as i64) * 1_000_000
+            } else {
+                (index as i64) * 1_000_000
+            }
+        })
+        .await;
+    }
+
+    /// Steady state, the common path: the source holds a stored resume
+    /// position, and every event that arrives next is stamped a day BEFORE it.
+    ///
+    /// This is the production shape exactly. Nothing has failed, no ladder is
+    /// in play, the bookmark is healthy, and the only unusual thing about the
+    /// events is the time their providers wrote. The stored position is loaded
+    /// from the checkpoint here rather than held in memory, so this also pins
+    /// rule 31 against the PERSISTED value: it builds the floor time and it
+    /// decides nothing.
+    #[tokio::test]
+    async fn events_older_than_the_stored_resume_time_are_still_sent() {
+        let _seams = SeamSession::acquire();
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+        let mut first = application_subscription_with(Arc::clone(&checkpointer)).await;
+
+        // Read part of the backlog normally, so a resume position is genuinely
+        // stored, then persist it.
+        let read = first.pull_events(5).unwrap_or_default();
+        assert_eq!(
+            read.len(),
+            5,
+            "a stored resume position mid-backlog is the premise of this test"
+        );
+        let stored = first.first_channel_last_event_at();
+        assert_ne!(
+            stored, "never",
+            "the source must have stored the time of the last event it sent"
+        );
+        first.flush_bookmarks().await.expect("bookmarks must flush");
+        drop(first);
+
+        // Restart: the resume time now comes off disk, not out of memory.
+        let mut restarted = application_subscription_with(checkpointer).await;
+        let behind = chrono::DateTime::parse_from_rfc3339(&stored)
+            .expect("the stored position is RFC3339")
+            .with_timezone(&chrono::Utc)
+            - chrono::Duration::days(1);
+        let (delivered, timeline, request_log, warns) =
+            drain_injected_from(&_seams, &mut restarted, behind, |index| {
+                // A day behind the stored position, ascending among themselves.
+                (index as i64) * 1_000
+            });
+
+        assert_zero_loss(
+            &format!("stamped behind the stored position {stored}"),
+            &delivered,
+            &timeline,
+            &request_log,
+            &warns,
         );
     }
 }
