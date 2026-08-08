@@ -162,7 +162,7 @@ impl Inner {
 
 #[cfg(target_os = "windows")]
 #[inline]
-fn filetime_to_nanos(ft: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+const fn filetime_to_nanos(ft: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     let ticks = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
     ticks * 100 // convert 100ns intervals to nanoseconds
 }

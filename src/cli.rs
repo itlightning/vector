@@ -480,9 +480,9 @@ pub enum SubCommand {
 }
 
 impl SubCommand {
-    #[expect(
+    #[allow(
         clippy::missing_const_for_fn,
-        reason = "the #[cfg(windows)] arm calls a non-const method"
+        reason = "const-eligible on some targets only; the cfg arms differ"
     )]
     pub fn dangerously_allow_env_var_interpolation(&self) -> bool {
         match self {
@@ -530,6 +530,10 @@ pub enum Color {
 }
 
 impl Color {
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "the #[cfg(unix)] arm calls a non-const method"
+    )]
     pub fn use_color(&self) -> bool {
         match self {
             #[cfg(unix)]
