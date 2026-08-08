@@ -148,12 +148,12 @@ pub mod service_control {
         {
             service.start(&[] as &[OsString]).context(ServiceSnafu)?;
             emit!(WindowsServiceStart {
-                name: &*service_def.name.to_string_lossy(),
+                name: &service_def.name.to_string_lossy(),
                 already_started: false,
             });
         } else {
             emit!(WindowsServiceStart {
-                name: &*service_def.name.to_string_lossy(),
+                name: &service_def.name.to_string_lossy(),
                 already_started: true,
             });
         }
@@ -182,7 +182,7 @@ pub mod service_control {
         }
 
         emit!(WindowsServiceStop {
-            name: &*service_def.name.to_string_lossy(),
+            name: &service_def.name.to_string_lossy(),
             already_stopped,
         });
 
@@ -214,7 +214,7 @@ pub mod service_control {
 
         service.start(&[] as &[OsString]).context(ServiceSnafu)?;
         emit!(WindowsServiceRestart {
-            name: &*service_def.name.to_string_lossy()
+            name: &service_def.name.to_string_lossy()
         });
         Ok(())
     }
@@ -242,7 +242,7 @@ pub mod service_control {
             .context(ServiceSnafu)?;
 
         emit!(WindowsServiceInstall {
-            name: &*service_def.name.to_string_lossy(),
+            name: &service_def.name.to_string_lossy(),
         });
 
         // TODO: It is currently not possible to change the description of the service.
@@ -265,7 +265,7 @@ pub mod service_control {
         if service_status.current_state != ServiceState::Stopped {
             service.stop().context(ServiceSnafu)?;
             emit!(WindowsServiceStop {
-                name: &*service_def.name.to_string_lossy(),
+                name: &service_def.name.to_string_lossy(),
                 already_stopped: false,
             });
         }
@@ -281,7 +281,7 @@ pub mod service_control {
         service.delete().context(ServiceSnafu)?;
 
         emit!(WindowsServiceUninstall {
-            name: &*service_def.name.to_string_lossy(),
+            name: &service_def.name.to_string_lossy(),
         });
         Ok(())
     }
@@ -296,11 +296,10 @@ pub mod service_control {
 
         let service = service_manager
             .open_service(&service_def.name, access)
-            .map_err(|e| {
+            .inspect_err(|_| {
                 emit!(WindowsServiceDoesNotExistError {
-                    name: &*service_def.name.to_string_lossy(),
+                    name: &service_def.name.to_string_lossy(),
                 });
-                e
             })
             .context(ServiceSnafu)?;
         Ok(service)
