@@ -147,6 +147,16 @@ pub(super) static FAIL_ALL_BOOKMARK_UPDATES: std::sync::atomic::AtomicBool =
 pub(super) static EVT_NEXT_REQUESTS: std::sync::Mutex<Option<Vec<(String, usize)>>> =
     std::sync::Mutex::new(None);
 
+/// Test-only running total of the event count `EvtNext` handed back.
+///
+/// This is the drain loop's only independent oracle for "how many records did
+/// the API give us". Every other count in a test is produced by the same
+/// admission gate under test, so comparing two of those cannot detect a gate
+/// that drops uniformly: both sides degrade together.
+#[cfg(test)]
+pub(super) static EVT_NEXT_RETURNED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Test-only record of the flags passed to each `EvtSubscribe` call.
 ///
 /// `EvtSubscribeStrict` is D20 and load-bearing: without it Windows silently
@@ -1183,6 +1193,13 @@ impl EventLogSubscription {
                         None => result,
                     }
                 };
+
+                // Test-only: the independent oracle for how many records the
+                // API actually produced, counted before any of the drain's own
+                // filtering decisions can touch it.
+                #[cfg(test)]
+                EVT_NEXT_RETURNED_TOTAL
+                    .fetch_add(u64::from(returned), std::sync::atomic::Ordering::SeqCst);
 
                 // Test-only hook: lets the lost-wakeup regression test race
                 // a SetEvent against the drain without thread-timing. No-op
@@ -2769,6 +2786,7 @@ mod tests {
     impl RequestLog {
         fn install() -> Self {
             *EVT_NEXT_REQUESTS.lock().unwrap() = Some(Vec::new());
+            EVT_NEXT_RETURNED_TOTAL.store(0, std::sync::atomic::Ordering::SeqCst);
             Self
         }
 
@@ -2796,6 +2814,11 @@ mod tests {
             if let Some(log) = EVT_NEXT_REQUESTS.lock().unwrap().as_mut() {
                 log.clear();
             }
+        }
+
+        /// How many records `EvtNext` handed the drain loop since installation.
+        fn returned_total(&self) -> u64 {
+            EVT_NEXT_RETURNED_TOTAL.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -3276,27 +3299,26 @@ mod tests {
     /// seen. Inverting it delivers nothing while looking, from the outside, like
     /// a quiet channel.
     ///
-    /// Asserted against an independently read baseline rather than against
-    /// "delivered something". A non-empty check is the weak assertion this whole
-    /// exercise exists to eliminate: the gate can drop most of a backlog and
-    /// still hand back a few records, and only a comparison against what the
-    /// channel actually holds notices.
+    /// Asserted against the count `EvtNext` handed back, which is the only
+    /// oracle in reach that does not itself pass through the gate. "Delivered
+    /// something" is the weak assertion this whole exercise exists to
+    /// eliminate, and so is a comparison against a second drain: both sides run
+    /// the same gate, so a gate that drops uniformly degrades both and the
+    /// comparison stays green.
     #[tokio::test]
     #[serial]
-    async fn the_admission_gate_delivers_the_whole_backlog_and_nothing_twice() {
-        let mut baseline = subscription_from(&application_config()).await;
-        let expected: std::collections::HashSet<u64> =
-            drain_all(&mut baseline).into_iter().collect();
+    async fn the_admission_gate_emits_every_record_evtnext_returns() {
+        let mut subscription = subscription_from(&application_config()).await;
+        let request_log = RequestLog::install();
+
+        let delivered = drain_all(&mut subscription);
+
         assert!(
-            expected.len() >= 5,
+            request_log.returned_total() >= 5,
             "the Application backlog must hold several records for a partial \
              delivery to be distinguishable from a complete one, got {}",
-            expected.len()
+            request_log.returned_total()
         );
-        drop(baseline);
-
-        let mut subscription = subscription_from(&application_config()).await;
-        let delivered = drain_all(&mut subscription);
 
         let mut seen = std::collections::HashSet::new();
         for record_id in &delivered {
@@ -3305,13 +3327,13 @@ mod tests {
                 "record {record_id} was delivered twice within one drain"
             );
         }
-        for record_id in &expected {
-            assert!(
-                seen.contains(record_id),
-                "record {record_id} is in the channel and was never delivered: \
-                 the admission gate dropped a record it had no reason to drop"
-            );
-        }
+        assert_eq!(
+            delivered.len() as u64,
+            request_log.returned_total(),
+            "with no filter configured and nothing behind the resume boundary, \
+             every record the API returned must be emitted; the difference is \
+             what the admission gate silently dropped"
+        );
     }
 
     /// A bookmark failure mid-batch abandons the rest of the batch, and every
