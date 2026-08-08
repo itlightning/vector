@@ -65,12 +65,35 @@ const PUBLISHER_CACHE_CAPACITY: usize = 256;
 /// Calls EvtClose on drop to prevent handle leaks when evicted from LRU cache.
 pub struct PublisherHandle(pub isize);
 
+/// Test-only: publisher metadata handles that reached `EvtClose`.
+///
+/// Counted INSIDE the guard and after the API call, so neither deleting the
+/// drop body nor inverting the null test can increment it. A drop that ran is
+/// not the property; a handle that was released is.
+#[cfg(test)]
+pub(super) static PUBLISHER_HANDLE_CLOSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only: subscription handles that reached `EvtClose`, counted after the
+/// API call in `close_current`. Observable after the owner has been dropped,
+/// which the per-channel counters are not.
+#[cfg(test)]
+pub(super) static SUBSCRIPTION_HANDLE_CLOSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only: channel signal events released by `EventLogSubscription::drop`.
+#[cfg(test)]
+pub(super) static SUBSCRIPTION_TEARDOWN_CLOSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl Drop for PublisherHandle {
     fn drop(&mut self) {
         if self.0 != 0 {
             unsafe {
                 let _ = EvtClose(EVT_HANDLE(self.0));
             }
+            #[cfg(test)]
+            PUBLISHER_HANDLE_CLOSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -90,15 +113,23 @@ impl Drop for PublisherHandle {
 ///
 /// `EvtNext` can return an error with handles already populated. Every path
 /// that abandons a batch must run these handles through here or we leak.
+///
+/// Returns whether `EvtClose` was actually called. The caller's accounting
+/// keys on that return value rather than on its own call count, so a handle
+/// that never reaches the API is never counted as closed: an accounting seam
+/// that counts calls INTO the seam cannot see a guard here that stops closing
+/// real handles, which is the leak this accounting exists to catch.
 #[inline]
-fn close_event_handle(handle: EVT_HANDLE) {
+fn close_event_handle(handle: EVT_HANDLE) -> bool {
     // A null handle is what the fault-injection seam produces for a scripted
-    // count; it is accounted for above but must not reach the API.
+    // count; it is a retired slot but must not reach the API.
     if handle.0 != 0 {
         unsafe {
             let _ = EvtClose(handle);
         }
+        return true;
     }
+    false
 }
 
 /// Test-only script that replaces the `EvtNext` result.
@@ -365,8 +396,14 @@ struct ChannelSubscription {
     subscription_opens: i64,
     #[cfg(test)]
     subscription_closes: i64,
+    /// `EvtNext` handles that actually reached `EvtClose`.
     #[cfg(test)]
     event_handle_closes: i64,
+    /// Batch slots routed through the discard path, closed at the API or not.
+    /// The fault-injection seam hands the drain null slots, so this is what a
+    /// scripted test asserts and it can never stand in for the counter above.
+    #[cfg(test)]
+    event_handle_slots_retired: i64,
     /// Pre-registered counter for events read on this channel.
     events_read_counter: Counter,
     /// Pre-registered counter for render errors on this channel.
@@ -419,6 +456,10 @@ impl ChannelSubscription {
             unsafe {
                 let _ = EvtClose(handle);
             }
+            // Counted after the API call, so teardown can be asserted from
+            // outside the dropped value.
+            #[cfg(test)]
+            SUBSCRIPTION_HANDLE_CLOSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -692,12 +733,19 @@ impl ChannelSubscription {
     }
 
     /// Close a handle returned by `EvtNext`, accounting for it.
+    ///
+    /// Two counters, deliberately: `event_handle_slots_retired` says the drain
+    /// routed every slot of the batch through here, and `event_handle_closes`
+    /// says the API call actually happened. Only the second can see a leak.
     fn discard_event_handle(&mut self, handle: EVT_HANDLE) {
+        let _closed = close_event_handle(handle);
         #[cfg(test)]
         {
-            self.event_handle_closes += 1;
+            self.event_handle_slots_retired += 1;
+            if _closed {
+                self.event_handle_closes += 1;
+            }
         }
-        close_event_handle(handle);
     }
 
     /// Gap-detection applicability for this channel.
@@ -927,6 +975,8 @@ impl EventLogSubscription {
                 subscription_closes: 0,
                 #[cfg(test)]
                 event_handle_closes: 0,
+                #[cfg(test)]
+                event_handle_slots_retired: 0,
                 events_read_counter: counter!(
                     "windows_event_log_events_read_total",
                     "channel" => channel.clone()
@@ -1178,7 +1228,7 @@ impl EventLogSubscription {
                             // what makes the exactly-once assertion across an
                             // injected fault mean something.
                             for &raw in &event_handles[..returned as usize] {
-                                close_event_handle(EVT_HANDLE(raw));
+                                let _ = close_event_handle(EVT_HANDLE(raw));
                             }
                             event_handles.fill(0);
                             returned = count.min(event_handles.len() as u32);
@@ -1627,10 +1677,20 @@ impl EventLogSubscription {
         self.channels[0].subscription_opens - self.channels[0].subscription_closes
     }
 
-    /// Test-only: how many `EvtNext` handles the first channel has discarded.
+    /// Test-only: how many `EvtNext` handles the first channel actually closed
+    /// at the API. Driven by the return of `close_event_handle`, so a guard
+    /// that stops closing real handles drives this to zero.
     #[cfg(test)]
     pub(super) fn first_channel_event_handle_closes(&self) -> i64 {
         self.channels[0].event_handle_closes
+    }
+
+    /// Test-only: batch slots the first channel routed through the discard
+    /// path. Counts the null slots the fault-injection seam produces, which is
+    /// what a scripted fault can assert and is NOT evidence of a close.
+    #[cfg(test)]
+    pub(super) fn first_channel_event_handle_slots_retired(&self) -> i64 {
+        self.channels[0].event_handle_slots_retired
     }
 
     /// Test-only: the names of the channels that are currently readable, in
@@ -1660,6 +1720,27 @@ impl EventLogSubscription {
             evaluate_gap(Some(1), 5, self.channels[0].gap_detection(), false),
             GapVerdict::Gap { .. }
         )
+    }
+
+    /// Test-only: could the resume ladder still select the single-record skip
+    /// on the first channel?
+    ///
+    /// Advances a CLONE of the resume state, so asking the question does not
+    /// move the real ladder. This is a decision, not a field: revoking record
+    /// identity has to change what the ladder can choose, or it changes
+    /// nothing that matters.
+    #[cfg(test)]
+    pub(super) fn first_channel_ladder_can_skip_one_record(&self) -> bool {
+        let mut probe = self.channels[0].resume.clone();
+        probe.advance_rung();
+        probe.advance_rung() == Rung::SkipRecord
+    }
+
+    /// Test-only: the `last_event_at` field value the first channel would put
+    /// on an onset ERROR or a recovery WARN.
+    #[cfg(test)]
+    pub(super) fn first_channel_last_event_at(&self) -> String {
+        self.channels[0].last_event_at_rfc3339()
     }
 
     /// Returns a reference to the rate limiter, if configured.
@@ -1800,6 +1881,8 @@ impl Drop for EventLogSubscription {
             unsafe {
                 let _ = CloseHandle(sub.signal_event);
             }
+            #[cfg(test)]
+            SUBSCRIPTION_TEARDOWN_CLOSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         // Publisher metadata handles are closed automatically by PublisherHandle::drop
         // when the LRU cache is dropped.
@@ -1813,6 +1896,7 @@ impl Drop for EventLogSubscription {
 
 #[cfg(test)]
 mod tests {
+    use super::super::recovery::TimeRung;
     use super::*;
     use serial_test::serial;
 
@@ -2654,9 +2738,11 @@ mod tests {
         assert!(events.is_empty());
 
         assert_eq!(
-            subscription.first_channel_event_handle_closes(),
+            subscription.first_channel_event_handle_slots_retired(),
             4,
-            "all four handles returned alongside the error must be discarded"
+            "all four slots returned alongside the error must be discarded. \
+             The injected batch is synthetic, so this asserts the drain retired \
+             every slot, not that the API was called"
         );
         assert!(
             !subscription.first_channel_is_live(),
@@ -2683,7 +2769,7 @@ mod tests {
             subscription.first_channel_is_live(),
             "4317 with a zero returned count must leave the subscription alone"
         );
-        assert_eq!(subscription.first_channel_event_handle_closes(), 0);
+        assert_eq!(subscription.first_channel_event_handle_slots_retired(), 0);
     }
 
     /// An unknown code rebuilds rather than retrying the same handle, and the
@@ -3371,7 +3457,9 @@ mod tests {
         assert_eq!(
             subscription.first_channel_event_handle_closes(),
             2,
-            "the failing handle and the one remaining handle, each closed once"
+            "the failing handle and the one remaining handle, each closed once \
+             AT THE API. These are real handles from a real EvtNext, so this \
+             counts EvtClose calls, not trips through the accounting seam"
         );
     }
 
@@ -3776,5 +3864,532 @@ mod tests {
                  discarded without the position falling back to the bookmark"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Handle lifetime, asserted at the API rather than at the seam.
+    // ---------------------------------------------------------------------
+
+    /// Every handle `EvtNext` hands back must reach `EvtClose`.
+    ///
+    /// The oracle is deliberately not the accounting seam. A seam that counts
+    /// calls INTO itself cannot see a null guard below it that stops closing
+    /// real handles, and that mutation leaks one handle per event while the
+    /// old balance test stayed green. `event_handle_closes` is now driven by
+    /// whether `close_event_handle` actually called the API, and it is
+    /// compared against the record count recorded BEFORE any drain decision.
+    #[tokio::test]
+    #[serial]
+    async fn every_event_handle_evtnext_returns_is_closed_at_the_api() {
+        let mut subscription = subscription_from(&application_config()).await;
+        let request_log = RequestLog::install();
+
+        // Rebuilds interleaved with real drains: both the drain and the
+        // discard-on-rebuild path retire handles, and a leak in either is a
+        // leak.
+        let mut delivered = 0usize;
+        for _ in 0..3 {
+            delivered += drain_all(&mut subscription).len();
+            subscription.force_rebuild_all();
+            assert!(
+                subscription.first_channel_is_live(),
+                "a rebuild against a live Application channel must succeed"
+            );
+        }
+
+        let returned = request_log.returned_total();
+        assert!(
+            returned >= 5 && delivered > 0,
+            "the Application backlog must produce several records, otherwise a \
+             leak of every handle is indistinguishable from a quiet channel; \
+             returned {returned}, delivered {delivered}"
+        );
+        assert_eq!(
+            subscription.first_channel_event_handle_closes() as u64,
+            returned,
+            "every one of the {returned} handles the API returned must reach \
+             EvtClose exactly once"
+        );
+    }
+
+    /// The RAII wrapper on publisher metadata handles releases the handle, and
+    /// releases nothing when it holds none.
+    ///
+    /// Asserted on the close count kept inside the guard and after the API
+    /// call, so neither an empty drop body nor an inverted null test can
+    /// satisfy it. "Drop ran" is not the property.
+    #[test]
+    fn a_dropped_publisher_handle_is_released_at_the_api() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use windows::Win32::System::EventLog::EvtOpenPublisherMetadata;
+
+        let provider = HSTRING::from("Microsoft-Windows-Kernel-General");
+        let handle = unsafe { EvtOpenPublisherMetadata(None, &provider, None, 0, 0) }
+            .expect("the kernel publisher manifest is present on every Windows host");
+
+        let before = PUBLISHER_HANDLE_CLOSES.load(SeqCst);
+        {
+            let _wrapped = PublisherHandle(handle.0);
+            assert_eq!(
+                PUBLISHER_HANDLE_CLOSES.load(SeqCst),
+                before,
+                "nothing may be released while the wrapper is still alive"
+            );
+        }
+        assert_eq!(
+            PUBLISHER_HANDLE_CLOSES.load(SeqCst) - before,
+            1,
+            "dropping the wrapper must close the publisher metadata handle; \
+             every LRU eviction leaks one otherwise"
+        );
+
+        {
+            let _null = PublisherHandle(0);
+        }
+        assert_eq!(
+            PUBLISHER_HANDLE_CLOSES.load(SeqCst) - before,
+            1,
+            "a wrapper holding no handle must not reach the API"
+        );
+    }
+
+    /// Teardown releases the subscription handle and the channel signal event.
+    ///
+    /// Counted from inside the real close paths, so the count is still
+    /// readable after the owner is gone. Deleting the drop body leaks one
+    /// subscription and one event object per channel for the process lifetime.
+    #[tokio::test]
+    #[serial]
+    async fn dropping_the_subscription_releases_every_handle_it_holds() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let subscription = subscription_from(&application_config()).await;
+        assert!(
+            subscription.first_channel_is_live(),
+            "there must be a live handle for teardown to have anything to release"
+        );
+
+        let handles_before = SUBSCRIPTION_HANDLE_CLOSES.load(SeqCst);
+        let events_before = SUBSCRIPTION_TEARDOWN_CLOSES.load(SeqCst);
+        drop(subscription);
+
+        assert_eq!(
+            SUBSCRIPTION_HANDLE_CLOSES.load(SeqCst) - handles_before,
+            1,
+            "teardown must close the live subscription handle"
+        );
+        assert_eq!(
+            SUBSCRIPTION_TEARDOWN_CLOSES.load(SeqCst) - events_before,
+            1,
+            "teardown must close the channel signal event"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Checkpoint identity and validity.
+    // ---------------------------------------------------------------------
+
+    /// Ack-mode checkpointing looks a position up by channel name. Returning a
+    /// sibling's position writes channel A's progress under channel B, which is
+    /// silent; returning none never advances the checkpoint at all, which
+    /// re-delivers everything after a restart.
+    #[tokio::test]
+    #[serial]
+    async fn a_checkpoint_position_belongs_to_the_channel_it_was_asked_for() {
+        let mut config = application_config();
+        config.channels = vec!["Application".to_string(), "System".to_string()];
+        let mut subscription = subscription_from(&config).await;
+
+        let live = subscription.live_channel_names();
+        assert_eq!(
+            live.len(),
+            2,
+            "two channels are required: with one, a cross-channel read is \
+             indistinguishable from a correct one, got {live:?}"
+        );
+
+        let delivered = drain_all(&mut subscription);
+        assert!(
+            !delivered.is_empty(),
+            "both bookmarks must be positioned, otherwise no position exists to \
+             be looked up"
+        );
+
+        let first = subscription
+            .channel_position(&live[0])
+            .unwrap_or_else(|| panic!("{} must have a position after a drain", live[0]));
+        let second = subscription
+            .channel_position(&live[1])
+            .unwrap_or_else(|| panic!("{} must have a position after a drain", live[1]));
+
+        assert_eq!(
+            first.channel, live[0],
+            "the position returned for {} must be its own, not a sibling's",
+            live[0]
+        );
+        assert_eq!(
+            second.channel, live[1],
+            "the position returned for {} must be its own, not a sibling's",
+            live[1]
+        );
+        assert_ne!(
+            first.bookmark_xml, second.bookmark_xml,
+            "two channels drained to different points must not share a bookmark"
+        );
+        assert!(
+            subscription
+                .channel_position("Channel-That-Is-Not-Configured")
+                .is_none(),
+            "a channel that is not subscribed has no position"
+        );
+    }
+
+    /// A bookmark that marks no position must never reach the checkpoint.
+    ///
+    /// Persisting one gives the next start a bookmark it has to fall back
+    /// from, which is the dead-bookmark path the whole resume ladder exists to
+    /// survive: a checkpoint write that creates the failure it protects against.
+    #[tokio::test]
+    #[serial]
+    async fn a_bookmark_marking_no_position_is_never_checkpointed() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        assert!(
+            subscription.channel_position("Application").is_none(),
+            "a freshly created bookmark marks nothing and its XML carries no \
+             RecordId, so there is no position to persist"
+        );
+
+        let delivered = drain_all(&mut subscription);
+        assert!(
+            !delivered.is_empty(),
+            "the Application backlog must be readable, otherwise the negative \
+             assertion above is vacuous"
+        );
+        let position = subscription
+            .channel_position("Application")
+            .expect("a positioned bookmark IS checkpointable");
+        assert!(
+            position.bookmark_xml.contains("RecordId"),
+            "the persisted XML must carry the position, got: {}",
+            position.bookmark_xml
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Generated query composition (D21).
+    // ---------------------------------------------------------------------
+
+    /// The generated time predicate is composed onto a wildcard base and
+    /// nowhere else.
+    ///
+    /// Three separate guards decide this and each fails differently: a time
+    /// rung subscribing with the bare base loses the fallback entirely, a
+    /// bookmark rung subscribing with a predicate it never asked for narrows a
+    /// healthy resume, and composing over an operator's XPath silently
+    /// replaces the operator's filter with ours.
+    #[test]
+    fn a_time_predicate_is_composed_onto_a_wildcard_base_and_nothing_else() {
+        use chrono::TimeZone;
+
+        fn factory(base: &str) -> SubscriptionFactory {
+            SubscriptionFactory {
+                channel: "Application".to_string(),
+                base_query: base.to_string(),
+                base_origin: QueryOrigin::Operator,
+                read_existing_events: true,
+            }
+        }
+
+        const OPERATOR_QUERY: &str = "*[System[EventID=4624]]";
+        let when = chrono::Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap();
+
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(when, 42);
+
+        // Bookmark rung. A time floor exists, and it must not be used: the
+        // bookmark is the position.
+        assert_eq!(
+            factory("*").query_for(&resume),
+            ("*".to_string(), QueryOrigin::Operator),
+            "a bookmark resume subscribes with the configured query"
+        );
+
+        // Time rung over a wildcard base: the predicate IS the resume position.
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+        assert_eq!(
+            factory("*").query_for(&resume),
+            (
+                "*[System[TimeCreated[@SystemTime>='2026-08-07T12:00:00.000Z']]]".to_string(),
+                QueryOrigin::Generated
+            ),
+            "a time rung over a wildcard base subscribes with the generated \
+             predicate, tagged as ours so 15001 advances the ladder instead of \
+             failing the channel"
+        );
+
+        // Time rung over an operator query: not composable, so the operator's
+        // query stands and the exact in-process boundary does the trimming.
+        assert_eq!(
+            factory(OPERATOR_QUERY).query_for(&resume),
+            (OPERATOR_QUERY.to_string(), QueryOrigin::Operator),
+            "an operator XPath is never intersected with a generated predicate"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Log severity and triage fields.
+    // ---------------------------------------------------------------------
+
+    /// Captures `(level, error_type)` for every warn-band record.
+    #[derive(Clone, Default)]
+    struct ErrorTypeCapture {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    struct ErrorTypeVisitor(Option<String>);
+
+    impl tracing::field::Visit for ErrorTypeVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "error_type" {
+                self.0 = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "error_type" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorTypeCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let level = *event.metadata().level();
+            if level > tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = ErrorTypeVisitor(None);
+            event.record(&mut visitor);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((level.to_string(), visitor.0.unwrap_or_default()));
+        }
+    }
+
+    /// D16: the terminal rung discards the channel's whole backlog and is an
+    /// ERROR. Every other rung discards a bounded window and is a WARN.
+    ///
+    /// The severity IS the decision here, so both directions are asserted: a
+    /// polarity flip makes ordinary ladder movement page an operator and makes
+    /// unrecoverable backlog loss a warning.
+    #[tokio::test]
+    #[serial]
+    async fn the_terminal_resume_rung_is_an_error_and_the_others_are_warnings() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        fn capture<F: FnOnce()>(f: F) -> Vec<(String, String)> {
+            let capture = ErrorTypeCapture::default();
+            let collector = tracing_subscriber::registry().with(capture.clone());
+            tracing::subscriber::with_default(collector, f);
+            let seen = capture.seen.lock().unwrap().clone();
+            seen
+        }
+
+        // No event has ever been observed, so a dead bookmark has no stored
+        // time to fall back to and the ladder goes straight to the terminal
+        // rung.
+        let mut fresh = subscription_from(&application_config()).await;
+        let terminal = capture(|| {
+            let _guard = SubscribeScriptGuard::install(&[15011]);
+            fresh.force_rebuild_all();
+        });
+        assert!(
+            terminal
+                .iter()
+                .any(|(level, kind)| level == "ERROR" && kind == "resume_future_only"),
+            "falling back to future-events-only discards the backlog \
+             irrecoverably and must be an ERROR, got: {terminal:#?}"
+        );
+
+        // With a stored position the same failure takes a time rung, which
+        // discards a bounded window and is ordinary ladder movement.
+        let mut positioned = subscription_from(&application_config()).await;
+        assert!(
+            !drain_all(&mut positioned).is_empty(),
+            "a stored position is required for the time rung to be reachable"
+        );
+        let time_rung = capture(|| {
+            let _guard = SubscribeScriptGuard::install(&[15011]);
+            positioned.force_rebuild_all();
+        });
+        assert!(
+            time_rung.iter().any(|(level, _)| level == "WARN"),
+            "a time-window rung must be announced, got: {time_rung:#?}"
+        );
+        assert!(
+            !time_rung
+                .iter()
+                .any(|(_, kind)| kind == "resume_future_only"),
+            "a bounded time-window fallback is not backlog loss and must not \
+             claim to be, got: {time_rung:#?}"
+        );
+    }
+
+    /// `last_event_at` is the triage fact on the onset ERROR and the recovery
+    /// WARN (D29), and the agent's give-up WARN (D30) reads it. It is absolute
+    /// so consumers derive the age, and "never" is a distinct, meaningful value.
+    #[tokio::test]
+    #[serial]
+    async fn last_event_at_reads_never_until_an_event_arrives_and_a_timestamp_after() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        assert_eq!(
+            subscription.first_channel_last_event_at(),
+            "never",
+            "a channel that has produced nothing for us must say so plainly, \
+             not report a zero or empty timestamp"
+        );
+
+        let delivered = drain_all(&mut subscription);
+        assert!(!delivered.is_empty(), "events must actually arrive");
+
+        let reported = subscription.first_channel_last_event_at();
+        let parsed = chrono::DateTime::parse_from_rfc3339(&reported)
+            .unwrap_or_else(|e| panic!("last_event_at must be RFC3339, got {reported:?}: {e}"));
+        assert!(
+            parsed.timestamp() > 0,
+            "an absolute timestamp is what lets a consumer derive the age, got \
+             {reported:?}"
+        );
+    }
+
+    /// The 30s health heartbeat is an operator's only "are my channels up"
+    /// signal, and both halves carry meaning: the total is the configured
+    /// channel count and the active count is how many are readable right now.
+    #[tokio::test]
+    #[serial]
+    async fn the_health_summary_counts_configured_and_live_channels() {
+        let mut config = application_config();
+        config.channels = vec!["Application".to_string(), "System".to_string()];
+        let mut subscription = subscription_from(&config).await;
+
+        assert_eq!(
+            subscription.channel_health_summary(),
+            (2, 2),
+            "two configured channels, both readable on a healthy host"
+        );
+
+        {
+            // One channel goes down; the other is untouched.
+            let _guard = ScriptGuard::install(&[(15007, 0)]);
+            let _ = subscription.pull_events(100).expect("must not error out");
+        }
+
+        assert_eq!(
+            subscription.channel_health_summary(),
+            (2, 1),
+            "the total is the configuration and does not move; the active count \
+             is the live channels and must drop by exactly the one that failed"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // D23: rendered-text delivery revokes record-id trust.
+    // ---------------------------------------------------------------------
+
+    /// Rewrites the XML of every rendered event.
+    struct XmlRewriteGuard;
+
+    impl XmlRewriteGuard {
+        fn install(f: std::sync::Arc<dyn Fn(String) -> String + Send + Sync>) -> Self {
+            *super::super::render::RENDER_XML_REWRITE.lock().unwrap() = Some(f);
+            Self
+        }
+    }
+
+    impl Drop for XmlRewriteGuard {
+        fn drop(&mut self) {
+            *super::super::render::RENDER_XML_REWRITE.lock().unwrap() = None;
+        }
+    }
+
+    /// An event delivered as rendered text revokes record-id trust for its
+    /// channel, permanently.
+    ///
+    /// A genuine one needs a WEC forwarding pair, but the decision is derived
+    /// by PARSING the event XML, so an event whose XML carries
+    /// `<RenderingInfo>` is an input to the real derivation rather than a
+    /// stubbed verdict. Both consequences are asserted on behavior: gap
+    /// detection stops reporting, and the ladder can no longer select the
+    /// single-record skip, which on interleaved forwarded ids would discard an
+    /// arbitrary machine's event.
+    #[tokio::test]
+    #[serial]
+    async fn an_event_delivered_as_rendered_text_revokes_record_id_trust() {
+        // Control: the same backlog, unmodified. Both properties must hold
+        // afterwards, or the treatment below proves nothing.
+        let mut control = subscription_from(&application_config()).await;
+        let baseline = drain_all(&mut control);
+        assert!(
+            baseline.len() >= 2,
+            "the Application backlog must hold at least two records: one to \
+             carry <RenderingInfo> and one plain one after it, got {}",
+            baseline.len()
+        );
+        assert!(
+            control.first_channel_reports_record_id_gaps(),
+            "local events leave record ids trustworthy"
+        );
+        assert!(
+            control.first_channel_ladder_can_skip_one_record(),
+            "local events leave the single-record skip available"
+        );
+        drop(control);
+
+        // Treatment: the FIRST event of the same backlog arrives carrying
+        // <RenderingInfo>, every later one is untouched. That is the
+        // production shape, and it makes the stickiness assertion real: one
+        // forwarded event is proof about the CHANNEL, not about that event.
+        let mut subscription = subscription_from(&application_config()).await;
+        let delivered = {
+            let rewritten = std::sync::atomic::AtomicBool::new(false);
+            let _guard = XmlRewriteGuard::install(std::sync::Arc::new(move |xml: String| {
+                if rewritten.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return xml;
+                }
+                xml.replace(
+                    "</Event>",
+                    "<RenderingInfo Culture='en-US'><Message>forwarded</Message>\
+                     </RenderingInfo></Event>",
+                )
+            }));
+            drain_all(&mut subscription)
+        };
+        assert!(
+            delivered.len() >= 2,
+            "the forwarded-delivery decision is derived per rendered event, so \
+             the marked event and at least one plain event after it must both \
+             be delivered, got {}",
+            delivered.len()
+        );
+
+        assert!(
+            !subscription.first_channel_reports_record_id_gaps(),
+            "forwarded record ids interleave many originating machines, so every \
+             batch looks like a gap and detection must self-suppress. It must \
+             also stay suppressed across the plain events that followed"
+        );
+        assert!(
+            !subscription.first_channel_ladder_can_skip_one_record(),
+            "a single-record skip is not expressible against interleaved \
+             forwarded record ids and the ladder must go straight to the time \
+             rungs"
+        );
     }
 }
