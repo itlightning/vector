@@ -43,6 +43,10 @@ pub(super) mod seam {
 
 /// Record one `EvtFormatMessage` invocation for the test seam. No-op and
 /// zero-cost in non-test builds.
+// Const in a non-test build, where the body is empty, but never in a test
+// build, where it is an atomic increment. Marking it const would break the
+// test configuration this seam exists for.
+#[allow(clippy::missing_const_for_fn)]
 #[inline]
 fn note_format_message_call() {
     #[cfg(test)]
@@ -50,6 +54,7 @@ fn note_format_message_call() {
 }
 
 /// Record one entry into the publisher-metadata render path for the test seam.
+#[allow(clippy::missing_const_for_fn)]
 #[inline]
 fn note_publisher_path_entry() {
     #[cfg(test)]
@@ -78,6 +83,10 @@ pub(super) struct EventDisplay {
 /// and no publisher API is touched at all. See [`super::rendering_info`] for
 /// why that matters (`EvtFormatMessage` faults the process, it does not return
 /// an error). Otherwise the normal publisher-metadata path runs.
+// The render path takes its caches, counters, handle, XML and system fields
+// as separate arguments rather than a context struct, matching the in-tree
+// precedent for wide internal helpers.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_event_display(
     publisher_cache: &mut LruCache<String, PublisherHandle>,
     format_cache: &mut HashMap<String, LruCache<(u32, u64), Option<String>>>,
@@ -147,6 +156,7 @@ fn render_result_usable(result: &windows::core::Result<()>) -> bool {
 }
 
 /// Resolves task, opcode, and keyword names from provider metadata via EvtFormatMessage.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_event_metadata(
     publisher_cache: &mut LruCache<String, PublisherHandle>,
     format_cache: &mut HashMap<String, LruCache<(u32, u64), Option<String>>>,
@@ -166,9 +176,9 @@ pub fn resolve_event_metadata(
 
     let metadata_handle = EVT_HANDLE(raw_handle);
 
-    let task_flag = EvtFormatMessageTask.0 as u32;
-    let opcode_flag = EvtFormatMessageOpcode.0 as u32;
-    let keyword_flag = EvtFormatMessageKeyword.0 as u32;
+    let task_flag = EvtFormatMessageTask.0;
+    let opcode_flag = EvtFormatMessageOpcode.0;
+    let keyword_flag = EvtFormatMessageKeyword.0;
 
     let task_name = cached_format(
         format_cache,
@@ -234,6 +244,7 @@ fn get_or_open_publisher(
 
 /// Two-level cache lookup: outer HashMap keyed by `&str` (zero allocation),
 /// inner LRU keyed by `(flag, field_value)`.
+#[allow(clippy::too_many_arguments)]
 fn cached_format(
     cache: &mut HashMap<String, LruCache<(u32, u64), Option<String>>>,
     cache_hits_counter: &Counter,
@@ -250,11 +261,11 @@ fn cached_format(
     // peek() intentionally skips LRU promotion — get() requires &mut which
     // would need get_mut() on the outer HashMap. The put() on every miss
     // already handles insertion/promotion, so peek is correct here.
-    if let Some(inner) = cache.get(provider) {
-        if let Some(cached) = inner.peek(&inner_key) {
-            cache_hits_counter.increment(1);
-            return cached.clone();
-        }
+    if let Some(inner) = cache.get(provider)
+        && let Some(cached) = inner.peek(&inner_key)
+    {
+        cache_hits_counter.increment(1);
+        return cached.clone();
     }
 
     // Slow path: call API and populate cache
@@ -274,7 +285,7 @@ fn format_metadata_field(
 ) -> Option<String> {
     let mut buffer_used: u32 = 0;
     note_format_message_call();
-    let _ = unsafe {
+    _ = unsafe {
         EvtFormatMessage(
             metadata_handle,
             event_handle,
@@ -328,12 +339,12 @@ pub fn format_event_message(
     }
 
     let metadata_handle = EVT_HANDLE(raw_handle);
-    let flags = EvtFormatMessageEvent.0 as u32;
+    let flags = EvtFormatMessageEvent.0;
     let max_size = 64 * 1024;
 
     let mut buffer_used: u32 = 0;
     note_format_message_call();
-    let _ = unsafe {
+    _ = unsafe {
         EvtFormatMessage(
             metadata_handle,
             event_handle,
@@ -400,9 +411,11 @@ mod tests {
     /// taken, that would be visible as a nonzero counter rather than as a
     /// silent behavior change.
     #[test]
-    #[serial_test::serial]
     fn rendering_info_event_makes_zero_evtformatmessage_calls() {
-        seam::reset();
+        // The counters below are process-global, and a concurrent test that
+        // renders a real event would inflate them. The session both excludes
+        // that test and hands these counters over reset.
+        let _seams = super::super::test_seams::SeamSession::acquire();
 
         let (mut publisher_cache, mut format_cache) = empty_caches();
         let hits = metrics::counter!("test_cache_hits");
@@ -465,9 +478,8 @@ mod tests {
     /// exactly as it does on the publisher path, while still returning the
     /// task/opcode/keyword names.
     #[test]
-    #[serial_test::serial]
     fn rendering_info_respects_render_message_disabled() {
-        seam::reset();
+        let _seams = super::super::test_seams::SeamSession::acquire();
 
         let (mut publisher_cache, mut format_cache) = empty_caches();
         let hits = metrics::counter!("test_cache_hits");

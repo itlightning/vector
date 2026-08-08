@@ -867,6 +867,12 @@ async fn test_source_acknowledgements() {
 // Compliance tests
 #[tokio::test]
 async fn test_source_compliance() {
+    // Runs the whole source, so it opens real subscriptions and drives the
+    // drain loop: the same process-global seams every fault-injection test
+    // uses. Without the session this test silently corrupts them, which is the
+    // class of failure `test_seams` exists to make impossible.
+    let _seams = super::test_seams::SeamSession::acquire();
+
     let data_dir = tempfile::tempdir().expect("failed to create temp data_dir");
     let mut config = create_test_config();
     config.data_dir = Some(data_dir.path().to_path_buf());

@@ -11,7 +11,11 @@ use governor::{
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
 };
-use metrics::{Counter, Gauge, counter, gauge};
+use metrics::{Counter, Gauge};
+use vector_lib::{
+    counter, gauge,
+    internal_event::{CounterName, GaugeName},
+};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EvtClose, EvtNext, EvtOpenChannelConfig, EvtSubscribe,
@@ -49,12 +53,13 @@ use crate::internal_events::WindowsEventLogBookmarkError;
 /// `SetEvent` against the drain without relying on thread-timing.
 /// No-op and zero-cost in non-test builds.
 ///
-/// Only one test should install a hook at a time; tests that install a hook
-/// must use `#[serial_test::serial]` or equivalent serialization to prevent
-/// concurrent tests from triggering each other's hook.
+/// A process-global like every other seam here, so a hook is only installable
+/// while holding a [`super::test_seams::SeamSession`], which is what keeps a
+/// concurrent test from triggering it.
 #[cfg(test)]
-static DRAIN_STEP_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>> =
-    std::sync::Mutex::new(None);
+pub(super) static DRAIN_STEP_HOOK: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
 
 /// Maximum number of entries in the EvtFormatMessage result cache.
 pub const FORMAT_CACHE_CAPACITY: usize = 10_000;
@@ -90,7 +95,7 @@ impl Drop for PublisherHandle {
     fn drop(&mut self) {
         if self.0 != 0 {
             unsafe {
-                let _ = EvtClose(EVT_HANDLE(self.0));
+                _ = EvtClose(EVT_HANDLE(self.0));
             }
             #[cfg(test)]
             PUBLISHER_HANDLE_CLOSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -125,7 +130,7 @@ fn close_event_handle(handle: EVT_HANDLE) -> bool {
     // count; it is a retired slot but must not reach the API.
     if handle.0 != 0 {
         unsafe {
-            let _ = EvtClose(handle);
+            _ = EvtClose(handle);
         }
         return true;
     }
@@ -137,7 +142,9 @@ fn close_event_handle(handle: EVT_HANDLE) -> bool {
 /// Plays a fixed sequence of `(win32_code, returned_count)` pairs, including
 /// the error-with-nonzero-count case that the real API produces and that the
 /// old drain loop silently dropped events on. Precedent: `DRAIN_STEP_HOOK`.
-/// Only one test may install a script at a time; installers must serialize.
+/// Installing one requires a [`super::test_seams::SeamSession`], so only one
+/// test can hold a script at a time and no test can be running a subscription
+/// beside it.
 #[cfg(test)]
 pub(super) static EVT_NEXT_SCRIPT: std::sync::Mutex<
     Option<std::collections::VecDeque<(u32, u32)>>,
@@ -335,7 +342,7 @@ impl SubscriptionFactory {
                 Some(code) => {
                     if let Ok(handle) = result {
                         unsafe {
-                            let _ = EvtClose(handle);
+                            _ = EvtClose(handle);
                         }
                     }
                     Err(windows::core::Error::from_hresult(windows::core::HRESULT(
@@ -454,7 +461,7 @@ impl ChannelSubscription {
                 self.subscription_closes += 1;
             }
             unsafe {
-                let _ = EvtClose(handle);
+                _ = EvtClose(handle);
             }
             // Counted after the API call, so teardown can be asserted from
             // outside the dropped value.
@@ -496,7 +503,7 @@ impl ChannelSubscription {
                 self.backoff.reset();
                 self.subscription_active_gauge.set(1.0);
                 counter!(
-                    "windows_event_log_subscriptions_total",
+                    CounterName::WindowsEventLogSubscriptionsTotal,
                     "channel" => self.channel.clone()
                 )
                 .increment(1);
@@ -823,6 +830,13 @@ impl EventLogSubscription {
         checkpointer: Arc<Checkpointer>,
         _acknowledgements: bool,
     ) -> Result<Self, WindowsEventLogError> {
+        // Driving a real subscription reads and mutates the fault-injection
+        // seams whether or not this test installs one, so the session is
+        // required here rather than at the installers alone. This is the check
+        // that makes the requirement impossible to forget.
+        #[cfg(test)]
+        super::test_seams::SeamSession::assert_held();
+
         // Create rate limiter if configured
         let rate_limiter = if config.events_per_second > 0 {
             NonZeroU32::new(config.events_per_second).map(|rate| {
@@ -942,7 +956,7 @@ impl EventLogSubscription {
             );
 
             let subscription_active_gauge = gauge!(
-                "windows_event_log_subscription_active",
+                GaugeName::WindowsEventLogSubscriptionActive,
                 "channel" => channel.clone()
             );
 
@@ -978,20 +992,20 @@ impl EventLogSubscription {
                 #[cfg(test)]
                 event_handle_slots_retired: 0,
                 events_read_counter: counter!(
-                    "windows_event_log_events_read_total",
+                    CounterName::WindowsEventLogEventsReadTotal,
                     "channel" => channel.clone()
                 ),
                 render_errors_counter: counter!(
-                    "windows_event_log_render_errors_total",
+                    CounterName::WindowsEventLogRenderErrorsTotal,
                     "channel" => channel.clone()
                 ),
                 subscription_active_gauge,
                 last_event_timestamp_gauge: gauge!(
-                    "windows_event_log_last_event_timestamp_seconds",
+                    GaugeName::WindowsEventLogLastEventTimestampSeconds,
                     "channel" => channel.clone()
                 ),
                 channel_records_gauge: gauge!(
-                    "windows_event_log_channel_records_total",
+                    GaugeName::WindowsEventLogChannelRecordsTotal,
                     "channel" => channel.clone()
                 ),
                 rendered_delivery_seen: false,
@@ -1010,7 +1024,7 @@ impl EventLogSubscription {
         // configuration that names no usable channel at all is an error.
         if channel_subscriptions.is_empty() {
             unsafe {
-                let _ = CloseHandle(HANDLE(shutdown_event_raw as *mut std::ffi::c_void));
+                _ = CloseHandle(HANDLE(shutdown_event_raw as *mut std::ffi::c_void));
             }
             return Err(WindowsEventLogError::ConfigError {
                 message: "No channels could be subscribed to. All channels may be inaccessible or direct/analytic channels.".into(),
@@ -1032,8 +1046,8 @@ impl EventLogSubscription {
             render_buffer: vec![0u8; 16384],
             publisher_cache: LruCache::new(NonZeroUsize::new(PUBLISHER_CACHE_CAPACITY).unwrap()),
             format_cache: HashMap::new(),
-            cache_hits_counter: counter!("windows_event_log_cache_hits_total"),
-            cache_misses_counter: counter!("windows_event_log_cache_misses_total"),
+            cache_hits_counter: counter!(CounterName::WindowsEventLogCacheHitsTotal),
+            cache_misses_counter: counter!(CounterName::WindowsEventLogCacheMissesTotal),
             sid_resolver: SidResolver::new(),
             decode_buffer: vec![0u16; 8192],
             refresh_interval,
@@ -1138,7 +1152,7 @@ impl EventLogSubscription {
             // raised during the drain and hang the subscription until the next
             // event arrives.
             unsafe {
-                let _ = ResetEvent(channel_sub.signal_event);
+                _ = ResetEvent(channel_sub.signal_event);
             }
 
             // Periodic refresh. Rebuilding from the bookmark is clean by
@@ -1228,7 +1242,7 @@ impl EventLogSubscription {
                             // what makes the exactly-once assertion across an
                             // injected fault mean something.
                             for &raw in &event_handles[..returned as usize] {
-                                let _ = close_event_handle(EVT_HANDLE(raw));
+                                _ = close_event_handle(EVT_HANDLE(raw));
                             }
                             event_handles.fill(0);
                             returned = count.min(event_handles.len() as u32);
@@ -1375,7 +1389,7 @@ impl EventLogSubscription {
                             if let Some(ref only_ids) = self.config.only_event_ids
                                 && !only_ids.contains(&system_fields.event_id)
                             {
-                                counter!("windows_event_log_events_filtered_total", "reason" => "event_id_prefilter")
+                                counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_prefilter")
                                     .increment(1);
                                 channel_sub.discard_event_handle(event_handle);
                                 continue;
@@ -1385,7 +1399,7 @@ impl EventLogSubscription {
                                 .ignore_event_ids
                                 .contains(&system_fields.event_id)
                             {
-                                counter!("windows_event_log_events_filtered_total", "reason" => "event_id_prefilter")
+                                counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_prefilter")
                                     .increment(1);
                                 channel_sub.discard_event_handle(event_handle);
                                 continue;
@@ -1470,7 +1484,7 @@ impl EventLogSubscription {
                                         channel_sub.last_record_id_seen = Some(event.record_id);
                                     }
                                     counter!(
-                                        "windows_event_log_events_filtered_total",
+                                        CounterName::WindowsEventLogEventsFilteredTotal,
                                         "reason" => "resume_boundary"
                                     )
                                     .increment(1);
@@ -1523,10 +1537,10 @@ impl EventLogSubscription {
                                 channel_sub.last_event_at = Some(event.time_created);
 
                                 // Resolve SID to human-readable account name
-                                if let Some(ref sid) = event.user_id {
-                                    if let Some(account_name) = self.sid_resolver.resolve(sid) {
-                                        event.user_name = Some(account_name);
-                                    }
+                                if let Some(ref sid) = event.user_id
+                                    && let Some(account_name) = self.sid_resolver.resolve(sid)
+                                {
+                                    event.user_name = Some(account_name);
                                 }
 
                                 let bookmark_update = channel_sub.bookmark.update(event_handle);
@@ -1617,7 +1631,7 @@ impl EventLogSubscription {
                 // fresh OS notification. Pairs with the pre-drain ResetEvent
                 // above.
                 unsafe {
-                    let _ = SetEvent(channel_sub.signal_event);
+                    _ = SetEvent(channel_sub.signal_event);
                 }
             }
         }
@@ -1772,7 +1786,7 @@ impl EventLogSubscription {
 
         if !positions.is_empty() {
             self.checkpointer.set_batch(positions).await?;
-            counter!("windows_event_log_checkpoint_writes_total").increment(1);
+            counter!(CounterName::WindowsEventLogCheckpointWritesTotal).increment(1);
         }
 
         debug!(message = "Bookmark flush complete.");
@@ -1879,7 +1893,7 @@ impl Drop for EventLogSubscription {
         for sub in &mut self.channels {
             sub.close_current();
             unsafe {
-                let _ = CloseHandle(sub.signal_event);
+                _ = CloseHandle(sub.signal_event);
             }
             #[cfg(test)]
             SUBSCRIPTION_TEARDOWN_CLOSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1889,7 +1903,7 @@ impl Drop for EventLogSubscription {
 
         // Close shutdown event
         unsafe {
-            let _ = CloseHandle(self.shutdown_event);
+            _ = CloseHandle(self.shutdown_event);
         }
     }
 }
@@ -1897,8 +1911,8 @@ impl Drop for EventLogSubscription {
 #[cfg(test)]
 mod tests {
     use super::super::recovery::TimeRung;
+    use super::super::test_seams::SeamSession;
     use super::*;
-    use serial_test::serial;
 
     async fn create_test_checkpointer() -> (Arc<Checkpointer>, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -1927,6 +1941,7 @@ mod tests {
     /// Test pull subscription creation and basic operation
     #[tokio::test]
     async fn test_pull_subscription_creation() {
+        let _seams = SeamSession::acquire();
         let mut config = WindowsEventLogConfig::default();
         config.channels = vec!["Application".to_string()];
         config.event_timeout_ms = 1000;
@@ -1951,6 +1966,7 @@ mod tests {
     /// Test that wait_for_events_blocking returns timeout or events available
     #[tokio::test]
     async fn test_wait_for_events_timeout() {
+        let _seams = SeamSession::acquire();
         let mut config = WindowsEventLogConfig::default();
         config.channels = vec!["Application".to_string()];
         config.read_existing_events = false;
@@ -1984,6 +2000,7 @@ mod tests {
     /// Test that signal_shutdown wakes a waiting thread
     #[tokio::test]
     async fn test_shutdown_signal_wakes_wait() {
+        let _seams = SeamSession::acquire();
         let mut config = WindowsEventLogConfig::default();
         config.channels = vec!["Application".to_string()];
         config.event_timeout_ms = 500;
@@ -2013,7 +2030,7 @@ mod tests {
 
         unsafe {
             let handle = HANDLE(shutdown_event_raw as *mut std::ffi::c_void);
-            let _ = SetEvent(handle);
+            _ = SetEvent(handle);
         }
 
         let (subscription, result) = wait_handle.await.unwrap();
@@ -2033,6 +2050,7 @@ mod tests {
     /// Test that shutdown wins when both shutdown and channel handles are signaled.
     #[tokio::test]
     async fn test_shutdown_signal_takes_priority_over_channel_signal() {
+        let _seams = SeamSession::acquire();
         let mut config = WindowsEventLogConfig::default();
         config.channels = vec!["Application".to_string()];
         config.event_timeout_ms = 500;
@@ -2045,7 +2063,7 @@ mod tests {
 
         unsafe {
             let handle = HANDLE(subscription.shutdown_event_raw());
-            let _ = SetEvent(handle);
+            _ = SetEvent(handle);
         }
 
         let result = subscription.wait_for_events_blocking(0);
@@ -2058,6 +2076,7 @@ mod tests {
     /// Test pull_events with read_existing_events=true
     #[tokio::test]
     async fn test_pull_events_returns_events() {
+        let _seams = SeamSession::acquire();
         let mut config = WindowsEventLogConfig::default();
         config.channels = vec!["Application".to_string()];
         config.read_existing_events = true;
@@ -2095,6 +2114,7 @@ mod tests {
     /// Test multiple concurrent pull subscriptions
     #[tokio::test]
     async fn test_multiple_concurrent_subscriptions() {
+        let _seams = SeamSession::acquire();
         let mut config1 = WindowsEventLogConfig::default();
         config1.channels = vec!["Application".to_string()];
         config1.event_timeout_ms = 1000;
@@ -2123,6 +2143,7 @@ mod tests {
     /// Test read_existing_events=false only receives future events
     #[tokio::test]
     async fn test_read_existing_events_false_only_receives_future_events() {
+        let _seams = SeamSession::acquire();
         use chrono::Utc;
 
         let mut config = WindowsEventLogConfig::default();
@@ -2162,6 +2183,7 @@ mod tests {
     /// from a checkpoint, falling back to a fresh bookmark without crashing.
     #[tokio::test]
     async fn test_checkpoint_with_invalid_bookmark_falls_back_gracefully() {
+        let _seams = SeamSession::acquire();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let checkpointer = Arc::new(Checkpointer::new(temp_dir.path()).await.unwrap());
 
@@ -2202,8 +2224,8 @@ mod tests {
     /// 4. Assert `pull_events` still returns events — `EvtNext` fetches from the queue
     ///    regardless of signal state, so the speculative pull in mod.rs self-heals.
     #[tokio::test]
-    #[serial]
     async fn test_pull_events_works_with_cleared_signal() {
+        let _seams = SeamSession::acquire();
         // Seed the Application log with a record so the "events remain
         // available despite cleared signal" assertion below does not depend
         // on whatever backlog the runner happens to have. Freshly provisioned
@@ -2253,7 +2275,7 @@ mod tests {
         // regardless of the runner's pre-existing log state.
         let signal_raw = subscription.first_channel_signal_raw();
         unsafe {
-            let _ = ResetEvent(HANDLE(signal_raw as *mut std::ffi::c_void));
+            _ = ResetEvent(HANDLE(signal_raw as *mut std::ffi::c_void));
         }
 
         // Signal is cleared: an immediate (0ms) poll must report Timeout.
@@ -2306,8 +2328,8 @@ mod tests {
     /// clobbered by the reset and the immediate poll would return
     /// `Timeout` — which is exactly what #25194 reports.
     #[tokio::test]
-    #[serial]
     async fn test_pull_events_preserves_setevent_during_drain() {
+        let _seams = SeamSession::acquire();
         use std::sync::Arc as StdArc;
 
         let mut config = WindowsEventLogConfig::default();
@@ -2345,7 +2367,7 @@ mod tests {
                 }
                 if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     unsafe {
-                        let _ = SetEvent(signal);
+                        _ = SetEvent(signal);
                     }
                 }
             });
@@ -2368,7 +2390,7 @@ mod tests {
         // old buggy code. Exiting via budget exhaustion would skip
         // that reset and cause this test to false-pass against the
         // pre-fix code.
-        let _ = subscription.pull_events(usize::MAX).unwrap_or_default();
+        _ = subscription.pull_events(usize::MAX).unwrap_or_default();
 
         assert!(
             fired.load(std::sync::atomic::Ordering::SeqCst),
@@ -2406,7 +2428,7 @@ mod tests {
     struct ScriptGuard;
 
     impl ScriptGuard {
-        fn install(script: &[(u32, u32)]) -> Self {
+        fn install(_seams: &SeamSession, script: &[(u32, u32)]) -> Self {
             *EVT_NEXT_SCRIPT.lock().unwrap() = Some(script.iter().copied().collect());
             Self
         }
@@ -2442,7 +2464,7 @@ mod tests {
     struct SubscribeScriptGuard;
 
     impl SubscribeScriptGuard {
-        fn install(codes: &[u32]) -> Self {
+        fn install(_seams: &SeamSession, codes: &[u32]) -> Self {
             *EVT_SUBSCRIBE_SCRIPT.lock().unwrap() = Some(codes.iter().copied().collect());
             Self
         }
@@ -2458,7 +2480,7 @@ mod tests {
     struct RenderFailGuard;
 
     impl RenderFailGuard {
-        fn install() -> Self {
+        fn install(_seams: &SeamSession) -> Self {
             FAIL_ALL_RENDERS.store(true, std::sync::atomic::Ordering::SeqCst);
             Self
         }
@@ -2504,8 +2526,8 @@ mod tests {
     /// failed to open is a self-inflicted outage, and it is the exact failure
     /// mode build-new-then-swap exists to prevent.
     #[tokio::test]
-    #[serial]
     async fn a_failed_proactive_rebuild_keeps_the_live_subscription() {
+        let _seams = SeamSession::acquire();
         let (mut subscription, _temp_dir) = application_subscription().await;
         assert!(subscription.first_channel_is_live());
         let baseline = subscription.first_channel_handle_balance();
@@ -2513,7 +2535,7 @@ mod tests {
         {
             // RPC_S_SERVER_UNAVAILABLE: transient, and the kind of failure a
             // refresh really does hit on a service that is restarting.
-            let _guard = SubscribeScriptGuard::install(&[1722]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[1722]);
             subscription.force_proactive_rebuild_all();
         }
 
@@ -2540,18 +2562,18 @@ mod tests {
     /// A rebuild from a DEAD subscription has nothing to preserve, so a failure
     /// there legitimately leaves the channel down and retrying.
     #[tokio::test]
-    #[serial]
     async fn a_failed_rebuild_from_dead_leaves_the_channel_down() {
+        let _seams = SeamSession::acquire();
         let (mut subscription, _temp_dir) = application_subscription().await;
 
         {
-            let _guard = ScriptGuard::install(&[(15007, 0)]);
-            let _ = subscription.pull_events(100).expect("must not error out");
+            let _guard = ScriptGuard::install(&_seams, &[(15007, 0)]);
+            _ = subscription.pull_events(100).expect("must not error out");
         }
         assert!(!subscription.first_channel_is_live());
 
         {
-            let _guard = SubscribeScriptGuard::install(&[15007]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15007]);
             subscription.force_rebuild_all();
         }
         assert!(
@@ -2566,9 +2588,9 @@ mod tests {
     /// it again and skips it again, forever: the channel can never make progress
     /// past the bad event, which is a permanent stall dressed up as a skip.
     #[tokio::test]
-    #[serial]
     async fn a_skipped_unrenderable_event_is_not_redelivered_after_a_restart() {
-        let _ = std::process::Command::new("eventcreate")
+        let _seams = SeamSession::acquire();
+        _ = std::process::Command::new("eventcreate")
             .args([
                 "/T",
                 "INFORMATION",
@@ -2602,7 +2624,7 @@ mod tests {
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
         let mut skipping = application_subscription_with(Arc::clone(&checkpointer)).await;
         {
-            let _guard = RenderFailGuard::install();
+            let _guard = RenderFailGuard::install(&_seams);
             let delivered = skipping.pull_events(usize::MAX).unwrap_or_default();
             assert!(
                 delivered.is_empty(),
@@ -2645,8 +2667,8 @@ mod tests {
     /// the lab's single unregister episode still logged four warn-band lines
     /// against a design that calls for two.
     #[tokio::test]
-    #[serial]
     async fn one_episode_produces_exactly_one_onset_and_one_recovery() {
+        let _seams = SeamSession::acquire();
         use tracing_subscriber::layer::SubscriberExt;
 
         let (mut subscription, _temp_dir) = application_subscription().await;
@@ -2657,8 +2679,8 @@ mod tests {
         tracing::subscriber::with_default(collector, || {
             // Onset: the channel goes away underneath us.
             {
-                let _guard = ScriptGuard::install(&[(15007, 0)]);
-                let _ = subscription.pull_events(100).expect("must not error out");
+                let _guard = ScriptGuard::install(&_seams, &[(15007, 0)]);
+                _ = subscription.pull_events(100).expect("must not error out");
             }
             assert!(!subscription.first_channel_is_live());
 
@@ -2666,7 +2688,7 @@ mod tests {
             // the same condition already reported, so none of them may reach the
             // warn band.
             {
-                let _guard = SubscribeScriptGuard::install(&[15007; 6]);
+                let _guard = SubscribeScriptGuard::install(&_seams, &[15007; 6]);
                 for _ in 0..6 {
                     subscription.force_rebuild_all();
                     assert!(!subscription.first_channel_is_live());
@@ -2700,8 +2722,8 @@ mod tests {
     /// handles, so the count of open subscription handles must return to its
     /// baseline after any number of rebuilds.
     #[tokio::test]
-    #[serial]
     async fn handle_count_returns_to_baseline_after_forced_rebuilds() {
+        let _seams = SeamSession::acquire();
         let (mut subscription, _temp_dir) = application_subscription().await;
 
         let baseline = subscription.first_channel_handle_balance();
@@ -2726,11 +2748,11 @@ mod tests {
     /// handle after such an error loses events, because on 1734 the API cursor
     /// advances even when the call fails.
     #[tokio::test]
-    #[serial]
     async fn evt_next_error_with_populated_handles_discards_them() {
+        let _seams = SeamSession::acquire();
         let (mut subscription, _temp_dir) = application_subscription().await;
 
-        let _guard = ScriptGuard::install(&[(15011, 4)]);
+        let _guard = ScriptGuard::install(&_seams, &[(15011, 4)]);
 
         let events = subscription
             .pull_events(100)
@@ -2756,13 +2778,13 @@ mod tests {
     /// healthy channel to 18 shipping ERROR events per three minutes, so it
     /// must not tear anything down.
     #[tokio::test]
-    #[serial]
     async fn benign_invalid_operation_does_not_tear_down() {
+        let _seams = SeamSession::acquire();
         let (mut subscription, _temp_dir) = application_subscription().await;
 
-        let _guard = ScriptGuard::install(&[(4317, 0)]);
+        let _guard = ScriptGuard::install(&_seams, &[(4317, 0)]);
 
-        let _ = subscription
+        _ = subscription
             .pull_events(100)
             .expect("a benign drain terminator is not an error");
         assert!(
@@ -2775,13 +2797,13 @@ mod tests {
     /// An unknown code rebuilds rather than retrying the same handle, and the
     /// channel comes back on its own.
     #[tokio::test]
-    #[serial]
     async fn unknown_codes_rebuild_and_recover() {
+        let _seams = SeamSession::acquire();
         let (mut subscription, _temp_dir) = application_subscription().await;
 
         {
-            let _guard = ScriptGuard::install(&[(60123, 0)]);
-            let _ = subscription.pull_events(100).expect("must not error out");
+            let _guard = ScriptGuard::install(&_seams, &[(60123, 0)]);
+            _ = subscription.pull_events(100).expect("must not error out");
             assert!(
                 !subscription.first_channel_is_live(),
                 "an unknown code must rebuild rather than retry the same handle"
@@ -2802,13 +2824,13 @@ mod tests {
     /// `(TimeCreated, RecordId)` boundary is what makes that contribute zero
     /// duplicates, so no record id may appear in two consecutive reads.
     #[tokio::test]
-    #[serial]
     async fn rebuild_does_not_redeliver_events() {
+        let _seams = SeamSession::acquire();
         // Best-effort seed. Writing to Application needs privilege the test
         // runner may not have, and this assertion does not depend on the seed:
         // it reads whatever backlog the channel already holds and only requires
         // that the SECOND read repeats nothing from the first.
-        let _ = std::process::Command::new("eventcreate")
+        _ = std::process::Command::new("eventcreate")
             .args([
                 "/T",
                 "INFORMATION",
@@ -2870,7 +2892,7 @@ mod tests {
     struct RequestLog;
 
     impl RequestLog {
-        fn install() -> Self {
+        fn install(_seams: &SeamSession) -> Self {
             *EVT_NEXT_REQUESTS.lock().unwrap() = Some(Vec::new());
             EVT_NEXT_RETURNED_TOTAL.store(0, std::sync::atomic::Ordering::SeqCst);
             Self
@@ -2919,7 +2941,7 @@ mod tests {
     struct FlagLog;
 
     impl FlagLog {
-        fn install() -> Self {
+        fn install(_seams: &SeamSession) -> Self {
             *EVT_SUBSCRIBE_FLAG_LOG.lock().unwrap() = Some(Vec::new());
             Self
         }
@@ -2949,7 +2971,7 @@ mod tests {
     struct BookmarkFailGuard;
 
     impl BookmarkFailGuard {
-        fn install() -> Self {
+        fn install(_seams: &SeamSession) -> Self {
             FAIL_ALL_BOOKMARK_UPDATES.store(true, std::sync::atomic::Ordering::SeqCst);
             Self
         }
@@ -3004,8 +3026,8 @@ mod tests {
     /// and silently loses data only on a host whose bookmark has died. So the
     /// exact flag word is asserted here.
     #[tokio::test]
-    #[serial]
     async fn bookmark_resume_passes_start_after_bookmark_and_strict() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         // Position the bookmark: a fresh bookmark marks no position, and
@@ -3018,7 +3040,7 @@ mod tests {
              never gets positioned and this proves nothing"
         );
 
-        let flag_log = FlagLog::install();
+        let flag_log = FlagLog::install(&_seams);
         subscription.force_rebuild_all();
 
         assert_eq!(
@@ -3037,10 +3059,10 @@ mod tests {
 
     /// The other two resume modes carry exactly their own flag and nothing else.
     #[tokio::test]
-    #[serial]
     async fn oldest_and_future_only_resume_modes_pass_their_exact_flag() {
+        let _seams = SeamSession::acquire();
         {
-            let flag_log = FlagLog::install();
+            let flag_log = FlagLog::install(&_seams);
             let _subscription = subscription_from(&application_config()).await;
             assert_eq!(
                 flag_log.flags(),
@@ -3052,7 +3074,7 @@ mod tests {
 
         let mut config = application_config();
         config.read_existing_events = false;
-        let flag_log = FlagLog::install();
+        let flag_log = FlagLog::install(&_seams);
         let _subscription = subscription_from(&config).await;
         assert_eq!(
             flag_log.flags(),
@@ -3071,13 +3093,13 @@ mod tests {
     /// periodic refresh is not in play, so there is nothing to preserve and the
     /// failed rebuild legitimately leaves the channel down.
     #[tokio::test]
-    #[serial]
     async fn a_failed_rebuild_from_dead_closes_a_live_subscription() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
         assert!(subscription.first_channel_is_live());
 
         {
-            let _guard = SubscribeScriptGuard::install(&[15007]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15007]);
             subscription.force_rebuild_all();
         }
 
@@ -3092,14 +3114,14 @@ mod tests {
     /// to preserve, so the failure must be classified and acted on rather than
     /// deferred as a harmless refresh miss.
     #[tokio::test]
-    #[serial]
     async fn a_failed_proactive_rebuild_with_no_live_handle_still_classifies() {
+        let _seams = SeamSession::acquire();
         use tracing_subscriber::layer::SubscriberExt;
 
         let mut subscription = subscription_from(&application_config()).await;
         {
-            let _guard = ScriptGuard::install(&[(15007, 0)]);
-            let _ = subscription.pull_events(100).expect("must not error out");
+            let _guard = ScriptGuard::install(&_seams, &[(15007, 0)]);
+            _ = subscription.pull_events(100).expect("must not error out");
         }
         assert!(!subscription.first_channel_is_live());
 
@@ -3108,7 +3130,7 @@ mod tests {
         tracing::subscriber::with_default(collector, || {
             // ERROR_EVT_INVALID_CHANNEL_PATH: a permanent skip, which is logged
             // unconditionally rather than being episode-gated.
-            let _guard = SubscribeScriptGuard::install(&[15000]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15000]);
             subscription.force_proactive_rebuild_all();
         });
 
@@ -3126,16 +3148,16 @@ mod tests {
     /// the retry into the past would turn every failed refresh into a rebuild
     /// storm against a service that is already unwell.
     #[tokio::test]
-    #[serial]
     async fn a_failed_proactive_rebuild_defers_the_next_refresh() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
-        let flag_log = FlagLog::install();
+        let flag_log = FlagLog::install(&_seams);
 
         {
             // Seven consecutive failures walk the backoff to its 60s cap, so the
             // deferral this asserts is measured in tens of seconds rather than
             // in a window a loaded test host can close on its own.
-            let _guard = SubscribeScriptGuard::install(&[1722; 7]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[1722; 7]);
             for _ in 0..7 {
                 subscription.force_proactive_rebuild_all();
             }
@@ -3143,7 +3165,7 @@ mod tests {
         assert_eq!(flag_log.attempts(), 7, "the failed attempts themselves");
         assert!(subscription.first_channel_is_live());
 
-        let _ = subscription.pull_events(1);
+        _ = subscription.pull_events(1);
         assert_eq!(
             flag_log.attempts(),
             7,
@@ -3157,20 +3179,20 @@ mod tests {
     /// and the isolate rung's whole purpose is that the next read asks for one
     /// record so a failure is attributable to exactly one record.
     #[tokio::test]
-    #[serial]
     async fn an_invalid_generated_query_at_subscribe_isolates_the_batch() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         {
-            let _guard = SubscribeScriptGuard::install(&[15001]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15001]);
             subscription.force_rebuild_all();
         }
         subscription.force_rebuild_all();
         assert!(subscription.first_channel_is_live());
 
-        let request_log = RequestLog::install();
-        let _guard = ScriptGuard::install(&[(259, 0)]);
-        let _ = subscription.pull_events(usize::MAX);
+        let request_log = RequestLog::install(&_seams);
+        let _guard = ScriptGuard::install(&_seams, &[(259, 0)]);
+        _ = subscription.pull_events(usize::MAX);
 
         assert_eq!(
             request_log.sizes(),
@@ -3187,8 +3209,8 @@ mod tests {
     /// A channel count that does not divide the budget evenly is the case that
     /// distinguishes a division from anything else.
     #[tokio::test]
-    #[serial]
     async fn the_per_channel_budget_divides_the_max_across_channels() {
+        let _seams = SeamSession::acquire();
         let mut config = application_config();
         config.channels = vec![
             "Application".to_string(),
@@ -3197,9 +3219,9 @@ mod tests {
         ];
         let mut subscription = subscription_from(&config).await;
 
-        let request_log = RequestLog::install();
-        let _guard = ScriptGuard::install(&[(259, 0); 3]);
-        let _ = subscription.pull_events(7);
+        let request_log = RequestLog::install(&_seams);
+        let _guard = ScriptGuard::install(&_seams, &[(259, 0); 3]);
+        _ = subscription.pull_events(7);
 
         assert_eq!(
             request_log.sizes().first().copied(),
@@ -3212,8 +3234,8 @@ mod tests {
     /// its siblings. Four consecutive calls over two channels must visit them in
     /// alternating order.
     #[tokio::test]
-    #[serial]
     async fn channels_are_drained_in_rotating_order() {
+        let _seams = SeamSession::acquire();
         let mut config = application_config();
         config.channels = vec!["Application".to_string(), "System".to_string()];
         let mut subscription = subscription_from(&config).await;
@@ -3225,10 +3247,10 @@ mod tests {
             "both channels must be readable for this to prove anything, got {live:?}"
         );
 
-        let request_log = RequestLog::install();
-        let _guard = ScriptGuard::install(&[(259, 0); 8]);
+        let request_log = RequestLog::install(&_seams);
+        let _guard = ScriptGuard::install(&_seams, &[(259, 0); 8]);
         for _ in 0..4 {
-            let _ = subscription.pull_events(usize::MAX);
+            _ = subscription.pull_events(usize::MAX);
         }
 
         let expected: Vec<String> = vec![
@@ -3256,16 +3278,16 @@ mod tests {
     /// the future. Firing early wastes rebuilds; rescheduling into the past
     /// rebuilds on every single pull.
     #[tokio::test]
-    #[serial]
     async fn the_periodic_refresh_fires_when_due_and_then_reschedules_forward() {
+        let _seams = SeamSession::acquire();
         let mut config = application_config();
         config.read_existing_events = false;
         config.subscription_refresh_secs = 1;
         let mut subscription = subscription_from(&config).await;
 
-        let flag_log = FlagLog::install();
+        let flag_log = FlagLog::install(&_seams);
 
-        let _ = subscription.pull_events(1);
+        _ = subscription.pull_events(1);
         assert_eq!(
             flag_log.attempts(),
             0,
@@ -3273,10 +3295,10 @@ mod tests {
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        let _ = subscription.pull_events(1);
+        _ = subscription.pull_events(1);
         assert_eq!(flag_log.attempts(), 1, "the refresh is due and must fire");
 
-        let _ = subscription.pull_events(1);
+        _ = subscription.pull_events(1);
         assert_eq!(
             flag_log.attempts(),
             1,
@@ -3290,18 +3312,18 @@ mod tests {
     /// the backoff deadline is respected, and a successful rebuild falls through
     /// to the drain rather than costing the caller a whole cycle.
     #[tokio::test]
-    #[serial]
     async fn a_down_channel_waits_out_its_backoff_then_recovers_and_drains() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         {
-            let _guard = ScriptGuard::install(&[(15007, 0)]);
-            let _ = subscription.pull_events(usize::MAX);
+            let _guard = ScriptGuard::install(&_seams, &[(15007, 0)]);
+            _ = subscription.pull_events(usize::MAX);
         }
         assert!(!subscription.first_channel_is_live());
 
-        let flag_log = FlagLog::install();
-        let _ = subscription.pull_events(usize::MAX);
+        let flag_log = FlagLog::install(&_seams);
+        _ = subscription.pull_events(usize::MAX);
         assert_eq!(
             flag_log.attempts(),
             0,
@@ -3331,8 +3353,8 @@ mod tests {
     /// nothing at all, which no delivery-count assertion elsewhere notices
     /// because those tests do not configure `only_event_ids`.
     #[tokio::test]
-    #[serial]
     async fn the_only_event_ids_prefilter_keeps_the_configured_ids() {
+        let _seams = SeamSession::acquire();
         let mut baseline = subscription_from(&application_config()).await;
         let ids: Vec<u32> = baseline
             .pull_events(usize::MAX)
@@ -3363,8 +3385,8 @@ mod tests {
     /// would silently switch off the only signal we have for retention-overwrite
     /// data loss, on every channel, forever.
     #[tokio::test]
-    #[serial]
     async fn reading_local_events_leaves_record_id_gap_detection_active() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         let delivered = drain_all(&mut subscription);
@@ -3392,10 +3414,10 @@ mod tests {
     /// the same gate, so a gate that drops uniformly degrades both and the
     /// comparison stays green.
     #[tokio::test]
-    #[serial]
     async fn the_admission_gate_emits_every_record_evtnext_returns() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
-        let request_log = RequestLog::install();
+        let request_log = RequestLog::install(&_seams);
 
         let delivered = drain_all(&mut subscription);
 
@@ -3435,8 +3457,8 @@ mod tests {
     /// use-after-close against the API; missing one is the leak the whole
     /// handle-accounting seam exists to catch.
     #[tokio::test]
-    #[serial]
     async fn a_mid_batch_bookmark_failure_closes_each_handle_exactly_once() {
+        let _seams = SeamSession::acquire();
         let mut baseline = subscription_from(&application_config()).await;
         let backlog = baseline.pull_events(2).unwrap_or_default().len();
         assert_eq!(
@@ -3447,7 +3469,7 @@ mod tests {
         drop(baseline);
 
         let mut subscription = subscription_from(&application_config()).await;
-        let _guard = BookmarkFailGuard::install();
+        let _guard = BookmarkFailGuard::install(&_seams);
         let delivered = subscription.pull_events(2).unwrap_or_default();
 
         assert!(
@@ -3468,8 +3490,8 @@ mod tests {
     /// an early exit strands the remaining backlog until the next OS
     /// notification, which on a quiet channel may be hours.
     #[tokio::test]
-    #[serial]
     async fn the_signal_is_rearmed_only_when_the_drain_exited_early() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         let delivered = subscription.pull_events(1).unwrap_or_default();
@@ -3492,8 +3514,8 @@ mod tests {
         let mut quiesced = false;
         for _ in 0..5 {
             {
-                let _guard = ScriptGuard::install(&[(259, 0)]);
-                let _ = subscription.pull_events(usize::MAX);
+                let _guard = ScriptGuard::install(&_seams, &[(259, 0)]);
+                _ = subscription.pull_events(usize::MAX);
             }
             if matches!(
                 subscription.wait_for_events_blocking(0),
@@ -3514,17 +3536,17 @@ mod tests {
     /// an idle host, so whether that query is ISSUED is the contract. A gauge
     /// write is not observable; the call is.
     #[tokio::test]
-    #[serial]
     async fn record_count_queries_are_skipped_on_idle_speculative_pulls() {
+        let _seams = SeamSession::acquire();
         use super::super::render::CHANNEL_RECORDS_UPDATES;
         use std::sync::atomic::Ordering::SeqCst;
 
         let mut subscription = subscription_from(&application_config()).await;
 
         {
-            let _guard = ScriptGuard::install(&[(259, 0)]);
+            let _guard = ScriptGuard::install(&_seams, &[(259, 0)]);
             CHANNEL_RECORDS_UPDATES.store(0, SeqCst);
-            let _ = subscription.pull_events_speculative(10);
+            _ = subscription.pull_events_speculative(10);
         }
         assert_eq!(
             CHANNEL_RECORDS_UPDATES.load(SeqCst),
@@ -3534,9 +3556,9 @@ mod tests {
         );
 
         {
-            let _guard = ScriptGuard::install(&[(259, 0)]);
+            let _guard = ScriptGuard::install(&_seams, &[(259, 0)]);
             CHANNEL_RECORDS_UPDATES.store(0, SeqCst);
-            let _ = subscription.pull_events(10);
+            _ = subscription.pull_events(10);
         }
         assert_eq!(
             CHANNEL_RECORDS_UPDATES.load(SeqCst),
@@ -3555,8 +3577,8 @@ mod tests {
     /// it is, and a restart does not resume onto the record we deliberately
     /// dropped and repeat the whole escape.
     #[tokio::test]
-    #[serial]
     async fn the_deliberate_skip_drops_one_record_and_survives_a_restart() {
+        let _seams = SeamSession::acquire();
         let mut baseline_sub = subscription_from(&application_config()).await;
         let backlog = drain_all(&mut baseline_sub);
         assert!(
@@ -3584,8 +3606,8 @@ mod tests {
         // across three consecutive rebuilds counts.
         for _ in 0..6 {
             {
-                let _guard = ScriptGuard::install(&[(15011, 0)]);
-                let _ = subscription.pull_events(usize::MAX);
+                let _guard = ScriptGuard::install(&_seams, &[(15011, 0)]);
+                _ = subscription.pull_events(usize::MAX);
             }
             subscription.force_rebuild_all();
         }
@@ -3624,23 +3646,23 @@ mod tests {
     /// refresh does not clear the skip, a transient ACL flap or a momentary bad
     /// channel path becomes a permanent outage for the life of the process.
     #[tokio::test]
-    #[serial]
     async fn the_periodic_refresh_is_what_un_skips_a_skipped_channel() {
+        let _seams = SeamSession::acquire();
         let mut config = application_config();
         config.subscription_refresh_secs = 1;
         let mut subscription = subscription_from(&config).await;
 
         {
             // ERROR_EVT_INVALID_CHANNEL_PATH: skip for this generation.
-            let _guard = ScriptGuard::install(&[(15000, 0)]);
-            let _ = subscription.pull_events(usize::MAX);
+            let _guard = ScriptGuard::install(&_seams, &[(15000, 0)]);
+            _ = subscription.pull_events(usize::MAX);
         }
         assert!(
             !subscription.first_channel_is_live(),
             "a skip must take the channel out of service"
         );
 
-        let _ = subscription.pull_events(usize::MAX);
+        _ = subscription.pull_events(usize::MAX);
         assert!(
             !subscription.first_channel_is_live(),
             "the pull path must not retry a skipped channel; that is the retry \
@@ -3648,7 +3670,7 @@ mod tests {
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        let _ = subscription.pull_events(usize::MAX);
+        _ = subscription.pull_events(usize::MAX);
         assert!(
             subscription.first_channel_is_live(),
             "the refresh must clear the skip and rebuild, so an ACL flap heals \
@@ -3670,8 +3692,8 @@ mod tests {
     /// Reopening from anywhere else would either replay the channel or discard
     /// its backlog on what is only a marshalling-size problem.
     #[tokio::test]
-    #[serial]
     async fn an_oversized_read_halves_the_batch_and_reopens_from_the_bookmark() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
         assert!(
             !drain_all(&mut subscription).is_empty(),
@@ -3679,12 +3701,12 @@ mod tests {
         );
         let baseline_handles = subscription.first_channel_handle_balance();
 
-        let request_log = RequestLog::install();
-        let flag_log = FlagLog::install();
+        let request_log = RequestLog::install(&_seams);
+        let flag_log = FlagLog::install(&_seams);
 
         {
-            let _guard = ScriptGuard::install(&[(1734, 0)]);
-            let _ = subscription
+            let _guard = ScriptGuard::install(&_seams, &[(1734, 0)]);
+            _ = subscription
                 .pull_events(usize::MAX)
                 .expect("an oversized read is not a source error");
         }
@@ -3710,7 +3732,7 @@ mod tests {
         );
 
         request_log.clear();
-        let _ = subscription.pull_events(usize::MAX);
+        _ = subscription.pull_events(usize::MAX);
         assert_eq!(
             request_log.sizes().first().copied(),
             Some(50),
@@ -3722,14 +3744,14 @@ mod tests {
     /// request the API can serve, so the floor is the whole reason the ladder
     /// terminates instead of wedging the channel.
     #[tokio::test]
-    #[serial]
     async fn repeated_oversized_reads_halve_the_batch_to_a_floor_of_one() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
-        let request_log = RequestLog::install();
+        let request_log = RequestLog::install(&_seams);
 
         for _ in 0..8 {
-            let _guard = ScriptGuard::install(&[(1734, 0)]);
-            let _ = subscription.pull_events(usize::MAX);
+            let _guard = ScriptGuard::install(&_seams, &[(1734, 0)]);
+            _ = subscription.pull_events(usize::MAX);
         }
 
         assert_eq!(
@@ -3744,24 +3766,24 @@ mod tests {
     /// on the first clean batch would just walk into the same oversized event
     /// again.
     #[tokio::test]
-    #[serial]
     async fn recovery_after_a_plain_batch_reduction_is_gradual() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         {
-            let _guard = ScriptGuard::install(&[(1734, 0)]);
-            let _ = subscription.pull_events(usize::MAX);
+            let _guard = ScriptGuard::install(&_seams, &[(1734, 0)]);
+            _ = subscription.pull_events(usize::MAX);
         }
 
-        let request_log = RequestLog::install();
+        let request_log = RequestLog::install(&_seams);
 
         // Nine clean batches: one short of the recovery threshold.
         {
-            let _renders = RenderFailGuard::install();
+            let _renders = RenderFailGuard::install(&_seams);
             let mut script = vec![(0u32, 1u32); 9];
             script.push((259, 0));
-            let _guard = ScriptGuard::install(&script);
-            let _ = subscription.pull_events(usize::MAX);
+            let _guard = ScriptGuard::install(&_seams, &script);
+            _ = subscription.pull_events(usize::MAX);
         }
         assert_eq!(
             request_log.sizes(),
@@ -3772,9 +3794,9 @@ mod tests {
         // The tenth crosses it.
         request_log.clear();
         {
-            let _renders = RenderFailGuard::install();
-            let _guard = ScriptGuard::install(&[(0, 1), (259, 0)]);
-            let _ = subscription.pull_events(usize::MAX);
+            let _renders = RenderFailGuard::install(&_seams);
+            let _guard = ScriptGuard::install(&_seams, &[(0, 1), (259, 0)]);
+            _ = subscription.pull_events(usize::MAX);
         }
         assert_eq!(
             request_log.sizes(),
@@ -3789,8 +3811,8 @@ mod tests {
     /// left to be careful about. This is how 4.2 and 4.3.1 are reconciled, and
     /// the two paths must not be collapsed into one.
     #[tokio::test]
-    #[serial]
     async fn recovery_after_a_poison_escape_rung_is_immediate() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
         assert!(
             !drain_all(&mut subscription).is_empty(),
@@ -3801,17 +3823,17 @@ mod tests {
         // normal recovery, a stuck one is a poisoned position.
         for _ in 0..3 {
             {
-                let _guard = ScriptGuard::install(&[(15011, 0)]);
-                let _ = subscription.pull_events(usize::MAX);
+                let _guard = ScriptGuard::install(&_seams, &[(15011, 0)]);
+                _ = subscription.pull_events(usize::MAX);
             }
             subscription.force_rebuild_all();
         }
         assert!(subscription.first_channel_is_live());
 
-        let request_log = RequestLog::install();
-        let _renders = RenderFailGuard::install();
-        let _guard = ScriptGuard::install(&[(0, 1), (259, 0)]);
-        let _ = subscription.pull_events(usize::MAX);
+        let request_log = RequestLog::install(&_seams);
+        let _renders = RenderFailGuard::install(&_seams);
+        let _guard = ScriptGuard::install(&_seams, &[(0, 1), (259, 0)]);
+        _ = subscription.pull_events(usize::MAX);
 
         assert_eq!(
             request_log.sizes(),
@@ -3828,8 +3850,8 @@ mod tests {
     /// discarded and the position is taken from the bookmark instead. If that
     /// were wrong, the events in flight at each fault would silently vanish.
     #[tokio::test]
-    #[serial]
     async fn no_events_are_lost_or_duplicated_across_the_halve_and_recover_cycle() {
+        let _seams = SeamSession::acquire();
         let mut baseline = subscription_from(&application_config()).await;
         let before: Vec<u64> = drain_all(&mut baseline);
         assert!(
@@ -3842,8 +3864,8 @@ mod tests {
         let mut delivered: Vec<u64> = Vec::new();
         for _ in 0..4 {
             {
-                let _guard = ScriptGuard::install(&[(1734, 0)]);
-                let _ = subscription.pull_events(usize::MAX);
+                let _guard = ScriptGuard::install(&_seams, &[(1734, 0)]);
+                _ = subscription.pull_events(usize::MAX);
             }
             delivered.extend(drain_all(&mut subscription));
         }
@@ -3879,10 +3901,10 @@ mod tests {
     /// whether `close_event_handle` actually called the API, and it is
     /// compared against the record count recorded BEFORE any drain decision.
     #[tokio::test]
-    #[serial]
     async fn every_event_handle_evtnext_returns_is_closed_at_the_api() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
-        let request_log = RequestLog::install();
+        let request_log = RequestLog::install(&_seams);
 
         // Rebuilds interleaved with real drains: both the drain and the
         // discard-on-rebuild path retire handles, and a leak in either is a
@@ -3920,6 +3942,7 @@ mod tests {
     /// satisfy it. "Drop ran" is not the property.
     #[test]
     fn a_dropped_publisher_handle_is_released_at_the_api() {
+        let _seams = SeamSession::acquire();
         use std::sync::atomic::Ordering::SeqCst;
         use windows::Win32::System::EventLog::EvtOpenPublisherMetadata;
 
@@ -3959,8 +3982,8 @@ mod tests {
     /// readable after the owner is gone. Deleting the drop body leaks one
     /// subscription and one event object per channel for the process lifetime.
     #[tokio::test]
-    #[serial]
     async fn dropping_the_subscription_releases_every_handle_it_holds() {
+        let _seams = SeamSession::acquire();
         use std::sync::atomic::Ordering::SeqCst;
 
         let subscription = subscription_from(&application_config()).await;
@@ -3994,8 +4017,8 @@ mod tests {
     /// silent; returning none never advances the checkpoint at all, which
     /// re-delivers everything after a restart.
     #[tokio::test]
-    #[serial]
     async fn a_checkpoint_position_belongs_to_the_channel_it_was_asked_for() {
+        let _seams = SeamSession::acquire();
         let mut config = application_config();
         config.channels = vec!["Application".to_string(), "System".to_string()];
         let mut subscription = subscription_from(&config).await;
@@ -4050,8 +4073,8 @@ mod tests {
     /// from, which is the dead-bookmark path the whole resume ladder exists to
     /// survive: a checkpoint write that creates the failure it protects against.
     #[tokio::test]
-    #[serial]
     async fn a_bookmark_marking_no_position_is_never_checkpointed() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         assert!(
@@ -4189,8 +4212,8 @@ mod tests {
     /// polarity flip makes ordinary ladder movement page an operator and makes
     /// unrecoverable backlog loss a warning.
     #[tokio::test]
-    #[serial]
     async fn the_terminal_resume_rung_is_an_error_and_the_others_are_warnings() {
+        let _seams = SeamSession::acquire();
         use tracing_subscriber::layer::SubscriberExt;
 
         fn capture<F: FnOnce()>(f: F) -> Vec<(String, String)> {
@@ -4206,7 +4229,7 @@ mod tests {
         // rung.
         let mut fresh = subscription_from(&application_config()).await;
         let terminal = capture(|| {
-            let _guard = SubscribeScriptGuard::install(&[15011]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
             fresh.force_rebuild_all();
         });
         assert!(
@@ -4225,7 +4248,7 @@ mod tests {
             "a stored position is required for the time rung to be reachable"
         );
         let time_rung = capture(|| {
-            let _guard = SubscribeScriptGuard::install(&[15011]);
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
             positioned.force_rebuild_all();
         });
         assert!(
@@ -4245,8 +4268,8 @@ mod tests {
     /// WARN (D29), and the agent's give-up WARN (D30) reads it. It is absolute
     /// so consumers derive the age, and "never" is a distinct, meaningful value.
     #[tokio::test]
-    #[serial]
     async fn last_event_at_reads_never_until_an_event_arrives_and_a_timestamp_after() {
+        let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
 
         assert_eq!(
@@ -4273,8 +4296,8 @@ mod tests {
     /// signal, and both halves carry meaning: the total is the configured
     /// channel count and the active count is how many are readable right now.
     #[tokio::test]
-    #[serial]
     async fn the_health_summary_counts_configured_and_live_channels() {
+        let _seams = SeamSession::acquire();
         let mut config = application_config();
         config.channels = vec!["Application".to_string(), "System".to_string()];
         let mut subscription = subscription_from(&config).await;
@@ -4287,8 +4310,8 @@ mod tests {
 
         {
             // One channel goes down; the other is untouched.
-            let _guard = ScriptGuard::install(&[(15007, 0)]);
-            let _ = subscription.pull_events(100).expect("must not error out");
+            let _guard = ScriptGuard::install(&_seams, &[(15007, 0)]);
+            _ = subscription.pull_events(100).expect("must not error out");
         }
 
         assert_eq!(
@@ -4330,8 +4353,8 @@ mod tests {
     /// single-record skip, which on interleaved forwarded ids would discard an
     /// arbitrary machine's event.
     #[tokio::test]
-    #[serial]
     async fn an_event_delivered_as_rendered_text_revokes_record_id_trust() {
+        let _seams = SeamSession::acquire();
         // Control: the same backlog, unmodified. Both properties must hold
         // afterwards, or the treatment below proves nothing.
         let mut control = subscription_from(&application_config()).await;
