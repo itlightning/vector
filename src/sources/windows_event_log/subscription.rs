@@ -3275,22 +3275,41 @@ mod tests {
     /// The admission gate emits new events and drops only what it has already
     /// seen. Inverting it delivers nothing while looking, from the outside, like
     /// a quiet channel.
+    ///
+    /// Asserted against an independently read baseline rather than against
+    /// "delivered something". A non-empty check is the weak assertion this whole
+    /// exercise exists to eliminate: the gate can drop most of a backlog and
+    /// still hand back a few records, and only a comparison against what the
+    /// channel actually holds notices.
     #[tokio::test]
     #[serial]
-    async fn the_backlog_is_delivered_and_never_twice() {
-        let mut subscription = subscription_from(&application_config()).await;
-
-        let delivered = drain_all(&mut subscription);
+    async fn the_admission_gate_delivers_the_whole_backlog_and_nothing_twice() {
+        let mut baseline = subscription_from(&application_config()).await;
+        let expected: std::collections::HashSet<u64> =
+            drain_all(&mut baseline).into_iter().collect();
         assert!(
-            !delivered.is_empty(),
-            "the admission gate must emit events past the resume boundary"
+            expected.len() >= 5,
+            "the Application backlog must hold several records for a partial \
+             delivery to be distinguishable from a complete one, got {}",
+            expected.len()
         );
+        drop(baseline);
+
+        let mut subscription = subscription_from(&application_config()).await;
+        let delivered = drain_all(&mut subscription);
 
         let mut seen = std::collections::HashSet::new();
         for record_id in &delivered {
             assert!(
                 seen.insert(*record_id),
                 "record {record_id} was delivered twice within one drain"
+            );
+        }
+        for record_id in &expected {
+            assert!(
+                seen.contains(record_id),
+                "record {record_id} is in the channel and was never delivered: \
+                 the admission gate dropped a record it had no reason to drop"
             );
         }
     }
