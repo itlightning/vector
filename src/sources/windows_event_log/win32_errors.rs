@@ -61,7 +61,7 @@ pub(super) const INHERITED_UNDOCUMENTED_16953: u32 = 16953;
 /// Windows Event Log APIs surface Win32 codes wrapped in an HRESULT, so the
 /// low 16 bits carry the number. Both are logged on every state transition:
 /// names are our guesses, numerics are ground truth.
-pub(super) fn win32_code(error: &windows::core::Error) -> u32 {
+pub(super) const fn win32_code(error: &windows::core::Error) -> u32 {
     (error.code().0 as u32) & 0xFFFF
 }
 
@@ -157,7 +157,7 @@ pub(super) enum RenderDisposition {
 /// before rebuilding; retrying the same handle is not an option, because on
 /// 1734 the API cursor advances even when the call fails (Winlogbeat #3076) and
 /// retrying loses events.
-pub(super) fn classify_evt_next(
+pub(super) const fn classify_evt_next(
     code: u32,
     returned: u32,
     query_origin: QueryOrigin,
@@ -213,7 +213,7 @@ pub(super) fn classify_evt_next(
 }
 
 /// Classify an `EvtSubscribe` failure.
-pub(super) fn classify_subscribe(code: u32, query_origin: QueryOrigin) -> SubscribeOutcome {
+pub(super) const fn classify_subscribe(code: u32, query_origin: QueryOrigin) -> SubscribeOutcome {
     match code {
         c if c == ERROR_EVT_INVALID_CHANNEL_PATH.0 => {
             SubscribeOutcome::SkipChannel(SkipReason::InvalidChannelPath)
@@ -252,7 +252,7 @@ pub(super) fn classify_subscribe(code: u32, query_origin: QueryOrigin) -> Subscr
 ///
 /// Purely descriptive: no behavior keys off it. Returning `None` for an unknown
 /// code is correct and expected, since unknown codes still rebuild.
-pub(super) fn describe(code: u32) -> Option<&'static str> {
+pub(super) const fn describe(code: u32) -> Option<&'static str> {
     Some(match code {
         c if c == ERROR_ACCESS_DENIED.0 => "ERROR_ACCESS_DENIED",
         c if c == ERROR_INVALID_HANDLE.0 => "ERROR_INVALID_HANDLE",
@@ -285,7 +285,7 @@ pub(super) fn describe(code: u32) -> Option<&'static str> {
 ///
 /// Kept next to the drain classifier so the contrast is visible: same numbers,
 /// different call site, different and strictly narrower set of outcomes.
-pub(super) fn classify_render(code: u32) -> RenderDisposition {
+pub(super) const fn classify_render(code: u32) -> RenderDisposition {
     use windows::Win32::Foundation::{
         ERROR_EVT_MAX_INSERTS_REACHED, ERROR_EVT_UNRESOLVED_PARAMETER_INSERT,
         ERROR_EVT_UNRESOLVED_VALUE_INSERT, ERROR_INSUFFICIENT_BUFFER,

@@ -55,7 +55,7 @@ fn lookup_sid(sid_string: &str) -> Option<String> {
     let mut domain_len: u32 = 0;
     let mut sid_type = SID_NAME_USE::default();
 
-    let _ = unsafe {
+    _ = unsafe {
         LookupAccountSidW(
             None,
             psid,
@@ -69,7 +69,7 @@ fn lookup_sid(sid_string: &str) -> Option<String> {
 
     if name_len == 0 {
         unsafe {
-            let _ = LocalFree(HLOCAL(psid.0));
+            _ = LocalFree(HLOCAL(psid.0));
         }
         return None;
     }
@@ -92,7 +92,7 @@ fn lookup_sid(sid_string: &str) -> Option<String> {
 
     // Free the PSID allocated by ConvertStringSidToSidW
     unsafe {
-        let _ = LocalFree(HLOCAL(psid.0));
+        _ = LocalFree(HLOCAL(psid.0));
     }
 
     if result.is_err() {

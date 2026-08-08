@@ -134,7 +134,7 @@ impl BookmarkManager {
 
             // First call with null buffer to get required size
             // ERROR_INSUFFICIENT_BUFFER (122 / 0x7A) is expected
-            let _ = EvtRender(
+            _ = EvtRender(
                 None,
                 self.handle,
                 EvtRenderBookmark.0,
@@ -215,7 +215,7 @@ impl BookmarkManager {
             let mut property_count: u32 = 0;
 
             // First call with null buffer to get required size (ERROR_INSUFFICIENT_BUFFER expected)
-            let _ = EvtRender(
+            _ = EvtRender(
                 None,
                 handle,
                 EvtRenderBookmark.0,
@@ -265,7 +265,7 @@ impl BookmarkManager {
     fn close(&mut self) {
         if self.handle.0 != 0 {
             unsafe {
-                let _ = EvtClose(self.handle);
+                _ = EvtClose(self.handle);
                 debug!(message = "Closed bookmark handle.", handle = ?self.handle);
                 self.handle = EVT_HANDLE(0);
             }
