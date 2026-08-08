@@ -22,6 +22,11 @@ cfg_if::cfg_if! {
         mod rendering_info;
         mod sid_resolver;
         mod subscription;
+        /// Exclusive access to the process-global fault-injection seams. Any
+        /// test that installs a seam or creates a subscription must hold a
+        /// `SeamSession`; the requirement is enforced, not documented.
+        #[cfg(test)]
+        mod test_seams;
         mod win32_errors;
         mod xml_parser;
 
@@ -167,6 +172,7 @@ impl Finalizer {
 /// Both the `EventsAvailable` path and the speculative-timeout path share this
 /// logic. Returns `true` if the downstream pipeline closed and the caller
 /// should break out of the main event loop.
+#[allow(clippy::too_many_arguments)]
 async fn process_event_batch(
     events: Vec<WindowsEvent>,
     parser: &EventLogParser,
@@ -365,9 +371,9 @@ impl WindowsEventLogSource {
             unsafe {
                 let handle =
                     windows::Win32::Foundation::HANDLE(watcher_handle_raw as *mut std::ffi::c_void);
-                let _ = windows::Win32::System::Threading::SetEvent(handle);
+                _ = windows::Win32::System::Threading::SetEvent(handle);
                 if watcher_owns_handle {
-                    let _ = windows::Win32::Foundation::CloseHandle(handle);
+                    _ = windows::Win32::Foundation::CloseHandle(handle);
                 }
             }
         });
