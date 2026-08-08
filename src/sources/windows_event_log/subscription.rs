@@ -1677,6 +1677,13 @@ impl EventLogSubscription {
         }
     }
 
+    /// Test-only: whether the first channel's ladder is on a time rung, i.e.
+    /// the next resume is a time query rather than a bookmark.
+    #[cfg(test)]
+    pub(super) fn first_channel_resumes_by_time(&self) -> bool {
+        matches!(self.channels[0].resume.rung, Rung::TimeAdvance(_))
+    }
+
     /// Test-only: whether the first channel currently has a live subscription.
     #[cfg(test)]
     pub(super) fn first_channel_is_live(&self) -> bool {
@@ -3435,6 +3442,14 @@ mod tests {
                 "record {record_id} was delivered twice within one drain"
             );
         }
+        // Rule 2, on real record numbers rather than injected ones: the API
+        // hands events back in record order and the source preserves it.
+        // Record order is the ONLY order the source may rely on, because the
+        // times in this very backlog are not sorted.
+        assert!(
+            delivered.windows(2).all(|pair| pair[0] < pair[1]),
+            "EvtNext delivers in record order and the source must preserve it"
+        );
         // Equality, on a healthy host with no injected render failure and no
         // armed poison skip: rules 5 and 6 are the only subtractions and
         // neither is in play here, so rule 7 leaves nothing else to subtract.
@@ -3610,11 +3625,19 @@ mod tests {
         }
         assert!(subscription.first_channel_is_live());
 
-        let delivered = drain_all(&mut subscription);
+        let (delivered, warns) = warn_band_error_types(|| drain_all(&mut subscription));
         assert!(
             !delivered.contains(&poisoned),
             "record {poisoned} sat immediately past the resume boundary on the \
              skip rung and had to be dropped; the escape did nothing"
+        );
+        // Rule 6: deliberate loss of a real event is never silent.
+        assert!(
+            warns
+                .iter()
+                .any(|(level, kind)| level == "WARN" && kind == "poison_record_skipped"),
+            "the skip discards a real event, so it must be announced at WARN: \
+             {warns:#?}"
         );
         assert!(
             delivered.contains(&next_good),
@@ -4842,6 +4865,130 @@ mod tests {
             &timeline,
             &request_log,
             &warns,
+        );
+    }
+
+    /// Rule 12: a first start is normal operation and says nothing.
+    ///
+    /// The default is `read_existing_events = false`, so a fresh install reads
+    /// only new events. That is a configuration choice, not data loss, and an
+    /// earlier draft of the contract described it as though it were the
+    /// terminal recovery rung. Nothing above DEBUG may be emitted.
+    #[tokio::test]
+    async fn a_first_start_with_no_stored_position_is_quiet() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let _seams = SeamSession::acquire();
+        assert!(
+            !WindowsEventLogConfig::default().read_existing_events,
+            "rule 11 calls this the default; if it changes, the rule changes"
+        );
+        let mut config = application_config();
+        config.read_existing_events = false;
+
+        let capture = ErrorTypeCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
+        // `set_default` rather than `with_default`: the subscription is built
+        // across an await, and the guard has to span it.
+        let guard = tracing::subscriber::set_default(collector);
+        let mut subscription = subscription_from(&config).await;
+        _ = subscription.pull_events(usize::MAX);
+        drop(guard);
+
+        let warns = capture.seen.lock().unwrap().clone();
+        assert!(
+            warns.is_empty(),
+            "a first start on a channel with no stored position is ordinary \
+             operation and must produce no warn-band line: {warns:#?}"
+        );
+    }
+
+    /// Rules 21 and 24: a time rung cannot compose onto an operator query, so
+    /// the source re-reads the channel from the OLDEST record.
+    ///
+    /// That is a large duplicate burst, and it is a deliberate choice: the
+    /// alternative is intersecting two XPaths, which is not reliably
+    /// expressible, and the failure mode of guessing wrong is loss. The
+    /// subscribe flag word is the only place this is observable, so it is
+    /// asserted directly.
+    #[tokio::test]
+    async fn a_time_rung_under_an_operator_query_rereads_from_the_oldest_record() {
+        let _seams = SeamSession::acquire();
+        let mut config = application_config();
+        // Matches essentially every event, so a stored position is reachable,
+        // and is not the wildcard base a generated predicate can compose onto.
+        config.event_query = Some("*[System[Level<=5]]".to_string());
+        let mut subscription = subscription_from(&config).await;
+        assert!(
+            !subscription.pull_events(5).unwrap_or_default().is_empty(),
+            "a stored position is the premise: the operator query must match \
+             something on this host"
+        );
+
+        // Kill the bookmark: the ladder moves to the boundary-tick time rung.
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
+            subscription.force_rebuild_all();
+        }
+        assert!(
+            subscription.first_channel_resumes_by_time(),
+            "the premise is the time rung"
+        );
+
+        let flag_log = FlagLog::install(&_seams);
+        subscription.force_rebuild_all();
+        assert_eq!(
+            flag_log.flags(),
+            vec![EvtSubscribeStartAtOldestRecord.0],
+            "with an operator query the time predicate cannot be composed, so \
+             the resume restarts at the oldest record and re-delivers the \
+             channel. Duplicates are acceptable; a silently filtered resume \
+             would not be"
+        );
+    }
+
+    /// Rules 23 and 25: the boundary-tick rung re-reads a millisecond and loses
+    /// nothing.
+    ///
+    /// It is the only lossless rung, and it is lossless BECAUSE it over-reads:
+    /// the XPath floors to the millisecond, so events already sent can come
+    /// back. Trimming that overlap is exactly what the deleted admission gate
+    /// did, and what cost real events.
+    #[tokio::test]
+    async fn the_boundary_tick_rung_loses_no_records() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+
+        let first: Vec<u64> = subscription
+            .pull_events(50)
+            .unwrap_or_default()
+            .iter()
+            .map(|event| event.record_id)
+            .collect();
+        assert_eq!(first.len(), 50, "this test resumes mid-backlog");
+
+        // Bookmark death: the ladder takes the time rung, floored to the
+        // millisecond of the last event sent.
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
+            subscription.force_rebuild_all();
+        }
+        assert!(
+            subscription.first_channel_resumes_by_time(),
+            "the premise is the time rung, not another bookmark resume"
+        );
+
+        let after = drain_all(&mut subscription);
+        let seen: std::collections::HashSet<u64> =
+            first.iter().chain(after.iter()).copied().collect();
+        let last = seen.iter().copied().max().expect("records were delivered");
+        let missing: Vec<u64> = (first[0]..=last).filter(|id| !seen.contains(id)).collect();
+        assert!(
+            missing.is_empty(),
+            "the boundary-tick rung must lose nothing between the last event \
+             sent and the resume. {} records went missing, first ten {:?}",
+            missing.len(),
+            missing.iter().take(10).collect::<Vec<_>>()
         );
     }
 }
