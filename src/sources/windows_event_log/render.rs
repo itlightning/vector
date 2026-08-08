@@ -13,6 +13,35 @@ use windows::core::HSTRING;
 use super::error::WindowsEventLogError;
 use super::win32_errors::{RenderDisposition, classify_render, win32_code};
 
+/// Test-only rewrite of the rendered XML, applied to the string this function
+/// is about to return.
+///
+/// This supplies an INPUT, not a decision. Everything downstream that cares
+/// about `<RenderingInfo>` derives it by parsing this XML, so injecting an
+/// event whose XML carries the element exercises the real derivation. A WEC
+/// forwarding pair is the only way to obtain such an event from the API, and
+/// setting the derived flag directly would assert the seam instead.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(super) static RENDER_XML_REWRITE: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(String) -> String + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+/// Apply the test-only rewrite, if one is installed.
+#[cfg(test)]
+fn rewrite_xml(xml: String) -> String {
+    let rewrite = RENDER_XML_REWRITE.lock().unwrap().clone();
+    match rewrite {
+        Some(f) => f(xml),
+        None => xml,
+    }
+}
+
+#[cfg(not(test))]
+const fn rewrite_xml(xml: String) -> String {
+    xml
+}
+
 /// Render an event handle to XML using reusable buffers.
 pub(super) fn render_event_xml(
     render_buffer: &mut Vec<u8>,
@@ -88,7 +117,7 @@ pub(super) fn render_event_xml(
                 render_buffer.shrink_to_fit();
             }
 
-            return Ok(result);
+            return Ok(rewrite_xml(result));
         }
         return Err(WindowsEventLogError::ReadEventError { source: e });
     }
@@ -103,7 +132,7 @@ pub(super) fn render_event_xml(
         render_buffer.shrink_to_fit();
     }
 
-    Ok(result)
+    Ok(rewrite_xml(result))
 }
 
 /// Update the channel record count gauge using EvtGetLogInfo.
