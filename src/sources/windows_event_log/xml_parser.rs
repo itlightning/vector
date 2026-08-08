@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use metrics::counter;
 use quick_xml::{Reader, events::Event as XmlEvent};
+use vector_lib::{counter, internal_event::CounterName};
 
 use super::config::WindowsEventLogConfig;
 use super::error::*;
@@ -229,12 +229,12 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
                 }
             }
             Ok(XmlEvent::Text(ref e)) => {
-                if in_system && text_target != TextTarget::None {
-                    if let Ok(text) = e.unescape() {
-                        if text_buf.len() + text.len() <= 4096 {
-                            text_buf.push_str(&text);
-                        }
-                    }
+                if in_system
+                    && text_target != TextTarget::None
+                    && let Ok(text) = e.unescape()
+                    && text_buf.len() + text.len() <= 4096
+                {
+                    text_buf.push_str(&text);
                 }
             }
             Ok(XmlEvent::End(ref e)) => {
@@ -242,11 +242,11 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
                 let local = local.as_ref();
                 if local == b"System" {
                     // Commit any pending text before exiting
-                    commit_text(&text_target, &text_buf, &mut fields);
+                    commit_text(text_target, &text_buf, &mut fields);
                     break;
                 }
                 if in_system && text_target != TextTarget::None {
-                    commit_text(&text_target, &text_buf, &mut fields);
+                    commit_text(text_target, &text_buf, &mut fields);
                     text_target = TextTarget::None;
                     text_buf.clear();
                 }
@@ -263,7 +263,7 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
 }
 
 /// Commit collected element text into the appropriate SystemFields field.
-fn commit_text(target: &TextTarget, text: &str, fields: &mut SystemFields) {
+fn commit_text(target: TextTarget, text: &str, fields: &mut SystemFields) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -380,13 +380,13 @@ pub fn build_event(
     if let Some(ref only_ids) = config.only_event_ids
         && !only_ids.contains(&event_id)
     {
-        counter!("windows_event_log_events_filtered_total", "reason" => "event_id_not_in_only_list")
+        counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_not_in_only_list")
             .increment(1);
         return Ok(None);
     }
 
     if config.ignore_event_ids.contains(&event_id) {
-        counter!("windows_event_log_events_filtered_total", "reason" => "event_id_ignored")
+        counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_ignored")
             .increment(1);
         return Ok(None);
     }
@@ -420,7 +420,7 @@ pub fn build_event(
     if let Some(max_age_secs) = config.max_event_age_secs {
         let age = Utc::now().signed_duration_since(time_created);
         if age.num_seconds() > max_age_secs as i64 {
-            counter!("windows_event_log_events_filtered_total", "reason" => "max_age_exceeded")
+            counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "max_age_exceeded")
                 .increment(1);
             return Ok(None);
         }

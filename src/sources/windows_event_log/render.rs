@@ -177,7 +177,7 @@ pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
     };
 
     unsafe {
-        let _ = EvtClose(log_handle);
+        _ = EvtClose(log_handle);
     }
 
     if result.is_ok() {
@@ -197,7 +197,7 @@ fn decode_utf16_buffer(buffer: &[u8], bytes_used: u32, decode_buf: &mut Vec<u16>
     if bytes_used == 0 || bytes_used as usize > buffer.len() {
         return String::new();
     }
-    if bytes_used < 2 || bytes_used % 2 != 0 {
+    if bytes_used < 2 || !bytes_used.is_multiple_of(2) {
         return String::new();
     }
 

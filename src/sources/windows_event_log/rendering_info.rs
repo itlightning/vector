@@ -109,11 +109,9 @@ pub(super) fn parse(xml: &str) -> Option<RenderingInfoFields> {
                     };
                 }
             }
-            Ok(XmlEvent::Empty(ref e)) => {
-                // A self-closing <RenderingInfo/> still means rendered delivery.
-                if e.name().local_name().as_ref() == b"RenderingInfo" {
-                    present = true;
-                }
+            // A self-closing <RenderingInfo/> still means rendered delivery.
+            Ok(XmlEvent::Empty(ref e)) if e.name().local_name().as_ref() == b"RenderingInfo" => {
+                present = true;
             }
             Ok(XmlEvent::Text(ref e)) => {
                 if in_rendering_info

@@ -241,14 +241,14 @@ impl ResumeState {
     }
 
     /// Record a successfully processed event.
-    pub(super) fn observe_event(&mut self, time: DateTime<Utc>, record_id: u64) {
+    pub(super) const fn observe_event(&mut self, time: DateTime<Utc>, record_id: u64) {
         self.last_event_time = Some(time);
         self.last_record_id = Some(record_id);
     }
 
     /// A batch read cleanly. Reset the ladder and the stuck detector so a
     /// transient cause never leaves a channel permanently coarse or slow.
-    pub(super) fn observe_clean_read(&mut self) {
+    pub(super) const fn observe_clean_read(&mut self) {
         self.rung = Rung::Bookmark;
         self.skip_next_record = false;
         self.stuck_position = None;
@@ -322,7 +322,7 @@ impl ResumeState {
     /// time rung, or future-events-only when there is no stored time to fall
     /// back to (D16: that rung is deliberate loss of the whole backlog and its
     /// caller emits ERROR).
-    pub(super) fn bookmark_dead(&mut self) -> Rung {
+    pub(super) const fn bookmark_dead(&mut self) -> Rung {
         self.stuck_count = 0;
         self.skip_next_record = false;
         self.rung = if self.last_event_time.is_some() {
@@ -535,7 +535,7 @@ pub(super) struct GapDetection {
 }
 
 /// Evaluate one event's record id against the previous one.
-pub(super) fn evaluate_gap(
+pub(super) const fn evaluate_gap(
     previous: Option<u64>,
     current: u64,
     detection: GapDetection,
