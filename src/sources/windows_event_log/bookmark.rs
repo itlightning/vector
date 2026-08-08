@@ -88,6 +88,19 @@ impl BookmarkManager {
     ///
     /// Returns an error if the Windows API fails to update the bookmark.
     pub fn update(&mut self, event_handle: EVT_HANDLE) -> Result<(), WindowsEventLogError> {
+        // Test-only fault injection. A real mid-batch bookmark failure is not
+        // producible on demand, and the behavior under test (close the current
+        // handle and every remaining handle in the batch, exactly once, then
+        // leave the drain early) is handle accounting that cannot be asserted
+        // any other way.
+        #[cfg(test)]
+        if super::subscription::FAIL_ALL_BOOKMARK_UPDATES.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(WindowsEventLogError::SubscriptionError {
+                source: windows::core::Error::from_hresult(windows::core::HRESULT(6)),
+            });
+        }
+
         unsafe {
             EvtUpdateBookmark(self.handle, event_handle).map_err(|e| {
                 error!(message = "Failed to update bookmark.", error = %e);

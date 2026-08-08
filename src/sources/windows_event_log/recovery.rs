@@ -955,4 +955,154 @@ mod tests {
         assert!(Rung::TimeAdvance(TimeRung::OneSecond).is_deliberate_skip());
         assert!(Rung::FutureOnly.is_deliberate_skip());
     }
+
+    /// A time rung resumes AFTER the last good event, never before it.
+    ///
+    /// The only existing `time_floor` test sits on the `Bookmark` rung, where
+    /// the advance is `Duration::ZERO` and the direction of the arithmetic is
+    /// unobservable. Flipping the sign on a busy channel is not a small error:
+    /// it re-delivers everything back to the start of the window, on the exact
+    /// rung that only ever fires because the bookmark already failed.
+    #[test]
+    fn a_time_rung_moves_the_floor_forward_not_backward() {
+        let base = ts(1_700_000_000, 0);
+
+        for (rung, expected_advance) in [
+            (TimeRung::BoundaryTick, Duration::from_nanos(100)),
+            (TimeRung::OneSecond, Duration::from_secs(1)),
+            (TimeRung::TenSeconds, Duration::from_secs(10)),
+            (TimeRung::OneMinute, Duration::from_secs(60)),
+            (TimeRung::FiveMinutes, Duration::from_secs(300)),
+            (TimeRung::ThirtyMinutes, Duration::from_secs(1800)),
+        ] {
+            let mut resume = ResumeState::new(true);
+            resume.observe_event(base, 1);
+            resume.rung = Rung::TimeAdvance(rung);
+
+            let floor = resume.time_floor().unwrap();
+            assert!(
+                floor >= base,
+                "{rung:?} resumed BEFORE the last good event ({floor} < {base}); \
+                 that is mass re-delivery, not an escape"
+            );
+            // Floored to the millisecond, so the boundary tick lands exactly on
+            // the base and every other rung lands its full window ahead.
+            let expected = base + chrono::Duration::from_std(expected_advance).unwrap()
+                - chrono::Duration::nanoseconds(i64::from(
+                    expected_advance.subsec_nanos() % 1_000_000,
+                ));
+            assert_eq!(floor, expected, "wrong window width for {rung:?}");
+        }
+    }
+
+    /// D23: marking record identity unusable must actually change the ladder's
+    /// choice. The existing coverage constructs the unusable state directly via
+    /// `ResumeState::new(false)`, so the setter itself could do nothing and the
+    /// whole forwarded-channel mechanism would silently be a no-op.
+    #[test]
+    fn marking_record_identity_unusable_takes_the_skip_rung_off_the_table() {
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(ts(1_700_000_000, 0), 7);
+        resume.mark_record_identity_unusable();
+
+        assert_eq!(resume.advance_rung(), Rung::IsolateOne);
+        assert_eq!(
+            resume.advance_rung(),
+            Rung::TimeAdvance(TimeRung::BoundaryTick),
+            "forwarded record ids interleave from many machines, so a \
+             single-record skip is not expressible and the ladder must go \
+             straight to time windows"
+        );
+        assert!(
+            !resume.skip_next_record,
+            "no record skip may be armed on a channel whose record ids mean nothing"
+        );
+    }
+
+    /// `restore` is the OTHER recovery path, and it is the one the poison escape
+    /// uses. Without it a channel that escaped a poison record stays at a batch
+    /// size of one forever, which is a permanent throughput cap applied for a
+    /// problem that is already over.
+    #[test]
+    fn restore_returns_to_the_configured_size_in_one_step() {
+        let mut batch = BatchAdaptation::new(100);
+        batch.isolate();
+        assert_eq!(batch.current(), 1);
+
+        batch.restore();
+        assert_eq!(
+            batch.current(),
+            100,
+            "an escape's batch reduction is not a size problem, so a clean read \
+             ends it outright rather than gradually"
+        );
+    }
+
+    /// The `resumed_from` and `rung` log fields are the structured values the
+    /// source pack keys on (4.5). A wrong or empty one costs attribution on
+    /// exactly the messages an operator reads during an outage.
+    #[test]
+    fn log_field_labels_are_the_exact_strings_the_pack_keys_on() {
+        assert_eq!(ResumedFrom::Bookmark.as_str(), "bookmark");
+        assert_eq!(ResumedFrom::TimeFallback.as_str(), "time_fallback");
+        assert_eq!(ResumedFrom::FutureOnly.as_str(), "future_only");
+
+        assert_eq!(TimeRung::BoundaryTick.as_str(), "boundary_tick");
+        assert_eq!(TimeRung::OneSecond.as_str(), "+1s");
+        assert_eq!(TimeRung::TenSeconds.as_str(), "+10s");
+        assert_eq!(TimeRung::OneMinute.as_str(), "+60s");
+        assert_eq!(TimeRung::FiveMinutes.as_str(), "+5m");
+        assert_eq!(TimeRung::ThirtyMinutes.as_str(), "+30m");
+
+        assert_eq!(Rung::Bookmark.as_str(), "bookmark");
+        assert_eq!(Rung::IsolateOne.as_str(), "isolate_one");
+        assert_eq!(Rung::SkipRecord.as_str(), "skip_record");
+        assert_eq!(Rung::FutureOnly.as_str(), "future_only");
+        assert_eq!(Rung::TimeAdvance(TimeRung::OneMinute).as_str(), "+60s");
+    }
+
+    /// D27's jitter has to keep varying. A PRNG that degenerates to a fixed
+    /// point still produces a legal-looking delay, so the channel-decorrelation
+    /// test above passes while every channel is once again perfectly in step
+    /// with itself.
+    #[test]
+    fn jitter_keeps_varying_at_a_fixed_attempt() {
+        let mut backoff = Backoff::new(jitter_seed("Application"));
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            delays.push(backoff.next_delay());
+            backoff.reset();
+        }
+
+        assert!(
+            delays.windows(2).any(|pair| pair[0] != pair[1]),
+            "every delay at attempt 0 was identical ({delays:?}); the jitter \
+             state has collapsed to a fixed point"
+        );
+    }
+
+    /// Jitter only ever SUBTRACTS, and never more than a quarter. A jitter term
+    /// that can exceed the delay turns the backoff into no backoff at all,
+    /// which is the retry storm the whole mechanism exists to prevent.
+    #[test]
+    fn jitter_never_takes_more_than_a_quarter_of_the_delay() {
+        for channel in ["Application", "System", "Setup", "Security"] {
+            let mut backoff = Backoff::new(jitter_seed(channel));
+            for attempt in 0..10u32 {
+                let raw = BACKOFF_BASE
+                    .saturating_mul(1u32 << attempt.min(6))
+                    .min(BACKOFF_CAP);
+                let delay = backoff.next_delay();
+                assert!(
+                    delay >= raw.mul_f64(0.75),
+                    "{channel} attempt {attempt}: delay {delay:?} fell below 75% \
+                     of {raw:?}; jitter must reduce by at most a quarter"
+                );
+                assert!(
+                    delay <= raw,
+                    "{channel} attempt {attempt}: jitter added time"
+                );
+            }
+        }
+    }
 }
