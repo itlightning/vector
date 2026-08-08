@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -24,19 +24,32 @@ use super::xml_parser::SystemFields;
 pub(super) mod seam {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::test_seams::SeamSession;
+
     pub(crate) static FORMAT_MESSAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
     pub(crate) static PUBLISHER_PATH_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 
+    /// Reset both counters. Called by `SeamSession` on acquire and on drop, so
+    /// it deliberately does NOT assert the session is held: it runs while the
+    /// session is being established and while it is being torn down.
     pub(crate) fn reset() {
         FORMAT_MESSAGE_CALLS.store(0, Ordering::SeqCst);
         PUBLISHER_PATH_ENTRIES.store(0, Ordering::SeqCst);
     }
 
-    pub(crate) fn format_message_calls() -> usize {
+    /// These counters are process globals, so a reader without the session can
+    /// observe another test's renders. Taking `&SeamSession` makes that a
+    /// COMPILE error rather than a runtime one, matching the seam installers.
+    ///
+    /// `EventLogSubscription::new` has to assert at runtime instead, because it
+    /// is production code and cannot take a test-only parameter. These are
+    /// `cfg(test)` only, so they can do better.
+    pub(crate) fn format_message_calls(_seams: &SeamSession) -> usize {
         FORMAT_MESSAGE_CALLS.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn publisher_path_entries() -> usize {
+    /// Compile-time session requirement, see [`format_message_calls`].
+    pub(crate) fn publisher_path_entries(_seams: &SeamSession) -> usize {
         PUBLISHER_PATH_ENTRIES.load(Ordering::SeqCst)
     }
 }
@@ -257,8 +270,8 @@ fn cached_format(
 ) -> Option<String> {
     let inner_key = (flag, field_value);
 
-    // Fast path: borrowed &str lookup on outer HashMap — zero allocation.
-    // peek() intentionally skips LRU promotion — get() requires &mut which
+    // Fast path: borrowed &str lookup on outer HashMap â€” zero allocation.
+    // peek() intentionally skips LRU promotion â€” get() requires &mut which
     // would need get_mut() on the outer HashMap. The put() on every miss
     // already handles insertion/promotion, so peek is correct here.
     if let Some(inner) = cache.get(provider)
@@ -415,7 +428,7 @@ mod tests {
         // The counters below are process-global, and a concurrent test that
         // renders a real event would inflate them. The session both excludes
         // that test and hands these counters over reset.
-        let _seams = super::super::test_seams::SeamSession::acquire();
+        let seams = super::super::test_seams::SeamSession::acquire();
 
         let (mut publisher_cache, mut format_cache) = empty_caches();
         let hits = metrics::counter!("test_cache_hits");
@@ -439,12 +452,12 @@ mod tests {
         );
 
         assert_eq!(
-            seam::format_message_calls(),
+            seam::format_message_calls(&seams),
             0,
             "an event carrying <RenderingInfo> must never reach EvtFormatMessage"
         );
         assert_eq!(
-            seam::publisher_path_entries(),
+            seam::publisher_path_entries(&seams),
             0,
             "an event carrying <RenderingInfo> must never open publisher metadata"
         );
@@ -479,7 +492,7 @@ mod tests {
     /// task/opcode/keyword names.
     #[test]
     fn rendering_info_respects_render_message_disabled() {
-        let _seams = super::super::test_seams::SeamSession::acquire();
+        let seams = super::super::test_seams::SeamSession::acquire();
 
         let (mut publisher_cache, mut format_cache) = empty_caches();
         let hits = metrics::counter!("test_cache_hits");
@@ -497,7 +510,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(seam::format_message_calls(), 0);
+        assert_eq!(seam::format_message_calls(&seams), 0);
         assert!(display.rendered_message.is_none());
         assert_eq!(display.task_name.as_deref(), Some("Service state change"));
     }
