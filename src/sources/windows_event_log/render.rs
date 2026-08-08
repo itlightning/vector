@@ -108,10 +108,22 @@ pub(super) fn render_event_xml(
 
 /// Update the channel record count gauge using EvtGetLogInfo.
 ///
+/// Test-only count of `update_channel_records` calls.
+///
+/// The whole point of the speculative-pull flag is to avoid steady
+/// `EvtOpenLog`/`EvtGetLogInfo` churn on an idle host, so "was the metadata
+/// query issued" IS the contract, and a gauge write is not observable.
+#[cfg(test)]
+pub(super) static CHANNEL_RECORDS_UPDATES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Reports total records in the channel. SOC teams compare this against
 /// `rate(events_read_total)` to detect ingestion lag.
 /// Best-effort: if any API call fails, the gauge is left unchanged.
 pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
+    #[cfg(test)]
+    CHANNEL_RECORDS_UPDATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let channel_hstring = HSTRING::from(channel);
     let log_handle = unsafe {
         // EvtOpenChannelPath = 1

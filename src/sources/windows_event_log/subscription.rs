@@ -127,6 +127,38 @@ pub(super) static EVT_SUBSCRIBE_SCRIPT: std::sync::Mutex<Option<std::collections
 pub(super) static FAIL_ALL_RENDERS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only: force `BookmarkManager::update` to fail, so the mid-batch
+/// bookmark-failure path can be exercised. That path's contract is that it
+/// closes the current handle AND every remaining handle in the batch exactly
+/// once, which is only assertable if the failure can be produced on demand.
+#[cfg(test)]
+pub(super) static FAIL_ALL_BOOKMARK_UPDATES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only record of the batch size requested from each `EvtNext` call, as
+/// `(channel, requested)`.
+///
+/// The batch ladder (D11) is only meaningful as what we ASK the API for next, so
+/// this is the observable the adaptation tests assert on. Asserting the internal
+/// counter instead is exactly the failure mode section 10.4 of the plan
+/// describes. It doubles as the round-robin observable: the channel order across
+/// calls is visible here and nowhere else.
+#[cfg(test)]
+pub(super) static EVT_NEXT_REQUESTS: std::sync::Mutex<Option<Vec<(String, usize)>>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only record of the flags passed to each `EvtSubscribe` call.
+///
+/// `EvtSubscribeStrict` is D20 and load-bearing: without it Windows silently
+/// repositions on a dead bookmark and silent data loss presents as a healthy
+/// subscription. Nothing else in the system can observe that a flag was dropped,
+/// so the exact argument is recorded and asserted. The length also counts
+/// subscribe ATTEMPTS, which is how the refresh and backoff schedules are
+/// asserted without reading a timer field.
+#[cfg(test)]
+pub(super) static EVT_SUBSCRIBE_FLAG_LOG: std::sync::Mutex<Option<Vec<u32>>> =
+    std::sync::Mutex::new(None);
+
 /// Why a rebuild is happening, which decides what a failure is allowed to cost.
 ///
 /// The distinction is the whole of D22: rebuilding a channel that is already
@@ -222,6 +254,14 @@ impl SubscriptionFactory {
         } else {
             EvtSubscribeToFutureEvents.0
         };
+
+        // Test-only: record the exact flag word. A mutation that drops
+        // EvtSubscribeStrict changes nothing else that any other assertion can
+        // see, which is precisely why it needs its own observable.
+        #[cfg(test)]
+        if let Some(log) = EVT_SUBSCRIBE_FLAG_LOG.lock().unwrap().as_mut() {
+            log.push(flags);
+        }
 
         let result = unsafe {
             EvtSubscribe(
@@ -1098,6 +1138,13 @@ impl EventLogSubscription {
                     break;
                 };
 
+                // Test-only: the batch size we are ASKING for is the observable
+                // the adaptation ladder is asserted on.
+                #[cfg(test)]
+                if let Some(log) = EVT_NEXT_REQUESTS.lock().unwrap().as_mut() {
+                    log.push((channel_sub.channel.clone(), event_handles.len()));
+                }
+
                 let result = unsafe { EvtNext(handle, &mut event_handles, 0, 0, &mut returned) };
 
                 // Test-only fault injection: replaces the API result with a
@@ -1111,15 +1158,27 @@ impl EventLogSubscription {
                         .as_mut()
                         .and_then(std::collections::VecDeque::pop_front);
                     match scripted {
-                        Some((0, count)) => {
-                            returned = count.min(event_handles.len() as u32);
-                            Ok(())
-                        }
                         Some((code, count)) => {
+                            // The real call already ran and may have populated
+                            // handles. Close them and hand the drain loop a
+                            // synthetic buffer: injection must never leak a
+                            // handle, and it must never silently swallow a real
+                            // batch either. The bookmark has not advanced, so a
+                            // rebuild re-reads exactly these events, which is
+                            // what makes the exactly-once assertion across an
+                            // injected fault mean something.
+                            for &raw in &event_handles[..returned as usize] {
+                                close_event_handle(EVT_HANDLE(raw));
+                            }
+                            event_handles.fill(0);
                             returned = count.min(event_handles.len() as u32);
-                            Err(windows::core::Error::from_hresult(windows::core::HRESULT(
-                                code as i32,
-                            )))
+                            if code == 0 {
+                                Ok(())
+                            } else {
+                                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                                    code as i32,
+                                )))
+                            }
                         }
                         None => result,
                     }
@@ -1555,6 +1614,35 @@ impl EventLogSubscription {
     #[cfg(test)]
     pub(super) fn first_channel_event_handle_closes(&self) -> i64 {
         self.channels[0].event_handle_closes
+    }
+
+    /// Test-only: the names of the channels that are currently readable, in
+    /// declaration order.
+    ///
+    /// Round-robin fairness is a statement about which channels get drained in
+    /// what order, and a channel that could not be opened on this host is
+    /// legitimately absent from that order.
+    #[cfg(test)]
+    pub(super) fn live_channel_names(&self) -> Vec<String> {
+        self.channels
+            .iter()
+            .filter(|c| c.is_live())
+            .map(|c| c.channel.clone())
+            .collect()
+    }
+
+    /// Test-only: would a record-id gap on the first channel still be REPORTED?
+    ///
+    /// This is a decision, not a field: forwarded rendered-text delivery marks a
+    /// channel's record ids as untrustworthy and self-disables gap detection
+    /// (D23), and the only way that decision shows up anywhere is in the verdict
+    /// `evaluate_gap` returns.
+    #[cfg(test)]
+    pub(super) fn first_channel_reports_record_id_gaps(&self) -> bool {
+        matches!(
+            evaluate_gap(Some(1), 5, self.channels[0].gap_detection(), false),
+            GapVerdict::Gap { .. }
+        )
     }
 
     /// Returns a reference to the rate limiter, if configured.
@@ -2659,6 +2747,984 @@ mod tests {
             assert!(
                 !first.contains(record_id),
                 "record {record_id} was delivered twice across a rebuild"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Behavioral coverage for the drain loop's own decisions.
+    //
+    // A mutation run over this file showed the loop was driven shallowly: error
+    // ROUTING was asserted, the loop's internal decisions were not. Everything
+    // below asserts an observable outcome (what batch size is requested next,
+    // which channel is drained next, what flag word reaches the API, what is
+    // delivered), never a field the implementation happens to set. That
+    // distinction is section 10.4 of the plan and it is why these tests are
+    // phrased the way they are.
+    // ---------------------------------------------------------------------
+
+    /// Records the batch size asked of each `EvtNext` call.
+    struct RequestLog;
+
+    impl RequestLog {
+        fn install() -> Self {
+            *EVT_NEXT_REQUESTS.lock().unwrap() = Some(Vec::new());
+            Self
+        }
+
+        /// Requested sizes, in call order.
+        fn sizes(&self) -> Vec<usize> {
+            EVT_NEXT_REQUESTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|log| log.iter().map(|(_, size)| *size).collect())
+                .unwrap_or_default()
+        }
+
+        /// Channels drained, in call order.
+        fn channels(&self) -> Vec<String> {
+            EVT_NEXT_REQUESTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|log| log.iter().map(|(channel, _)| channel.clone()).collect())
+                .unwrap_or_default()
+        }
+
+        fn clear(&self) {
+            if let Some(log) = EVT_NEXT_REQUESTS.lock().unwrap().as_mut() {
+                log.clear();
+            }
+        }
+    }
+
+    impl Drop for RequestLog {
+        fn drop(&mut self) {
+            *EVT_NEXT_REQUESTS.lock().unwrap() = None;
+        }
+    }
+
+    /// Records the flag word passed to each `EvtSubscribe` call. Its length is
+    /// also the number of subscribe ATTEMPTS, successful or not.
+    struct FlagLog;
+
+    impl FlagLog {
+        fn install() -> Self {
+            *EVT_SUBSCRIBE_FLAG_LOG.lock().unwrap() = Some(Vec::new());
+            Self
+        }
+
+        fn flags(&self) -> Vec<u32> {
+            EVT_SUBSCRIBE_FLAG_LOG
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn attempts(&self) -> usize {
+            self.flags().len()
+        }
+    }
+
+    impl Drop for FlagLog {
+        fn drop(&mut self) {
+            *EVT_SUBSCRIBE_FLAG_LOG.lock().unwrap() = None;
+        }
+    }
+
+    /// Forces every bookmark update to fail, exercising the mid-batch
+    /// bookmark-failure path.
+    struct BookmarkFailGuard;
+
+    impl BookmarkFailGuard {
+        fn install() -> Self {
+            FAIL_ALL_BOOKMARK_UPDATES.store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for BookmarkFailGuard {
+        fn drop(&mut self) {
+            FAIL_ALL_BOOKMARK_UPDATES.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn subscription_from(config: &WindowsEventLogConfig) -> EventLogSubscription {
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+        // The checkpoint directory only has to outlive creation for these
+        // tests: none of them restart over the same checkpoint.
+        std::mem::forget(_temp_dir);
+        EventLogSubscription::new(config, checkpointer, false)
+            .await
+            .expect("subscription creation should succeed")
+    }
+
+    fn application_config() -> WindowsEventLogConfig {
+        let mut config = WindowsEventLogConfig::default();
+        config.channels = vec!["Application".to_string()];
+        config.read_existing_events = true;
+        config.event_timeout_ms = 500;
+        config
+    }
+
+    /// Read a channel until it stops producing, returning every record id in
+    /// delivery order.
+    fn drain_all(subscription: &mut EventLogSubscription) -> Vec<u64> {
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            let batch = subscription.pull_events(usize::MAX).unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
+            seen.extend(batch.iter().map(|e| e.record_id));
+        }
+        seen
+    }
+
+    // ---------------------------------------------------------------------
+    // D20: the subscribe flag word.
+    // ---------------------------------------------------------------------
+
+    /// `EvtSubscribeStrict` is the mechanism that makes a dead bookmark fail
+    /// LOUDLY instead of silently repositioning, and it is what caught the
+    /// startup bug where every channel was down. Dropping it changes nothing
+    /// any other assertion can see: the subscription still opens, still reads,
+    /// and silently loses data only on a host whose bookmark has died. So the
+    /// exact flag word is asserted here.
+    #[tokio::test]
+    #[serial]
+    async fn bookmark_resume_passes_start_after_bookmark_and_strict() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        // Position the bookmark: a fresh bookmark marks no position, and
+        // subscribing strictly against one that marks nothing is the startup
+        // bug, not the resume path.
+        let delivered = drain_all(&mut subscription);
+        assert!(
+            !delivered.is_empty(),
+            "the Application backlog must be readable, otherwise the bookmark \
+             never gets positioned and this proves nothing"
+        );
+
+        let flag_log = FlagLog::install();
+        subscription.force_rebuild_all();
+
+        assert_eq!(
+            flag_log.flags(),
+            vec![EvtSubscribeStartAfterBookmark.0 | EvtSubscribeStrict.0],
+            "a bookmark resume must subscribe with StartAfterBookmark AND Strict"
+        );
+        assert_ne!(
+            flag_log.flags()[0] & EvtSubscribeStrict.0,
+            0,
+            "EvtSubscribeStrict must be set: without it Windows silently \
+             repositions on a dead bookmark and data loss presents as a healthy \
+             subscription (D20)"
+        );
+    }
+
+    /// The other two resume modes carry exactly their own flag and nothing else.
+    #[tokio::test]
+    #[serial]
+    async fn oldest_and_future_only_resume_modes_pass_their_exact_flag() {
+        {
+            let flag_log = FlagLog::install();
+            let _subscription = subscription_from(&application_config()).await;
+            assert_eq!(
+                flag_log.flags(),
+                vec![EvtSubscribeStartAtOldestRecord.0],
+                "read_existing_events with no usable bookmark reads from the \
+                 oldest record"
+            );
+        }
+
+        let mut config = application_config();
+        config.read_existing_events = false;
+        let flag_log = FlagLog::install();
+        let _subscription = subscription_from(&config).await;
+        assert_eq!(
+            flag_log.flags(),
+            vec![EvtSubscribeToFutureEvents.0],
+            "without read_existing_events and with no stored position, only \
+             future events are collected"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // D22: what a failed rebuild is allowed to cost, per rebuild kind.
+    // ---------------------------------------------------------------------
+
+    /// The two operands of the D22 guard mean different things and must be
+    /// pinned independently. This is the FromDead-with-a-live-handle case: the
+    /// periodic refresh is not in play, so there is nothing to preserve and the
+    /// failed rebuild legitimately leaves the channel down.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_rebuild_from_dead_closes_a_live_subscription() {
+        let mut subscription = subscription_from(&application_config()).await;
+        assert!(subscription.first_channel_is_live());
+
+        {
+            let _guard = SubscribeScriptGuard::install(&[15007]);
+            subscription.force_rebuild_all();
+        }
+
+        assert!(
+            !subscription.first_channel_is_live(),
+            "a FromDead rebuild is not covered by the proactive keep-the-live-one \
+             guard: holding a handle is not by itself a reason to keep it"
+        );
+    }
+
+    /// And the proactive-with-no-live-handle case: there is no live subscription
+    /// to preserve, so the failure must be classified and acted on rather than
+    /// deferred as a harmless refresh miss.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_proactive_rebuild_with_no_live_handle_still_classifies() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let mut subscription = subscription_from(&application_config()).await;
+        {
+            let _guard = ScriptGuard::install(&[(15007, 0)]);
+            let _ = subscription.pull_events(100).expect("must not error out");
+        }
+        assert!(!subscription.first_channel_is_live());
+
+        let counter = WarnBandCounter::default();
+        let collector = tracing_subscriber::registry().with(counter.clone());
+        tracing::subscriber::with_default(collector, || {
+            // ERROR_EVT_INVALID_CHANNEL_PATH: a permanent skip, which is logged
+            // unconditionally rather than being episode-gated.
+            let _guard = SubscribeScriptGuard::install(&[15000]);
+            subscription.force_proactive_rebuild_all();
+        });
+
+        let lines = counter.warns.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "with no live subscription to protect, a proactive failure must be \
+             classified and reported, not deferred as a refresh miss: {lines:#?}"
+        );
+        assert!(lines[0].starts_with("ERROR"), "got: {lines:#?}");
+    }
+
+    /// A deferred proactive rebuild comes back LATER, not immediately. Pushing
+    /// the retry into the past would turn every failed refresh into a rebuild
+    /// storm against a service that is already unwell.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_proactive_rebuild_defers_the_next_refresh() {
+        let mut subscription = subscription_from(&application_config()).await;
+        let flag_log = FlagLog::install();
+
+        {
+            // Seven consecutive failures walk the backoff to its 60s cap, so the
+            // deferral this asserts is measured in tens of seconds rather than
+            // in a window a loaded test host can close on its own.
+            let _guard = SubscribeScriptGuard::install(&[1722; 7]);
+            for _ in 0..7 {
+                subscription.force_proactive_rebuild_all();
+            }
+        }
+        assert_eq!(flag_log.attempts(), 7, "the failed attempts themselves");
+        assert!(subscription.first_channel_is_live());
+
+        let _ = subscription.pull_events(1);
+        assert_eq!(
+            flag_log.attempts(),
+            7,
+            "the deferred refresh is a capped backoff away, not immediate; \
+             scheduling it into the past turns every failed refresh into a \
+             rebuild storm against a service that is already unwell"
+        );
+    }
+
+    /// D21: our OWN generated predicate coming back invalid advances one rung,
+    /// and the isolate rung's whole purpose is that the next read asks for one
+    /// record so a failure is attributable to exactly one record.
+    #[tokio::test]
+    #[serial]
+    async fn an_invalid_generated_query_at_subscribe_isolates_the_batch() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        {
+            let _guard = SubscribeScriptGuard::install(&[15001]);
+            subscription.force_rebuild_all();
+        }
+        subscription.force_rebuild_all();
+        assert!(subscription.first_channel_is_live());
+
+        let request_log = RequestLog::install();
+        let _guard = ScriptGuard::install(&[(259, 0)]);
+        let _ = subscription.pull_events(usize::MAX);
+
+        assert_eq!(
+            request_log.sizes(),
+            vec![1],
+            "the isolate rung must ask the API for exactly one record"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-channel budget and round-robin fairness.
+    // ---------------------------------------------------------------------
+
+    /// The event budget is SPLIT across channels, not handed to each of them.
+    /// A channel count that does not divide the budget evenly is the case that
+    /// distinguishes a division from anything else.
+    #[tokio::test]
+    #[serial]
+    async fn the_per_channel_budget_divides_the_max_across_channels() {
+        let mut config = application_config();
+        config.channels = vec![
+            "Application".to_string(),
+            "System".to_string(),
+            "Setup".to_string(),
+        ];
+        let mut subscription = subscription_from(&config).await;
+
+        let request_log = RequestLog::install();
+        let _guard = ScriptGuard::install(&[(259, 0); 3]);
+        let _ = subscription.pull_events(7);
+
+        assert_eq!(
+            request_log.sizes().first().copied(),
+            Some(2),
+            "7 events across 3 channels is 2 per channel, not 7 and not 21"
+        );
+    }
+
+    /// The starting channel rotates every call, so a busy channel cannot starve
+    /// its siblings. Four consecutive calls over two channels must visit them in
+    /// alternating order.
+    #[tokio::test]
+    #[serial]
+    async fn channels_are_drained_in_rotating_order() {
+        let mut config = application_config();
+        config.channels = vec!["Application".to_string(), "System".to_string()];
+        let mut subscription = subscription_from(&config).await;
+
+        let live = subscription.live_channel_names();
+        assert_eq!(
+            live.len(),
+            2,
+            "both channels must be readable for this to prove anything, got {live:?}"
+        );
+
+        let request_log = RequestLog::install();
+        let _guard = ScriptGuard::install(&[(259, 0); 8]);
+        for _ in 0..4 {
+            let _ = subscription.pull_events(usize::MAX);
+        }
+
+        let expected: Vec<String> = vec![
+            live[0].clone(),
+            live[1].clone(),
+            live[1].clone(),
+            live[0].clone(),
+            live[0].clone(),
+            live[1].clone(),
+            live[1].clone(),
+            live[0].clone(),
+        ];
+        assert_eq!(
+            request_log.channels(),
+            expected,
+            "each call must start at the next channel and then wrap"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Periodic refresh and backoff scheduling.
+    // ---------------------------------------------------------------------
+
+    /// D9: the refresh fires when it is DUE and then schedules the next one into
+    /// the future. Firing early wastes rebuilds; rescheduling into the past
+    /// rebuilds on every single pull.
+    #[tokio::test]
+    #[serial]
+    async fn the_periodic_refresh_fires_when_due_and_then_reschedules_forward() {
+        let mut config = application_config();
+        config.read_existing_events = false;
+        config.subscription_refresh_secs = 1;
+        let mut subscription = subscription_from(&config).await;
+
+        let flag_log = FlagLog::install();
+
+        let _ = subscription.pull_events(1);
+        assert_eq!(
+            flag_log.attempts(),
+            0,
+            "the refresh is not due yet and must not fire"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let _ = subscription.pull_events(1);
+        assert_eq!(flag_log.attempts(), 1, "the refresh is due and must fire");
+
+        let _ = subscription.pull_events(1);
+        assert_eq!(
+            flag_log.attempts(),
+            1,
+            "the next refresh is a full interval away; rescheduling into the past \
+             would rebuild on every pull"
+        );
+    }
+
+    /// A down channel waits out its backoff, then recovers AND drains within the
+    /// same pull. Three decisions ride on this: only a down channel is rebuilt,
+    /// the backoff deadline is respected, and a successful rebuild falls through
+    /// to the drain rather than costing the caller a whole cycle.
+    #[tokio::test]
+    #[serial]
+    async fn a_down_channel_waits_out_its_backoff_then_recovers_and_drains() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        {
+            let _guard = ScriptGuard::install(&[(15007, 0)]);
+            let _ = subscription.pull_events(usize::MAX);
+        }
+        assert!(!subscription.first_channel_is_live());
+
+        let flag_log = FlagLog::install();
+        let _ = subscription.pull_events(usize::MAX);
+        assert_eq!(
+            flag_log.attempts(),
+            0,
+            "the backoff deadline has not passed; retrying now is the stampede \
+             the jittered backoff exists to prevent"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        let events = subscription
+            .pull_events(usize::MAX)
+            .expect("recovery must not surface as a source error");
+
+        assert_eq!(flag_log.attempts(), 1, "the channel must retry once it may");
+        assert!(subscription.first_channel_is_live());
+        assert!(
+            !events.is_empty(),
+            "a recovered channel must be drained in the SAME pull; skipping the \
+             drain costs a whole cycle of latency for nothing"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The in-loop filters.
+    // ---------------------------------------------------------------------
+
+    /// The event-id prefilter KEEPS the configured ids. Inverting it delivers
+    /// nothing at all, which no delivery-count assertion elsewhere notices
+    /// because those tests do not configure `only_event_ids`.
+    #[tokio::test]
+    #[serial]
+    async fn the_only_event_ids_prefilter_keeps_the_configured_ids() {
+        let mut baseline = subscription_from(&application_config()).await;
+        let ids: Vec<u32> = baseline
+            .pull_events(usize::MAX)
+            .unwrap_or_default()
+            .iter()
+            .map(|e| e.event_id)
+            .collect();
+        assert!(
+            !ids.is_empty(),
+            "the Application backlog must be readable, otherwise this proves nothing"
+        );
+        let wanted = ids[0];
+        drop(baseline);
+
+        let mut config = application_config();
+        config.only_event_ids = Some(vec![wanted]);
+        let mut subscription = subscription_from(&config).await;
+
+        let delivered = drain_all(&mut subscription);
+        assert!(
+            !delivered.is_empty(),
+            "events matching the configured id must be delivered, not filtered out"
+        );
+    }
+
+    /// D23 self-disables record-id gap detection for channels delivered as
+    /// forwarded rendered text. Reading LOCAL events must not trip that: doing so
+    /// would silently switch off the only signal we have for retention-overwrite
+    /// data loss, on every channel, forever.
+    #[tokio::test]
+    #[serial]
+    async fn reading_local_events_leaves_record_id_gap_detection_active() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        let delivered = drain_all(&mut subscription);
+        assert!(
+            !delivered.is_empty(),
+            "events must actually be rendered for the forwarded-delivery decision \
+             to be reached at all"
+        );
+
+        assert!(
+            subscription.first_channel_reports_record_id_gaps(),
+            "local events carry no <RenderingInfo>, so record ids stay trustworthy \
+             and a gap must still be reported"
+        );
+    }
+
+    /// The admission gate emits new events and drops only what it has already
+    /// seen. Inverting it delivers nothing while looking, from the outside, like
+    /// a quiet channel.
+    #[tokio::test]
+    #[serial]
+    async fn the_backlog_is_delivered_and_never_twice() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        let delivered = drain_all(&mut subscription);
+        assert!(
+            !delivered.is_empty(),
+            "the admission gate must emit events past the resume boundary"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for record_id in &delivered {
+            assert!(
+                seen.insert(*record_id),
+                "record {record_id} was delivered twice within one drain"
+            );
+        }
+    }
+
+    /// A bookmark failure mid-batch abandons the rest of the batch, and every
+    /// handle in it is ours to close exactly once. Closing one twice is a
+    /// use-after-close against the API; missing one is the leak the whole
+    /// handle-accounting seam exists to catch.
+    #[tokio::test]
+    #[serial]
+    async fn a_mid_batch_bookmark_failure_closes_each_handle_exactly_once() {
+        let mut baseline = subscription_from(&application_config()).await;
+        let backlog = baseline.pull_events(2).unwrap_or_default().len();
+        assert_eq!(
+            backlog, 2,
+            "this assertion needs a batch of exactly two events to distinguish \
+             the current handle from the remainder"
+        );
+        drop(baseline);
+
+        let mut subscription = subscription_from(&application_config()).await;
+        let _guard = BookmarkFailGuard::install();
+        let delivered = subscription.pull_events(2).unwrap_or_default();
+
+        assert!(
+            delivered.is_empty(),
+            "an event whose position cannot be recorded is not delivered"
+        );
+        assert_eq!(
+            subscription.first_channel_event_handle_closes(),
+            2,
+            "the failing handle and the one remaining handle, each closed once"
+        );
+    }
+
+    /// The channel signal is re-armed only when the drain exited EARLY. Re-arming
+    /// after a clean drain spins the wait loop at full speed; not re-arming after
+    /// an early exit strands the remaining backlog until the next OS
+    /// notification, which on a quiet channel may be hours.
+    #[tokio::test]
+    #[serial]
+    async fn the_signal_is_rearmed_only_when_the_drain_exited_early() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        let delivered = subscription.pull_events(1).unwrap_or_default();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "a budget of one must exit the drain early with backlog remaining"
+        );
+        assert!(
+            matches!(
+                subscription.wait_for_events_blocking(0),
+                WaitResult::EventsAvailable
+            ),
+            "an early exit must re-arm the signal so the next pull revisits this \
+             channel without waiting for a fresh OS notification"
+        );
+
+        // A clean drain leaves the signal alone. Retried, because a real event
+        // arriving on Application would legitimately re-signal it.
+        let mut quiesced = false;
+        for _ in 0..5 {
+            {
+                let _guard = ScriptGuard::install(&[(259, 0)]);
+                let _ = subscription.pull_events(usize::MAX);
+            }
+            if matches!(
+                subscription.wait_for_events_blocking(0),
+                WaitResult::Timeout
+            ) {
+                quiesced = true;
+                break;
+            }
+        }
+        assert!(
+            quiesced,
+            "a fully drained channel must not re-arm its own signal; doing so \
+             spins the wait loop at full speed"
+        );
+    }
+
+    /// The speculative pull exists to stop `EvtOpenLog`/`EvtGetLogInfo` churn on
+    /// an idle host, so whether that query is ISSUED is the contract. A gauge
+    /// write is not observable; the call is.
+    #[tokio::test]
+    #[serial]
+    async fn record_count_queries_are_skipped_on_idle_speculative_pulls() {
+        use super::super::render::CHANNEL_RECORDS_UPDATES;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut subscription = subscription_from(&application_config()).await;
+
+        {
+            let _guard = ScriptGuard::install(&[(259, 0)]);
+            CHANNEL_RECORDS_UPDATES.store(0, SeqCst);
+            let _ = subscription.pull_events_speculative(10);
+        }
+        assert_eq!(
+            CHANNEL_RECORDS_UPDATES.load(SeqCst),
+            0,
+            "a speculative pull that read nothing must not query the log's record \
+             count; that query is the churn this path exists to avoid"
+        );
+
+        {
+            let _guard = ScriptGuard::install(&[(259, 0)]);
+            CHANNEL_RECORDS_UPDATES.store(0, SeqCst);
+            let _ = subscription.pull_events(10);
+        }
+        assert_eq!(
+            CHANNEL_RECORDS_UPDATES.load(SeqCst),
+            1,
+            "a normal pull refreshes the record count even on an empty channel; \
+             that gauge is how ingestion lag is detected"
+        );
+    }
+
+    /// D17, at the layer that actually runs it: the deliberate one-shot skip.
+    ///
+    /// `admit` has good unit tests and they are load-bearing for nothing on
+    /// their own, because the drain loop is `admit`'s only caller. Driven from
+    /// here, the ladder walks to the skip rung and the assertion is what an
+    /// operator would see: the poison record is not delivered, the record after
+    /// it is, and a restart does not resume onto the record we deliberately
+    /// dropped and repeat the whole escape.
+    #[tokio::test]
+    #[serial]
+    async fn the_deliberate_skip_drops_one_record_and_survives_a_restart() {
+        let mut baseline_sub = subscription_from(&application_config()).await;
+        let backlog = drain_all(&mut baseline_sub);
+        assert!(
+            backlog.len() >= 6,
+            "this walks a ladder over a partially read backlog and needs at \
+             least six records, got {}",
+            backlog.len()
+        );
+        drop(baseline_sub);
+
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+        let mut config = application_config();
+        config.channels = vec!["Application".to_string()];
+        let mut subscription = EventLogSubscription::new(&config, Arc::clone(&checkpointer), false)
+            .await
+            .expect("subscription creation should succeed");
+
+        let read = subscription.pull_events(3).unwrap_or_default();
+        assert_eq!(read.len(), 3, "the resume boundary must land mid-backlog");
+        let poisoned = backlog[3];
+        let next_good = backlog[4];
+
+        // Two stuck detections: Bookmark -> IsolateOne -> SkipRecord. A moving
+        // position is normal recovery, so only a position that does not move
+        // across three consecutive rebuilds counts.
+        for _ in 0..6 {
+            {
+                let _guard = ScriptGuard::install(&[(15011, 0)]);
+                let _ = subscription.pull_events(usize::MAX);
+            }
+            subscription.force_rebuild_all();
+        }
+        assert!(subscription.first_channel_is_live());
+
+        let delivered = drain_all(&mut subscription);
+        assert!(
+            !delivered.contains(&poisoned),
+            "record {poisoned} sat immediately past the resume boundary on the \
+             skip rung and had to be dropped; the escape did nothing"
+        );
+        assert!(
+            delivered.contains(&next_good),
+            "the skip costs exactly ONE record: {next_good} must still arrive"
+        );
+
+        subscription
+            .flush_bookmarks()
+            .await
+            .expect("bookmarks must flush");
+        drop(subscription);
+
+        let mut restarted = EventLogSubscription::new(&config, checkpointer, false)
+            .await
+            .expect("subscription creation should succeed");
+        let after_restart = drain_all(&mut restarted);
+        assert!(
+            !after_restart.contains(&poisoned),
+            "record {poisoned} came back after a restart: the skip never became \
+             durable, so every restart re-walks the entire escape ladder"
+        );
+    }
+
+    /// D24: the periodic refresh is the ONLY thing that ever un-skips a channel.
+    /// A skipped channel is deliberately not retried on the pull path, so if the
+    /// refresh does not clear the skip, a transient ACL flap or a momentary bad
+    /// channel path becomes a permanent outage for the life of the process.
+    #[tokio::test]
+    #[serial]
+    async fn the_periodic_refresh_is_what_un_skips_a_skipped_channel() {
+        let mut config = application_config();
+        config.subscription_refresh_secs = 1;
+        let mut subscription = subscription_from(&config).await;
+
+        {
+            // ERROR_EVT_INVALID_CHANNEL_PATH: skip for this generation.
+            let _guard = ScriptGuard::install(&[(15000, 0)]);
+            let _ = subscription.pull_events(usize::MAX);
+        }
+        assert!(
+            !subscription.first_channel_is_live(),
+            "a skip must take the channel out of service"
+        );
+
+        let _ = subscription.pull_events(usize::MAX);
+        assert!(
+            !subscription.first_channel_is_live(),
+            "the pull path must not retry a skipped channel; that is the retry \
+             loop and the log noise D24 removes"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let _ = subscription.pull_events(usize::MAX);
+        assert!(
+            subscription.first_channel_is_live(),
+            "the refresh must clear the skip and rebuild, so an ACL flap heals \
+             within one interval instead of never"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // D11: the halve-and-recover cycle on RPC_S_INVALID_BOUND (1734).
+    //
+    // 1734 is a real platform condition we have never been able to trigger on
+    // our hardware (plan 10.2 leg 5, 10.5), so until now our response to it was
+    // verified by nothing but a classifier routing test. These drive the whole
+    // cycle through the EvtNext seam and assert it in terms of what we ask the
+    // API for next and what comes back.
+    // ---------------------------------------------------------------------
+
+    /// On 1734 the batch halves and the subscription reopens FROM THE BOOKMARK.
+    /// Reopening from anywhere else would either replay the channel or discard
+    /// its backlog on what is only a marshalling-size problem.
+    #[tokio::test]
+    #[serial]
+    async fn an_oversized_read_halves_the_batch_and_reopens_from_the_bookmark() {
+        let mut subscription = subscription_from(&application_config()).await;
+        assert!(
+            !drain_all(&mut subscription).is_empty(),
+            "the backlog must be readable so the bookmark is positioned"
+        );
+        let baseline_handles = subscription.first_channel_handle_balance();
+
+        let request_log = RequestLog::install();
+        let flag_log = FlagLog::install();
+
+        {
+            let _guard = ScriptGuard::install(&[(1734, 0)]);
+            let _ = subscription
+                .pull_events(usize::MAX)
+                .expect("an oversized read is not a source error");
+        }
+
+        assert_eq!(
+            request_log.sizes(),
+            vec![100],
+            "the failing read asked for the configured batch size"
+        );
+        assert_eq!(
+            flag_log.flags(),
+            vec![EvtSubscribeStartAfterBookmark.0 | EvtSubscribeStrict.0],
+            "the reopen must resume from the bookmark, strictly"
+        );
+        assert!(
+            subscription.first_channel_is_live(),
+            "an oversized read is a size problem, not a dead channel"
+        );
+        assert_eq!(
+            subscription.first_channel_handle_balance(),
+            baseline_handles,
+            "the reopen must close exactly the handle it replaced"
+        );
+
+        request_log.clear();
+        let _ = subscription.pull_events(usize::MAX);
+        assert_eq!(
+            request_log.sizes().first().copied(),
+            Some(50),
+            "the next read must ask for half as much"
+        );
+    }
+
+    /// Repeated 1734 keeps halving, and stops at one. A batch of zero is not a
+    /// request the API can serve, so the floor is the whole reason the ladder
+    /// terminates instead of wedging the channel.
+    #[tokio::test]
+    #[serial]
+    async fn repeated_oversized_reads_halve_the_batch_to_a_floor_of_one() {
+        let mut subscription = subscription_from(&application_config()).await;
+        let request_log = RequestLog::install();
+
+        for _ in 0..8 {
+            let _guard = ScriptGuard::install(&[(1734, 0)]);
+            let _ = subscription.pull_events(usize::MAX);
+        }
+
+        assert_eq!(
+            request_log.sizes(),
+            vec![100, 50, 25, 12, 6, 3, 1, 1],
+            "the batch halves on every oversized read and floors at one"
+        );
+    }
+
+    /// Recovery after a PLAIN reduction is gradual. The reduction was caused by
+    /// the data on the channel, so stepping straight back to the configured size
+    /// on the first clean batch would just walk into the same oversized event
+    /// again.
+    #[tokio::test]
+    #[serial]
+    async fn recovery_after_a_plain_batch_reduction_is_gradual() {
+        let mut subscription = subscription_from(&application_config()).await;
+
+        {
+            let _guard = ScriptGuard::install(&[(1734, 0)]);
+            let _ = subscription.pull_events(usize::MAX);
+        }
+
+        let request_log = RequestLog::install();
+
+        // Nine clean batches: one short of the recovery threshold.
+        {
+            let _renders = RenderFailGuard::install();
+            let mut script = vec![(0u32, 1u32); 9];
+            script.push((259, 0));
+            let _guard = ScriptGuard::install(&script);
+            let _ = subscription.pull_events(usize::MAX);
+        }
+        assert_eq!(
+            request_log.sizes(),
+            vec![50; 10],
+            "nine clean batches is not enough; the size must not step up early"
+        );
+
+        // The tenth crosses it.
+        request_log.clear();
+        {
+            let _renders = RenderFailGuard::install();
+            let _guard = ScriptGuard::install(&[(0, 1), (259, 0)]);
+            let _ = subscription.pull_events(usize::MAX);
+        }
+        assert_eq!(
+            request_log.sizes(),
+            vec![50, 100],
+            "the tenth consecutive clean batch steps the size back up"
+        );
+    }
+
+    /// Recovery after a POISON-ESCAPE rung is immediate. That reduction was not
+    /// caused by size at all: the batch was forced to one purely to attribute a
+    /// failure to a single record, so once a batch reads clean there is nothing
+    /// left to be careful about. This is how 4.2 and 4.3.1 are reconciled, and
+    /// the two paths must not be collapsed into one.
+    #[tokio::test]
+    #[serial]
+    async fn recovery_after_a_poison_escape_rung_is_immediate() {
+        let mut subscription = subscription_from(&application_config()).await;
+        assert!(
+            !drain_all(&mut subscription).is_empty(),
+            "a resume position must exist before it can be found stuck"
+        );
+
+        // Three rebuilds that resume at the same position: a moving position is
+        // normal recovery, a stuck one is a poisoned position.
+        for _ in 0..3 {
+            {
+                let _guard = ScriptGuard::install(&[(15011, 0)]);
+                let _ = subscription.pull_events(usize::MAX);
+            }
+            subscription.force_rebuild_all();
+        }
+        assert!(subscription.first_channel_is_live());
+
+        let request_log = RequestLog::install();
+        let _renders = RenderFailGuard::install();
+        let _guard = ScriptGuard::install(&[(0, 1), (259, 0)]);
+        let _ = subscription.pull_events(usize::MAX);
+
+        assert_eq!(
+            request_log.sizes(),
+            vec![1, 100],
+            "the isolate rung asks for one record, and the first clean batch \
+             restores the configured size immediately rather than gradually"
+        );
+    }
+
+    /// Nothing is lost and nothing is duplicated across the whole cycle.
+    ///
+    /// This is the invariant D8 trades partial-batch emit away for: on 1734 the
+    /// API cursor advances even when the call fails, so the returned handles are
+    /// discarded and the position is taken from the bookmark instead. If that
+    /// were wrong, the events in flight at each fault would silently vanish.
+    #[tokio::test]
+    #[serial]
+    async fn no_events_are_lost_or_duplicated_across_the_halve_and_recover_cycle() {
+        let mut baseline = subscription_from(&application_config()).await;
+        let before: Vec<u64> = drain_all(&mut baseline);
+        assert!(
+            !before.is_empty(),
+            "the Application backlog must be readable, otherwise this proves nothing"
+        );
+        drop(baseline);
+
+        let mut subscription = subscription_from(&application_config()).await;
+        let mut delivered: Vec<u64> = Vec::new();
+        for _ in 0..4 {
+            {
+                let _guard = ScriptGuard::install(&[(1734, 0)]);
+                let _ = subscription.pull_events(usize::MAX);
+            }
+            delivered.extend(drain_all(&mut subscription));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for record_id in &delivered {
+            assert!(
+                seen.insert(*record_id),
+                "record {record_id} was delivered twice across the batch-adaptation \
+                 cycle"
+            );
+        }
+        for record_id in &before {
+            assert!(
+                seen.contains(record_id),
+                "record {record_id} was readable before the cycle and was never \
+                 delivered: the events in flight at an oversized read were \
+                 discarded without the position falling back to the bookmark"
             );
         }
     }
