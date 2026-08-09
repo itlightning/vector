@@ -5,12 +5,13 @@
 
 use metrics::Gauge;
 use windows::Win32::System::EventLog::{
-    EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords, EvtOpenLog,
-    EvtRender, EvtRenderEventXml,
+    EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords,
+    EvtLogOldestRecordNumber, EvtOpenLog, EvtRender, EvtRenderEventXml,
 };
 use windows::core::HSTRING;
 
 use super::error::WindowsEventLogError;
+use super::status::ChannelRecordStats;
 use super::win32_errors::{RenderDisposition, classify_render, win32_code};
 
 /// Test-only rewrite of the rendered XML, applied to the string this function
@@ -160,9 +161,7 @@ fn shrink_decode_buffer(decode_buffer: &mut Vec<u16>) {
     }
 }
 
-/// Update the channel record count gauge using EvtGetLogInfo.
-///
-/// Test-only count of `update_channel_records` calls.
+/// Test-only count of channel metadata queries, whoever asked for them.
 ///
 /// The whole point of the speculative-pull flag is to avoid steady
 /// `EvtOpenLog`/`EvtGetLogInfo` churn on an idle host, so "was the metadata
@@ -175,18 +174,43 @@ pub(super) static CHANNEL_RECORDS_UPDATES: std::sync::atomic::AtomicUsize =
 /// `rate(events_read_total)` to detect ingestion lag.
 /// Best-effort: if any API call fails, the gauge is left unchanged.
 pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
+    if let Some(stats) = channel_record_stats(channel) {
+        gauge.set(stats.count as f64);
+    }
+}
+
+/// Read the record count and the oldest record id of a channel in one open.
+///
+/// Both properties come off the same log handle, so the pair costs one
+/// `EvtOpenLog` and two `EvtGetLogInfo` calls. Returns `None` if the channel
+/// cannot be opened or either property is unavailable: a partial answer would
+/// let a caller compute a record position out of one real number and one
+/// invented one.
+pub(super) fn channel_record_stats(channel: &str) -> Option<ChannelRecordStats> {
     #[cfg(test)]
     CHANNEL_RECORDS_UPDATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let channel_hstring = HSTRING::from(channel);
     let log_handle = unsafe {
         // EvtOpenChannelPath = 1
-        match EvtOpenLog(None, &channel_hstring, 1) {
-            Ok(h) => h,
-            Err(_) => return,
-        }
+        EvtOpenLog(None, &channel_hstring, 1).ok()?
     };
 
+    let count = log_info_u64(log_handle, EvtLogNumberOfLogRecords.0);
+    let oldest = log_info_u64(log_handle, EvtLogOldestRecordNumber.0);
+
+    unsafe {
+        _ = EvtClose(log_handle);
+    }
+
+    Some(ChannelRecordStats {
+        count: count?,
+        oldest: oldest?,
+    })
+}
+
+/// Read one `UInt64` log property off an open log handle.
+fn log_info_u64(log_handle: EVT_HANDLE, property: i32) -> Option<u64> {
     // EVT_VARIANT is 16 bytes: 8 bytes value + 4 bytes count + 4 bytes type
     let mut buffer = [0u8; 16];
     let mut buffer_used = 0u32;
@@ -194,22 +218,18 @@ pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
     let result = unsafe {
         EvtGetLogInfo(
             log_handle,
-            EVT_LOG_PROPERTY_ID(EvtLogNumberOfLogRecords.0),
+            EVT_LOG_PROPERTY_ID(property),
             buffer.len() as u32,
             Some(buffer.as_mut_ptr() as *mut _),
             &mut buffer_used,
         )
     };
 
-    unsafe {
-        _ = EvtClose(log_handle);
+    if result.is_err() {
+        return None;
     }
-
-    if result.is_ok() {
-        // EVT_VARIANT for UInt64: first 8 bytes are the value (little-endian)
-        let record_count = u64::from_le_bytes(buffer[..8].try_into().unwrap_or([0; 8]));
-        gauge.set(record_count as f64);
-    }
+    // EVT_VARIANT for UInt64: first 8 bytes are the value (little-endian)
+    Some(u64::from_le_bytes(buffer[..8].try_into().ok()?))
 }
 
 /// Decode a UTF-16LE buffer (as returned by Windows EvtRender) into a String.
