@@ -66,7 +66,7 @@ pub struct ChannelPosition {
 impl ChannelPosition {
     /// A position carrying only a bookmark, for callers that have nothing else.
     #[cfg(test)]
-    pub fn bookmark_only(channel: String, bookmark_xml: String) -> Self {
+    pub const fn bookmark_only(channel: String, bookmark_xml: String) -> Self {
         Self {
             channel,
             bookmark_xml,

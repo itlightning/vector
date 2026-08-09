@@ -245,11 +245,19 @@ struct SubscriptionFactory {
 impl SubscriptionFactory {
     /// The query to subscribe with at this ladder rung, and its origin.
     ///
-    /// A generated time predicate can only be composed onto a wildcard base;
-    /// intersecting it with an arbitrary operator XPath is not reliably
-    /// expressible. When we cannot compose, the subscription over-delivers and
-    /// the exact in-process `(TimeCreated, RecordId)` boundary trims it, which
-    /// is the same mechanism the millisecond flooring already relies on.
+    /// A generated time predicate is only composed onto a wildcard base today.
+    /// With `event_query` set, this returns it unchanged and the subscription
+    /// reads from the oldest record, so EVERY time rung does the same thing and
+    /// the ladder escalates nothing (R8, L2).
+    ///
+    /// That is a gap, not a language limit: the WEL query subset composes a
+    /// user filter and a time predicate perfectly well, and wrapping the user
+    /// string in a structured query with a `Suppress` floor would need no
+    /// parsing of it. Planned as D32; see section 4.0.2 of the resiliency plan.
+    ///
+    /// Nothing trims the over-delivery any more. The in-process
+    /// `(TimeCreated, RecordId)` boundary that used to do it discarded real
+    /// events and was deleted (D31).
     fn query_for(&self, resume: &ResumeState) -> (String, QueryOrigin) {
         let Some(floor) = resume.time_floor() else {
             return (self.base_query.clone(), self.base_origin);
@@ -1947,9 +1955,11 @@ mod tests {
     #[tokio::test]
     async fn test_pull_subscription_creation() {
         let _seams = SeamSession::acquire();
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.event_timeout_ms = 1000;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            event_timeout_ms: 1000,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
 
@@ -1972,10 +1982,12 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_events_timeout() {
         let _seams = SeamSession::acquire();
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = false;
-        config.event_timeout_ms = 100;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: false,
+            event_timeout_ms: 100,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
 
@@ -2006,9 +2018,11 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_signal_wakes_wait() {
         let _seams = SeamSession::acquire();
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.event_timeout_ms = 500;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
 
@@ -2056,9 +2070,11 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_signal_takes_priority_over_channel_signal() {
         let _seams = SeamSession::acquire();
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.event_timeout_ms = 500;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
 
@@ -2082,10 +2098,12 @@ mod tests {
     #[tokio::test]
     async fn test_pull_events_returns_events() {
         let _seams = SeamSession::acquire();
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = true;
-        config.event_timeout_ms = 2000;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: true,
+            event_timeout_ms: 2000,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
 
@@ -2120,13 +2138,17 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_concurrent_subscriptions() {
         let _seams = SeamSession::acquire();
-        let mut config1 = WindowsEventLogConfig::default();
-        config1.channels = vec!["Application".to_string()];
-        config1.event_timeout_ms = 1000;
+        let config1 = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            event_timeout_ms: 1000,
+            ..Default::default()
+        };
 
-        let mut config2 = WindowsEventLogConfig::default();
-        config2.channels = vec!["System".to_string()];
-        config2.event_timeout_ms = 1000;
+        let config2 = WindowsEventLogConfig {
+            channels: vec!["System".to_string()],
+            event_timeout_ms: 1000,
+            ..Default::default()
+        };
 
         let (checkpointer1, _temp_dir1) = create_test_checkpointer().await;
         let (checkpointer2, _temp_dir2) = create_test_checkpointer().await;
@@ -2151,10 +2173,12 @@ mod tests {
         let _seams = SeamSession::acquire();
         use chrono::Utc;
 
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = false;
-        config.event_timeout_ms = 500;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: false,
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
         let subscription_start_time = Utc::now();
@@ -2199,10 +2223,12 @@ mod tests {
             .await
             .expect("Should be able to set checkpoint");
 
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = true;
-        config.event_timeout_ms = 500;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: true,
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
 
         // The subscription should succeed even with a corrupted/invalid bookmark,
         // gracefully falling back to a fresh bookmark.
@@ -2264,10 +2290,12 @@ mod tests {
         // Give the service a moment to persist the record before we subscribe.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = true;
-        config.event_timeout_ms = 500;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: true,
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
 
@@ -2337,10 +2365,12 @@ mod tests {
         let _seams = SeamSession::acquire();
         use std::sync::Arc as StdArc;
 
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = true;
-        config.event_timeout_ms = 1000;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: true,
+            event_timeout_ms: 1000,
+            ..Default::default()
+        };
 
         let (checkpointer, _temp_dir) = create_test_checkpointer().await;
 
@@ -2456,10 +2486,12 @@ mod tests {
     async fn application_subscription_with(
         checkpointer: Arc<Checkpointer>,
     ) -> EventLogSubscription {
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = true;
-        config.event_timeout_ms = 500;
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: true,
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
         EventLogSubscription::new(&config, checkpointer, false)
             .await
             .expect("subscription creation should succeed")
@@ -2822,12 +2854,15 @@ mod tests {
         );
     }
 
-    /// Exactly-once delivery across a rebuild.
+    /// No re-delivery across a HEALTHY rebuild.
     ///
-    /// Rebuilding resumes from the checkpoint, which over-delivers by design
-    /// (the generated XPath floors to the millisecond). The exact in-process
-    /// `(TimeCreated, RecordId)` boundary is what makes that contribute zero
-    /// duplicates, so no record id may appear in two consecutive reads.
+    /// This is the bookmark path (R2): the rung is `Bookmark`, so the rebuild
+    /// resumes `StartAfterBookmark | Strict` with no generated time predicate
+    /// and therefore no over-delivery to trim. That is why no record id may
+    /// appear in two consecutive reads even though the admission gate is gone.
+    ///
+    /// The over-delivering path is the time ladder (R4 to R7), which re-reads
+    /// the last event's millisecond on purpose and is covered separately.
     #[tokio::test]
     async fn rebuild_does_not_redeliver_events() {
         let _seams = SeamSession::acquire();
@@ -2999,11 +3034,12 @@ mod tests {
     }
 
     fn application_config() -> WindowsEventLogConfig {
-        let mut config = WindowsEventLogConfig::default();
-        config.channels = vec!["Application".to_string()];
-        config.read_existing_events = true;
-        config.event_timeout_ms = 500;
-        config
+        WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            read_existing_events: true,
+            event_timeout_ms: 500,
+            ..Default::default()
+        }
     }
 
     /// Read a channel until it stops producing, returning every record id in
@@ -4240,8 +4276,8 @@ mod tests {
             let capture = ErrorTypeCapture::default();
             let collector = tracing_subscriber::registry().with(capture.clone());
             tracing::subscriber::with_default(collector, f);
-            let seen = capture.seen.lock().unwrap().clone();
-            seen
+
+            capture.seen.lock().unwrap().clone()
         }
 
         // No event has ever been observed, so a dead bookmark has no stored

@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use lru::LruCache;
@@ -431,8 +431,10 @@ mod tests {
         let seams = super::super::test_seams::SeamSession::acquire();
 
         let (mut publisher_cache, mut format_cache) = empty_caches();
-        let hits = metrics::counter!("test_cache_hits");
-        let misses = metrics::counter!("test_cache_misses");
+        // Inert doubles. These are required arguments that this test never
+        // reads, so a registered counter would only add a global side effect.
+        let hits = Counter::noop();
+        let misses = Counter::noop();
         let system_fields = parse_system_section(FORWARDED_FIXTURE);
         assert!(
             !system_fields.provider_name.is_empty(),
@@ -495,8 +497,10 @@ mod tests {
         let seams = super::super::test_seams::SeamSession::acquire();
 
         let (mut publisher_cache, mut format_cache) = empty_caches();
-        let hits = metrics::counter!("test_cache_hits");
-        let misses = metrics::counter!("test_cache_misses");
+        // Inert doubles. These are required arguments that this test never
+        // reads, so a registered counter would only add a global side effect.
+        let hits = Counter::noop();
+        let misses = Counter::noop();
         let system_fields = parse_system_section(FORWARDED_FIXTURE);
 
         let display = resolve_event_display(

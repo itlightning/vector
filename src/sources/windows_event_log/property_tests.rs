@@ -64,8 +64,13 @@ fn run_seed() -> [u8; 32] {
         .ok()
         .filter(|s| s.len() == 64)
     {
+        // Chunk the bytes rather than slice by index: the filter above only
+        // guarantees 64 CHARS, and a non-ASCII one would put a byte slice
+        // inside a codepoint.
+        let bytes = hex.as_bytes();
         for (index, byte) in seed.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap_or(0);
+            let pair = std::str::from_utf8(&bytes[index * 2..index * 2 + 2]).unwrap_or("");
+            *byte = u8::from_str_radix(pair, 16).unwrap_or(0);
         }
         return seed;
     }
@@ -90,6 +95,12 @@ fn hex(seed: &[u8; 32]) -> String {
 
 /// Run one property, reporting the case count and printing a reproduction
 /// command on failure.
+///
+/// The success line goes to stdout deliberately. Soak runs are judged by the
+/// seed and the case count of the runs that PASSED, so routing it through
+/// tracing (off by default under `cargo test`) would lose the only record of
+/// what was actually exercised.
+#[allow(clippy::print_stdout, reason = "seed reporting for soak reproduction")]
 fn check<S: Strategy>(name: &str, strategy: S, body: impl Fn(S::Value) -> Result<(), TestCaseError>)
 where
     S::Value: std::fmt::Debug,
