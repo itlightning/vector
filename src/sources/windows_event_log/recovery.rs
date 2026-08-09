@@ -128,7 +128,9 @@ pub(super) enum Rung {
 /// Time-window rungs in ascending order of data loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TimeRung {
-    /// Advance past the boundary tick only.
+    /// Switch from bookmark resume to time-query resume without moving the
+    /// floor. The only lossless rung: it re-reads the last event's own
+    /// millisecond, so it can duplicate but can never skip.
     BoundaryTick,
     OneSecond,
     TenSeconds,
@@ -145,7 +147,7 @@ impl TimeRung {
             // one: a last event in the final 100ns of a millisecond would push
             // the sum over the boundary and drop the rest of that millisecond.
             // The rung earns its place by switching from bookmark resume to
-            // time-query resume, not by moving the floor (R6, R7).
+            // time-query resume, not by moving the floor.
             Self::BoundaryTick => Duration::ZERO,
             Self::OneSecond => Duration::from_secs(1),
             Self::TenSeconds => Duration::from_secs(10),
@@ -354,7 +356,7 @@ impl ResumeState {
     /// trims the excess: the admission gate that used to do so discarded real
     /// events and was deleted (D31). The duplicates it re-delivers are bounded
     /// by one millisecond of the channel and are accepted, because loss is
-    /// unrecoverable and duplication is not (L5).
+    /// unrecoverable and duplication is not.
     pub(super) fn time_floor(&self) -> Option<DateTime<Utc>> {
         let base = self.last_event_time?;
         let advance = match self.rung {
@@ -690,7 +692,7 @@ mod tests {
 
     /// The XPath floors to the millisecond so it over-delivers, and nothing
     /// trims the excess (D31). The re-delivered events are bounded by one
-    /// millisecond of the channel, which L5 accepts.
+    /// millisecond of the channel, which is the accepted cost.
     #[test]
     fn time_floor_floors_to_the_millisecond() {
         let mut resume = ResumeState::new(true);
@@ -985,7 +987,7 @@ mod tests {
         let base = ts(1_700_000_000, 0);
 
         for (rung, expected_advance) in [
-            (TimeRung::BoundaryTick, Duration::from_nanos(100)),
+            (TimeRung::BoundaryTick, Duration::ZERO),
             (TimeRung::OneSecond, Duration::from_secs(1)),
             (TimeRung::TenSeconds, Duration::from_secs(10)),
             (TimeRung::OneMinute, Duration::from_secs(60)),
@@ -1009,6 +1011,78 @@ mod tests {
                     expected_advance.subsec_nanos() % 1_000_000,
                 ));
             assert_eq!(floor, expected, "wrong window width for {rung:?}");
+        }
+    }
+
+    /// The SIZE of the hole each rung is allowed to punch.
+    ///
+    /// The rung widths are the loss budget. Every rung above the first skips
+    /// from the last event sent to the floor, and nothing in the source reads
+    /// that window again, so a change that widened `OneSecond` to a minute
+    /// would silently multiply the loss by sixty on a path that only fires
+    /// when a channel is already unwell.
+    ///
+    /// The first rung is the one that must stay lossless: with a zero step and
+    /// a millisecond floor, it lands ON the last event's millisecond.
+    #[test]
+    fn each_time_rung_skips_exactly_its_own_width() {
+        // A sub-millisecond base, so a rung that forgot to floor would be
+        // caught rather than landing on a round number by luck.
+        let base = ts(1_700_000_000, 123_456_700);
+        let floor_of_base = ts(1_700_000_000, 123_000_000);
+
+        let widths = [
+            (TimeRung::BoundaryTick, 0i64),
+            (TimeRung::OneSecond, 1_000),
+            (TimeRung::TenSeconds, 10_000),
+            (TimeRung::OneMinute, 60_000),
+            (TimeRung::FiveMinutes, 300_000),
+            (TimeRung::ThirtyMinutes, 1_800_000),
+        ];
+
+        for (rung, expected_skip_ms) in widths {
+            let mut resume = ResumeState::new(true);
+            resume.observe_event(base, 1);
+            resume.rung = Rung::TimeAdvance(rung);
+
+            let skipped = resume.time_floor().unwrap() - floor_of_base;
+            assert_eq!(
+                skipped.num_milliseconds(),
+                expected_skip_ms,
+                "{rung:?} must skip exactly {expected_skip_ms}ms past the last \
+                 event's millisecond; a wider window is unrecoverable loss"
+            );
+        }
+
+        // Stated separately because it is the claim the ladder rests on: the
+        // first rung is the only lossless one.
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(base, 1);
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+        assert!(
+            resume.time_floor().unwrap() <= base,
+            "the first rung must re-read the last event's own millisecond, so \
+             it can duplicate but can never skip"
+        );
+    }
+
+    /// Duplicates are guaranteed by construction on the first time rung.
+    ///
+    /// The floor lands at or before the last event sent and the predicate is
+    /// `>=`, so that event is necessarily selected a second time. This is the
+    /// duplicate the deleted admission gate used to trim, and asserting it
+    /// here is what stops someone reintroducing a trim to "clean it up".
+    #[test]
+    fn the_first_time_rung_reselects_the_last_event_sent() {
+        for subsec in [0, 1, 500_000, 999_999, 123_456_700] {
+            let base = ts(1_700_000_000, subsec);
+            let mut resume = ResumeState::new(true);
+            resume.observe_event(base, 1);
+            resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+            assert!(
+                resume.time_floor().unwrap() <= base,
+                "floor must not exclude the last event sent (subsec {subsec})"
+            );
         }
     }
 
