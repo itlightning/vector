@@ -116,6 +116,35 @@ impl Tracer for MainTracer {
     }
 }
 
+/// Reads the allocation-tracing command-line options and arms tracking if they ask for it.
+///
+/// Must run before the process allocates anything that outlives startup: the tracing
+/// allocator prefixes each allocation with the id of the group that made it, so an object
+/// allocated before tracking is armed would be freed through a header nobody wrote. That
+/// is also why tracking cannot be turned on for a process that is already running. Both
+/// platform entry points call this, so the two stay in step.
+pub fn init_tracing_from_cli() {
+    let opts = crate::cli::Opts::get_matches()
+        .map_err(|error| {
+            // Printing to stdout/err can itself fail; ignore it.
+            _ = error.print();
+            exitcode::USAGE
+        })
+        .unwrap_or_else(|code| {
+            std::process::exit(code);
+        });
+    let allocation_tracing = opts.root.allocation_tracing;
+    REPORTING_INTERVAL_MS.store(
+        opts.root.allocation_tracing_reporting_interval_ms,
+        Ordering::Relaxed,
+    );
+    drop(opts);
+    if allocation_tracing {
+        TRACK_ALLOCATIONS.store(true, Ordering::Relaxed);
+        init_allocation_tracing();
+    }
+}
+
 /// Initializes allocation tracing.
 pub fn init_allocation_tracing() {
     for group in &GROUP_INFO {

@@ -44,12 +44,55 @@ pub use indoc::indoc;
 // re-export codecs for convenience
 pub use vector_lib::codecs;
 
-#[cfg(all(unix, feature = "tikv-jemallocator"))]
+/// Which allocator the process actually allocates from, before `allocation-tracing`
+/// decides whether to wrap it.
+///
+/// Priority is `mimalloc-pprof` (profiling builds only), then jemalloc where it is
+/// available, then the platform allocator. Selecting nothing at all leaves the platform
+/// default in place, which is why the static below is not declared in that case: an
+/// explicit `System` global allocator is not identical to declaring none.
+#[cfg(any(
+    feature = "allocation-tracing",
+    feature = "mimalloc-pprof",
+    all(unix, feature = "tikv-jemallocator")
+))]
+mod global_allocator {
+    #[cfg(feature = "mimalloc-pprof")]
+    pub(super) type Inner = mimalloc_pprof::MiMalloc;
+    #[cfg(feature = "mimalloc-pprof")]
+    pub(super) const INNER: Inner = mimalloc_pprof::MiMalloc;
+
+    #[cfg(all(not(feature = "mimalloc-pprof"), unix, feature = "tikv-jemallocator"))]
+    pub(super) type Inner = tikv_jemallocator::Jemalloc;
+    #[cfg(all(not(feature = "mimalloc-pprof"), unix, feature = "tikv-jemallocator"))]
+    pub(super) const INNER: Inner = tikv_jemallocator::Jemalloc;
+
+    #[cfg(all(
+        not(feature = "mimalloc-pprof"),
+        not(all(unix, feature = "tikv-jemallocator"))
+    ))]
+    pub(super) type Inner = std::alloc::System;
+    #[cfg(all(
+        not(feature = "mimalloc-pprof"),
+        not(all(unix, feature = "tikv-jemallocator"))
+    ))]
+    pub(super) const INNER: Inner = std::alloc::System;
+}
+
+#[cfg(feature = "allocation-tracing")]
 #[global_allocator]
-static ALLOC: self::internal_telemetry::allocations::Allocator<tikv_jemallocator::Jemalloc> =
-    self::internal_telemetry::allocations::get_grouped_tracing_allocator(
-        tikv_jemallocator::Jemalloc,
-    );
+static ALLOC: self::internal_telemetry::allocations::Allocator<global_allocator::Inner> =
+    self::internal_telemetry::allocations::get_grouped_tracing_allocator(global_allocator::INNER);
+
+#[cfg(all(
+    not(feature = "allocation-tracing"),
+    any(feature = "mimalloc-pprof", all(unix, feature = "tikv-jemallocator"))
+))]
+#[global_allocator]
+static ALLOC: global_allocator::Inner = global_allocator::INNER;
+
+#[cfg(windows)]
+mod heap_reclaim;
 
 #[allow(unreachable_pub)]
 pub mod internal_telemetry;

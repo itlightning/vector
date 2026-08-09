@@ -253,6 +253,10 @@ impl Application {
 
         config::set_env_var_interpolation(opts.root.dangerously_allow_env_var_interpolation);
 
+        // Past the subcommand dispatch above, so only the long-running server pays for it.
+        #[cfg(windows)]
+        crate::heap_reclaim::spawn();
+
         let config = runtime.block_on(ApplicationConfig::from_opts(
             &opts.root,
             &mut signals.handler,

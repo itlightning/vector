@@ -7,36 +7,11 @@ use vector::{app::Application, extra_context::ExtraContext};
 
 #[cfg(unix)]
 fn main() -> ExitCode {
-    #[cfg(all(unix, feature = "tikv-jemallocator"))]
-    {
-        use std::sync::atomic::Ordering;
-
-        use crate::vector::internal_telemetry::allocations::{
-            REPORTING_INTERVAL_MS, TRACK_ALLOCATIONS, init_allocation_tracing,
-        };
-        let opts = vector::cli::Opts::get_matches()
-            .map_err(|error| {
-                // Printing to stdout/err can itself fail; ignore it.
-                _ = error.print();
-                exitcode::USAGE
-            })
-            .unwrap_or_else(|code| {
-                std::process::exit(code);
-            });
-        let allocation_tracing = opts.root.allocation_tracing;
-        REPORTING_INTERVAL_MS.store(
-            opts.root.allocation_tracing_reporting_interval_ms,
-            Ordering::Relaxed,
-        );
-        drop(opts);
-        // At this point, we make the following assumption:
-        // The heap does not contain any allocations that have a shorter lifetime than the program.
-        if allocation_tracing {
-            // Start tracking allocations
-            TRACK_ALLOCATIONS.store(true, Ordering::Relaxed);
-            init_allocation_tracing();
-        }
-    }
+    // At this point, we make the following assumption:
+    // The heap does not contain any allocations that have a shorter lifetime than the program.
+    // Both entry points arm tracking here, before anything long-lived is allocated.
+    #[cfg(feature = "allocation-tracing")]
+    vector::internal_telemetry::allocations::init_tracing_from_cli();
 
     let exit_code = Application::run(ExtraContext::default())
         .code()
@@ -46,6 +21,11 @@ fn main() -> ExitCode {
 
 #[cfg(windows)]
 pub fn main() -> ExitCode {
+    // Same startup ordering constraint as the unix entry point: arm tracking before the
+    // service or console path allocates anything long-lived.
+    #[cfg(feature = "allocation-tracing")]
+    vector::internal_telemetry::allocations::init_tracing_from_cli();
+
     // We need to be able to run vector in User Interactive mode. We first try
     // to run vector as a service. If we fail, we consider that we are in
     // interactive mode and then fallback to console mode.  See
