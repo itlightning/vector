@@ -32,6 +32,10 @@ fn create_test_config() -> WindowsEventLogConfig {
         acknowledgements: Default::default(),
         render_message: false,
         subscription_refresh_secs: 86_400,
+        // Off, matching the default: these tests must exercise the source as a
+        // canonical build runs it.
+        status_path: None,
+        status_interval_secs: 30,
     }
 }
 
@@ -899,6 +903,61 @@ async fn test_source_compliance() {
     let mut config = create_test_config();
     config.data_dir = Some(data_dir.path().to_path_buf());
     run_and_assert_source_compliance(config, Duration::from_millis(100), &SOURCE_TAGS).await;
+}
+
+/// The status file appears with nothing configured, at the path the reader
+/// scans for.
+///
+/// This is the only path production ever uses: the config generator cannot
+/// emit `status_path`, because a binary that predates the option rejects it at
+/// validate time and breaks every apply. So the derived default is what
+/// connects the two halves, and an explicit path is the rare case.
+#[tokio::test]
+async fn the_status_file_is_written_at_the_derived_default_path() {
+    let _seams = super::test_seams::SeamSession::acquire();
+
+    let data_dir = tempfile::tempdir().expect("failed to create temp data_dir");
+    let mut config = create_test_config();
+    config.data_dir = Some(data_dir.path().to_path_buf());
+    assert!(
+        config.status_path.is_none(),
+        "the case under test is the one that names no path"
+    );
+
+    run_and_assert_source_compliance(config, Duration::from_millis(500), &SOURCE_TAGS).await;
+
+    // The source resolves its own subdirectory of the data dir, so the file
+    // lands beside that source's checkpoint rather than in a shared directory.
+    let component_dirs: Vec<_> = std::fs::read_dir(data_dir.path())
+        .expect("the data dir must exist")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        component_dirs.len(),
+        1,
+        "expected one per-component directory, found {component_dirs:?}"
+    );
+
+    let status_path = component_dirs[0].join("windows_event_log_status.json");
+    let raw = std::fs::read(&status_path).unwrap_or_else(|e| {
+        panic!("no status file at {}: {e}", status_path.display());
+    });
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&raw).expect("the status file must be complete JSON");
+    assert_eq!(parsed["schema"], 1);
+    assert!(
+        parsed["as_of"].is_string(),
+        "the reader treats a stale as_of as no information, so it is required"
+    );
+    for channel in ["System", "Application"] {
+        assert!(
+            parsed["channels"][channel].is_object(),
+            "every configured channel must appear, reachable or not: {parsed}"
+        );
+    }
 }
 
 // ================================================================================================

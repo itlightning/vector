@@ -32,6 +32,7 @@ use super::{
         Rung, evaluate_gap, jitter_seed,
     },
     sid_resolver::SidResolver,
+    status::{ChannelStatus, GapRecord, StatusSnapshot, gap_for_rung, newest_record_estimate},
     win32_errors::{
         DrainOutcome, QueryOrigin, SkipReason, SubscribeOutcome, classify_evt_next,
         classify_subscribe, describe, win32_code,
@@ -516,6 +517,10 @@ struct ChannelSubscription {
     /// fallback ran. Internal diagnostics; serialized on the status file by
     /// the stacked status patch.
     name_table_misses: u64,
+    /// Holes the resume ladder punched in this channel, newest last and bounded
+    /// so a flapping channel cannot grow without limit. Reported in the status
+    /// file; nothing reads them for a decision.
+    gaps: std::collections::VecDeque<GapRecord>,
     /// Test-only handle accounting, per channel so parallel tests cannot
     /// perturb each other. `opens - closes` must return to its baseline after
     /// any number of rebuilds.
@@ -700,15 +705,19 @@ impl ChannelSubscription {
                         // resolves, so there is no offending record to skip and
                         // nothing to isolate. Go to the time rung directly, or
                         // to future-only when there is no stored time at all.
+                        let previous = self.resume.rung;
                         let rung = self.resume.bookmark_dead();
                         self.bookmark_positioned = false;
+                        self.note_rung_gap(previous, rung);
                         self.log_rung_advance(rung, code, "bookmark_dead");
                         self.schedule_retry(code, &error, cause);
                     }
                     SubscribeOutcome::GeneratedQueryInvalid => {
                         // Our own ladder predicate is invalid. Advance exactly
                         // one rung and never retry the same predicate.
+                        let previous = self.resume.rung;
                         let rung = self.resume.advance_rung();
+                        self.note_rung_gap(previous, rung);
                         self.log_rung_advance(rung, code, "generated_query_invalid");
                         if rung == Rung::IsolateOne {
                             self.batch.isolate();
@@ -897,6 +906,62 @@ impl ChannelSubscription {
             if _closed {
                 self.event_handle_closes += 1;
             }
+        }
+    }
+
+    /// Record the hole a ladder step just created, if it created one.
+    ///
+    /// Called immediately after the step is taken, so `self.resume` already
+    /// describes the new position and `time_floor` gives the point the source
+    /// will resume from. The terminal step has no floor at all: it abandons the
+    /// backlog and starts at the present, so the hole runs up to now.
+    ///
+    /// A step that did not move the ladder records nothing. The terminal rung
+    /// absorbs every further failure, so a channel wedged there would otherwise
+    /// append an entry per rebuild and push its real history out of the bounded
+    /// list. Its state is already visible in the reported rung, which stays on
+    /// that step for as long as the channel is there.
+    ///
+    /// The lossless steps also record nothing, which is decided by the recorder
+    /// and not here, so every call site reports uniformly and none of them has
+    /// to remember which steps lose data.
+    fn note_rung_gap(&mut self, previous: Rung, rung: Rung) {
+        if previous == rung {
+            return;
+        }
+        let now = chrono::Utc::now();
+        let resume_at = match rung {
+            Rung::FutureOnly => Some(now),
+            Rung::TimeAdvance(_) => self.resume.time_floor(),
+            // Bounded by a record rather than by a time.
+            _ => None,
+        };
+        if let Some(gap) = gap_for_rung(rung, self.resume.last_event_time, resume_at, now) {
+            super::status::push_gap(&mut self.gaps, gap);
+        }
+    }
+
+    /// Everything the status file says about this channel.
+    ///
+    /// `stats` is read fresh by the caller rather than taken from anything the
+    /// pull loop maintains: the record-count refresh is deliberately skipped on
+    /// idle channels, and an idle channel is exactly the case a reader has to
+    /// tell apart from a wedged one.
+    fn status(&self, stats: Option<super::status::ChannelRecordStats>) -> ChannelStatus {
+        ChannelStatus {
+            subscribed: self.subscription_handle.is_some(),
+            skipped_reason: self
+                .skipped_this_generation
+                .map(|reason| reason.as_str().to_string()),
+            rung: self.resume.rung.as_str().to_string(),
+            last_event_at: self
+                .last_event_at
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            last_record_id: self.resume.last_record_id,
+            newest_record_id: newest_record_estimate(stats, self.resume.last_record_id),
+            bookmark_positioned: self.bookmark_positioned,
+            retry_attempt: self.backoff.attempt(),
+            gaps: self.gaps.iter().cloned().collect(),
         }
     }
 
@@ -1146,6 +1211,7 @@ impl EventLogSubscription {
                 last_record_id_seen: None,
                 query_filters,
                 name_table_misses: 0,
+                gaps: std::collections::VecDeque::new(),
                 #[cfg(test)]
                 subscription_opens: 0,
                 #[cfg(test)]
@@ -1545,10 +1611,12 @@ impl EventLogSubscription {
                                 // order of precision: isolate to one record,
                                 // skip that record, and only then start
                                 // discarding time windows.
+                                let previous = channel_sub.resume.rung;
                                 let rung = channel_sub.resume.advance_rung();
                                 if rung == Rung::IsolateOne {
                                     channel_sub.batch.isolate();
                                 }
+                                channel_sub.note_rung_gap(previous, rung);
                                 warn!(
                                     message = format!(
                                         "Windows Event Log resume position appears poisoned; \
@@ -2027,12 +2095,39 @@ impl EventLogSubscription {
         self.rate_limiter.as_ref()
     }
 
+    /// Test-only: the gap history recorded for the first channel.
+    #[cfg(test)]
+    pub(super) fn first_channel_gaps(&self) -> Vec<GapRecord> {
+        self.channels[0].gaps.iter().cloned().collect()
+    }
+
     /// Returns (total_channels, active_channels) for health reporting.
     pub fn channel_health_summary(&self) -> (usize, usize) {
         let total = self.channels.len();
         // A channel is considered active if its subscription handle is non-null
         let active = self.channels.iter().filter(|c| c.is_live()).count();
         (total, active)
+    }
+
+    /// Collect the per-channel facts for the status file.
+    ///
+    /// Queries every configured channel's record count and oldest record id
+    /// directly, which is what makes the file useful on an idle host: the pull
+    /// loop skips that refresh for channels that returned nothing, and a quiet
+    /// channel is precisely the case a reader must be able to tell apart from a
+    /// wedged one.
+    ///
+    /// Blocking Win32 calls, so this runs on a blocking thread with the rest of
+    /// the subscription.
+    pub(super) fn status_snapshot(&self) -> StatusSnapshot {
+        let mut snapshot = StatusSnapshot::new(chrono::Utc::now());
+        for channel_sub in &self.channels {
+            let stats = super::render::channel_record_stats(&channel_sub.channel);
+            snapshot
+                .channels
+                .insert(channel_sub.channel.clone(), channel_sub.status(stats));
+        }
+        snapshot
     }
 
     /// Flush all bookmarks to checkpoint storage.
@@ -4070,6 +4165,23 @@ mod tests {
             "the skip costs exactly ONE record: {next_good} must still arrive"
         );
 
+        // The one countable loss on the ladder, and the status file has to say
+        // so: every other step bounds its hole by two times and can only
+        // report that something is missing.
+        let gaps = subscription.first_channel_gaps();
+        let skip = gaps
+            .iter()
+            .find(|gap| gap.cause == "skip_record")
+            .unwrap_or_else(|| {
+                panic!("the skip rung must record the record it dropped: {gaps:#?}")
+            });
+        assert!(skip.exact, "one record is an exact count");
+        assert_eq!(skip.missing_records, Some(1));
+        assert_eq!(
+            skip.to, None,
+            "the hole is bounded by a record, not by a time"
+        );
+
         subscription
             .flush_bookmarks()
             .await
@@ -5753,6 +5865,155 @@ mod tests {
                 vec![expected],
                 "with no stored position, read_existing_events={read_existing} \
                  decides the start point"
+            );
+        }
+    }
+
+    /// The first time rung is an escalation that loses nothing, so it must
+    /// report nothing.
+    ///
+    /// It is the step most easily mistaken for a lossy one, because every other
+    /// escalation on the ladder does lose data. Reporting a hole here would
+    /// send a reader hunting for records that were all delivered.
+    #[tokio::test]
+    async fn the_boundary_tick_rung_records_no_gap() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        assert!(
+            !subscription.pull_events(5).unwrap_or_default().is_empty(),
+            "a stored position is the premise: the channel must deliver something"
+        );
+
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
+            subscription.force_rebuild_all();
+        }
+
+        assert!(
+            subscription.first_channel_resumes_by_time(),
+            "the premise is the first time rung"
+        );
+        assert!(
+            subscription.first_channel_gaps().is_empty(),
+            "the first time rung steps the floor by zero and re-reads the last \
+             event's millisecond, so it can duplicate but never skip. It must \
+             record no gap: {:?}",
+            subscription.first_channel_gaps()
+        );
+    }
+
+    /// Each lossy step reports the hole it made, with the cause of that step
+    /// and an honest statement of whether the loss is countable.
+    ///
+    /// Walked as one ladder rather than as separate cases, because the ordering
+    /// is the property: a widening window is recorded per step, and the
+    /// lossless first step never appears among them.
+    #[tokio::test]
+    async fn each_lossy_rung_records_its_own_gap() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        assert!(
+            !subscription.pull_events(5).unwrap_or_default().is_empty(),
+            "a stored position is the premise: the channel must deliver something"
+        );
+
+        // Each bookmark death takes the next rung: boundary tick, then the five
+        // widening windows, then the terminal rung. The eighth death moves
+        // nothing, because the terminal rung absorbs everything after it, and
+        // it must not append a second entry for a step that did not happen.
+        for _ in 0..8 {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
+            subscription.force_rebuild_all();
+        }
+        assert!(
+            subscription.first_channel_is_future_only(),
+            "the premise is a full walk to the terminal rung"
+        );
+
+        let gaps = subscription.first_channel_gaps();
+        let causes: Vec<&str> = gaps.iter().map(|gap| gap.cause.as_str()).collect();
+        assert_eq!(
+            causes,
+            vec!["+1s", "+10s", "+60s", "+5m", "+30m", "future_only"],
+            "one gap per lossy step, in ladder order, and no entry for the \
+             lossless first step"
+        );
+
+        for gap in &gaps {
+            assert!(
+                !gap.exact,
+                "{} bounds its hole by two times and cannot count what it \
+                 never read",
+                gap.cause
+            );
+            assert_eq!(
+                gap.missing_records, None,
+                "{} must not invent a count",
+                gap.cause
+            );
+            assert!(
+                gap.from.is_some(),
+                "{} must carry the last event delivered as the lower bound",
+                gap.cause
+            );
+            assert!(
+                gap.to.is_some(),
+                "{} must carry the point it resumed at as the upper bound",
+                gap.cause
+            );
+        }
+    }
+
+    /// The snapshot describes every configured channel with the facts a reader
+    /// needs, and the newest-record estimate has to be consistent with what the
+    /// source actually delivered.
+    ///
+    /// Run against a real channel because the estimate is
+    /// `oldest + count - 1` off two Win32 properties, and whether those two
+    /// agree with the record ids the API hands the drain is precisely the thing
+    /// no unit test can settle.
+    #[tokio::test]
+    async fn the_status_snapshot_reports_live_per_channel_facts() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        let delivered = subscription.pull_events(20).unwrap_or_default();
+        assert!(
+            !delivered.is_empty(),
+            "the premise is a channel that delivered something"
+        );
+
+        let snapshot = subscription.status_snapshot();
+        assert_eq!(snapshot.schema, 1);
+        let channel = snapshot
+            .channels
+            .get("Application")
+            .expect("every configured channel appears, subscribed or not");
+
+        assert!(channel.subscribed);
+        assert_eq!(channel.skipped_reason, None);
+        assert_eq!(channel.rung, "bookmark");
+        assert_eq!(channel.retry_attempt, 0);
+        assert!(channel.last_event_at.is_some());
+        assert!(channel.gaps.is_empty(), "a clean read punches no holes");
+
+        let last = channel
+            .last_record_id
+            .expect("records were delivered, so a position exists");
+        assert_eq!(
+            last,
+            delivered.last().unwrap().record_id,
+            "the reported position must be the last record actually delivered"
+        );
+        // The estimate is approximate, so the assertion is the one property a
+        // reader depends on: it never reports the source as further along than
+        // the channel. Absent is allowed; below the delivered record is not,
+        // because that computes as caught up.
+        if let Some(newest) = channel.newest_record_id {
+            assert!(
+                newest >= last,
+                "the newest-record estimate ({newest}) fell below the record \
+                 already delivered ({last}); that reads as caught up when the \
+                 source may not be"
             );
         }
     }
