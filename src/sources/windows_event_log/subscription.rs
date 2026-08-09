@@ -510,6 +510,12 @@ struct ChannelSubscription {
     last_event_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Previous record id, for gap detection.
     last_record_id_seen: Option<u64>,
+    /// When a read on this channel last came back with zero events, which is
+    /// the only exact statement that the subscription was at the head. Reported
+    /// in the status file. Set only where a read genuinely returned nothing:
+    /// never on an error, a batch cap, or a budget stop, all of which leave
+    /// events unread.
+    last_drained_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The active query filters events, so record ids skip by construction and
     /// gap detection cannot mean anything on this channel.
     query_filters: bool,
@@ -909,6 +915,20 @@ impl ChannelSubscription {
         }
     }
 
+    /// Note that a read on this channel came back empty.
+    ///
+    /// The one exact statement available about being caught up, and it is
+    /// stamped here rather than inferred by whatever polls the status file:
+    /// this loop runs far more often than that poll, so a busy channel can hit
+    /// the head repeatedly between two polls and be caught mid-batch by both.
+    ///
+    /// Every caller must have an EMPTY read in hand. An error, a batch cap, or
+    /// an exhausted budget all leave events unread, and stamping any of them
+    /// would claim the head while a backlog sits behind it.
+    fn note_drained_to_empty(&mut self) {
+        self.last_drained_at = Some(chrono::Utc::now());
+    }
+
     /// Record the hole a ladder step just created, if it created one.
     ///
     /// Called immediately after the step is taken, so `self.resume` already
@@ -956,6 +976,9 @@ impl ChannelSubscription {
             rung: self.resume.rung.as_str().to_string(),
             last_event_at: self
                 .last_event_at
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            last_drained_at: self
+                .last_drained_at
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             last_record_id: self.resume.last_record_id,
             newest_record_id: newest_record_estimate(stats, self.resume.last_record_id),
@@ -1209,6 +1232,10 @@ impl EventLogSubscription {
                 // the triage fact this field exists to carry.
                 last_event_at: resume_seed_time,
                 last_record_id_seen: None,
+                // Nothing has been read yet, so nothing proves the head has
+                // been reached. Never seeded from the checkpoint: an old
+                // process reaching the head says nothing about this one.
+                last_drained_at: None,
                 query_filters,
                 name_table_misses: 0,
                 gaps: std::collections::VecDeque::new(),
@@ -1571,6 +1598,13 @@ impl EventLogSubscription {
 
                     match outcome {
                         DrainOutcome::Drained => {
+                            // The channel said it has nothing more. Stamped
+                            // only with an empty batch: were handles ever
+                            // returned alongside this code, records were read
+                            // and being at the head is no longer provable.
+                            if returned == 0 {
+                                channel_sub.note_drained_to_empty();
+                            }
                             channel_drained = true;
                             break;
                         }
@@ -1645,6 +1679,11 @@ impl EventLogSubscription {
                 }
 
                 if returned == 0 {
+                    // A successful read that produced nothing: the subscription
+                    // is at the head of the channel, exactly and with no
+                    // arithmetic. This is the other of the only two ways to
+                    // learn that.
+                    channel_sub.note_drained_to_empty();
                     channel_drained = true;
                     break;
                 }
@@ -5977,9 +6016,11 @@ mod tests {
         let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
         let delivered = subscription.pull_events(20).unwrap_or_default();
-        assert!(
-            !delivered.is_empty(),
-            "the premise is a channel that delivered something"
+        assert_eq!(
+            delivered.len(),
+            20,
+            "the premise is a channel with a backlog, read up to the event \
+             budget and no further"
         );
 
         let snapshot = subscription.status_snapshot();
@@ -5995,6 +6036,23 @@ mod tests {
         assert_eq!(channel.retry_attempt, 0);
         assert!(channel.last_event_at.is_some());
         assert!(channel.gaps.is_empty(), "a clean read punches no holes");
+        // 20 events out of a channel with a real backlog: the reads stopped on
+        // the budget, not on an empty return, so nothing here proves the head
+        // was reached and the field must stay null.
+        assert_eq!(
+            channel.last_drained_at, None,
+            "a read capped by the event budget leaves events unread and must \
+             not claim the channel is caught up"
+        );
+
+        // Read to exhaustion: now an empty return really did happen.
+        drain_all(&mut subscription);
+        let drained = subscription.status_snapshot();
+        assert!(
+            drained.channels["Application"].last_drained_at.is_some(),
+            "a read that came back empty is the exact statement that the \
+             subscription reached the head"
+        );
 
         let last = channel
             .last_record_id
