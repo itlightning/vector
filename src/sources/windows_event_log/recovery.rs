@@ -103,8 +103,7 @@ impl ResumedFrom {
 
 /// One rung of the resume ladder.
 ///
-/// The ordering is deliberate and is the whole point of D17: precision first,
-/// convenience last. A single one-second time rung on a busy channel can
+/// The ordering is deliberate: precision first, convenience last. A single one-second time rung on a busy channel can
 /// discard thousands of good events to escape one bad record; a single-record
 /// skip cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,7 +326,7 @@ impl ResumeState {
     /// no offending record, so a single-record skip is meaningless and isolating
     /// the batch to one record accomplishes nothing. The correct response is the
     /// time rung, or future-events-only when there is no stored time to fall
-    /// back to (D16: that rung is deliberate loss of the whole backlog and its
+    /// back to (that rung is deliberate loss of the whole backlog and its
     /// caller emits ERROR).
     pub(super) const fn bookmark_dead(&mut self) -> Rung {
         self.stuck_count = 0;
@@ -354,7 +353,7 @@ impl ResumeState {
     ///
     /// Flooring makes the query **over-deliver**, never under-deliver. Nothing
     /// trims the excess: the admission gate that used to do so discarded real
-    /// events and was deleted (D31). The duplicates it re-delivers are bounded
+    /// events and was deleted. The duplicates it re-delivers are bounded
     /// by one millisecond of the channel and are accepted, because loss is
     /// unrecoverable and duplication is not.
     pub(super) fn time_floor(&self) -> Option<DateTime<Utc>> {
@@ -373,9 +372,9 @@ impl ResumeState {
     ///
     /// This is the ONLY reason this type can withhold an event, and it is
     /// deliberately blind to the event: it takes no time and no record id,
-    /// because nothing about an event may decide whether the event is sent
-    /// (section 4.0 rules 8 and 31). It returns true exactly once per arming, for the first record
-    /// delivered after the resume, which is the poison record we could not name.
+    /// because nothing about an event may decide whether the event is sent. It
+    /// returns true exactly once per arming, for the first record delivered
+    /// after the resume, which is the poison record we could not name.
     ///
     /// There is no time boundary here and there must never be one again. The
     /// version that compared `(TimeCreated, RecordId)` against the last sent
@@ -383,7 +382,7 @@ impl ResumeState {
     /// order, the provider writes the time, and the two are not ordered
     /// together (35 inversions in 2820 events, worst step 984 ms). The gate
     /// suppressed at most one millisecond of duplicates on a rare fallback path
-    /// and paid with silent, unrecoverable loss on the common one (D31).
+    /// and paid with silent, unrecoverable loss on the common one.
     pub(super) const fn take_poison_skip(&mut self) -> bool {
         if self.skip_next_record {
             self.skip_next_record = false;
@@ -691,7 +690,7 @@ mod tests {
     }
 
     /// The XPath floors to the millisecond so it over-delivers, and nothing
-    /// trims the excess (D31). The re-delivered events are bounded by one
+    /// trims the excess. The re-delivered events are bounded by one
     /// millisecond of the channel, which is the accepted cost.
     #[test]
     fn time_floor_floors_to_the_millisecond() {
@@ -701,7 +700,7 @@ mod tests {
         assert_eq!(floor.timestamp_subsec_nanos(), 123_000_000);
     }
 
-    /// Rules 28 to 31: the stored time and the stored record number are inputs
+    /// The stored time and the stored record number are inputs
     /// to the fallback query and to gap reporting, and they decide nothing
     /// about delivery.
     ///
@@ -729,14 +728,15 @@ mod tests {
         assert!(!resume.take_poison_skip());
 
         // And the stored values track the last event SENT, not the maximum
-        // time seen: rules 19 and 29 build the floor time from the last event the
-        // source sent, so a lower time there over-delivers, which is the safe
+        // time seen: the floor time is built from the last event the source
+        // sent, so a lower time there over-delivers, which is the safe
         // direction.
         assert_eq!(resume.last_event_time, Some(ts(1_699_999_999, 0)));
         assert_eq!(resume.last_record_id, Some(11));
     }
 
-    /// The behavior D17 buys: at the skip rung the poison event is dropped and
+    /// The behavior the rung ordering buys: at the skip rung the poison event
+    /// is dropped and
     /// the very next good event is delivered, so escaping one bad record costs
     /// one record and never a time window.
     ///
@@ -837,7 +837,7 @@ mod tests {
     }
 
     /// Nothing to fall back to: the stranded-bookmark rung. Deliberate loss of
-    /// the whole backlog, which is why its caller emits ERROR (D16).
+    /// the whole backlog, which is why its caller emits ERROR.
     #[test]
     fn dead_bookmark_without_a_stored_time_goes_future_only() {
         let mut resume = ResumeState::new(true);
@@ -1086,7 +1086,7 @@ mod tests {
         }
     }
 
-    /// D23: marking record identity unusable must actually change the ladder's
+    /// Marking record identity unusable must actually change the ladder's
     /// choice. The existing coverage constructs the unusable state directly via
     /// `ResumeState::new(false)`, so the setter itself could do nothing and the
     /// whole forwarded-channel mechanism would silently be a no-op.
@@ -1152,7 +1152,7 @@ mod tests {
         assert_eq!(Rung::TimeAdvance(TimeRung::OneMinute).as_str(), "+60s");
     }
 
-    /// D27's jitter has to keep varying. A PRNG that degenerates to a fixed
+    /// The backoff jitter has to keep varying. A PRNG that degenerates to a fixed
     /// point still produces a legal-looking delay, so the channel-decorrelation
     /// test above passes while every channel is once again perfectly in step
     /// with itself.

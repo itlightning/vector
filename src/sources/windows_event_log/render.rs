@@ -50,7 +50,7 @@ pub(super) fn render_event_xml(
 ) -> Result<String, WindowsEventLogError> {
     const MAX_BUFFER_SIZE: u32 = 10 * 1024 * 1024; // 10MB limit
 
-    // Test-only fault injection for the unprocessable-event path (D19). A real
+    // Test-only fault injection for the unprocessable-event path. A real
     // malformed event is not producible on demand, and the behavior under test
     // (skip the event, keep the subscription, advance past it) is exactly what
     // must not be asserted from the implementation.

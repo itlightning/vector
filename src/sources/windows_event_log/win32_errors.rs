@@ -91,7 +91,7 @@ pub(super) enum SkipReason {
     OperatorQueryInvalid,
     /// 5: no read access. Per-generation only. The 24h periodic refresh is what
     /// retries it, so a transient ACL flap heals within a day out of a
-    /// mechanism already in the plan, and a permanently unreadable channel
+    /// mechanism that already exists, and a permanently unreadable channel
     /// costs one warning per day rather than one per minute.
     AccessDenied,
 }
@@ -150,7 +150,7 @@ pub(super) enum SubscribeOutcome {
 /// (122) is routine here, and making the return type unable to express
 /// "rebuild the subscription" is what keeps buffer growth structurally
 /// incapable of tearing down a subscription. A batch that read successfully but
-/// contains one unprocessable event never costs more than that event (D19).
+/// contains one unprocessable event never costs more than that event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RenderDisposition {
     /// The buffer holds usable text despite the status (partial render).

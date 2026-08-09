@@ -498,9 +498,8 @@ impl WindowsEventLogSource {
                             // DEBUG, not WARN. A channel that is down already
                             // emitted its onset ERROR once and will emit its
                             // recovery WARN once; this 30s pulse would turn one
-                            // episode into a warn-band line every half minute,
-                            // which is the noise D4 exists to prevent. Exactly
-                            // two warn-band lines per episode, no more.
+                            // episode into a warn-band line every half minute.
+                            // Exactly two warn-band lines per episode, no more.
                             debug!(
                                 message = "Some channel subscriptions are inactive.",
                                 total_channels = total,

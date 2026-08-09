@@ -625,7 +625,7 @@ const fn default_render_message() -> bool {
     true
 }
 
-/// Default ON at 24 hours (D9).
+/// Default ON at 24 hours.
 const fn default_subscription_refresh_secs() -> u64 {
     86_400
 }
