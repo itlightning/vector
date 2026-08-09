@@ -822,9 +822,9 @@ mod subscription_tests {
         // Should not panic or consume excessive memory
         let result = extract_xml_value(&large_xml, "EventID");
         // Should either truncate or return None, but not crash
-        match result {
-            Some(value) => assert!(value.len() <= 4096, "Should limit extracted text size"),
-            None => {} // Acceptable if parsing fails due to size limits
+        // None is acceptable: parsing may refuse the input on size alone.
+        if let Some(value) = result {
+            assert!(value.len() <= 4096, "Should limit extracted text size");
         }
     }
 }
@@ -1171,7 +1171,7 @@ mod fault_tolerance_tests {
         let result = extract_event_data(invalid_xml, &config);
         // Should return empty result or handle gracefully without crashing
         assert!(
-            result.structured_data.len() == 0,
+            result.structured_data.is_empty(),
             "Invalid XML should result in empty data"
         );
     }
@@ -1187,7 +1187,7 @@ mod fault_tolerance_tests {
 
         let config = WindowsEventLogConfig::default();
         for malicious_xml in &malicious_xmls {
-            let result = extract_event_data(&malicious_xml, &config);
+            let result = extract_event_data(malicious_xml, &config);
             // Should handle without crashing or excessive resource usage
             assert!(
                 result.structured_data.len() <= 100,
@@ -1406,7 +1406,7 @@ mod checkpoint_tests {
     #[test]
     fn test_checkpoint_path_construction() {
         // Verify that the checkpoint module exists and can be used
-        let _ = std::mem::size_of::<super::super::checkpoint::Checkpointer>();
+        assert!(std::mem::size_of::<super::super::checkpoint::Checkpointer>() > 0);
         // The actual file operations would require Windows, so we only validate type availability.
     }
 }

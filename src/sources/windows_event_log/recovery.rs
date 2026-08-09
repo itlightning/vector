@@ -140,8 +140,13 @@ pub(super) enum TimeRung {
 impl TimeRung {
     pub(super) const fn advance_by(self) -> Duration {
         match self {
-            // One 100ns FILETIME tick, expressed in nanoseconds.
-            Self::BoundaryTick => Duration::from_nanos(100),
+            // Zero, deliberately. `time_floor` floors to the millisecond, so
+            // any step smaller than a millisecond is erased in every case but
+            // one: a last event in the final 100ns of a millisecond would push
+            // the sum over the boundary and drop the rest of that millisecond.
+            // The rung earns its place by switching from bookmark resume to
+            // time-query resume, not by moving the floor (R6, R7).
+            Self::BoundaryTick => Duration::ZERO,
             Self::OneSecond => Duration::from_secs(1),
             Self::TenSeconds => Duration::from_secs(10),
             Self::OneMinute => Duration::from_secs(60),
@@ -345,10 +350,11 @@ impl ResumeState {
     /// The lower bound for the generated XPath predicate, floored to the
     /// millisecond.
     ///
-    /// Flooring makes the query **over-deliver**, never under-deliver, and the
-    /// exact in-process boundary below trims the excess. That is what lets
-    /// precision contribute zero duplicates on every path: the XPath is coarse
-    /// on purpose and the fine cut happens where we have full resolution.
+    /// Flooring makes the query **over-deliver**, never under-deliver. Nothing
+    /// trims the excess: the admission gate that used to do so discarded real
+    /// events and was deleted (D31). The duplicates it re-delivers are bounded
+    /// by one millisecond of the channel and are accepted, because loss is
+    /// unrecoverable and duplication is not (L5).
     pub(super) fn time_floor(&self) -> Option<DateTime<Utc>> {
         let base = self.last_event_time?;
         let advance = match self.rung {
@@ -682,9 +688,9 @@ mod tests {
         assert!(!resume.take_poison_skip());
     }
 
-    /// The XPath floors to the millisecond so it over-delivers; the exact
-    /// in-process boundary trims the excess. Together they contribute zero
-    /// duplicates.
+    /// The XPath floors to the millisecond so it over-delivers, and nothing
+    /// trims the excess (D31). The re-delivered events are bounded by one
+    /// millisecond of the channel, which L5 accepts.
     #[test]
     fn time_floor_floors_to_the_millisecond() {
         let mut resume = ResumeState::new(true);

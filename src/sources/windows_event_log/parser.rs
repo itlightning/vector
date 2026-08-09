@@ -703,8 +703,10 @@ mod tests {
 
     #[test]
     fn test_parse_event_with_xml() {
-        let mut config = WindowsEventLogConfig::default();
-        config.include_xml = true;
+        let config = WindowsEventLogConfig {
+            include_xml: true,
+            ..Default::default()
+        };
 
         let parser = EventLogParser::new(&config, LogNamespace::Legacy);
         let event = create_test_event();

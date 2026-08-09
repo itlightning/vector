@@ -641,20 +641,16 @@ pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
                     current_element.clear();
                 }
             }
-            Ok(XmlEvent::Text(ref e)) => {
-                if inside_target {
-                    match e.unescape() {
-                        Ok(text) => {
-                            if current_element.len() + text.len() > 4096 {
-                                warn!(message = "XML element text too long, truncating.");
-                                break;
-                            }
-                            current_element.push_str(&text);
-                        }
-                        Err(_) => return None,
+            Ok(XmlEvent::Text(ref e)) if inside_target => match e.unescape() {
+                Ok(text) => {
+                    if current_element.len() + text.len() > 4096 {
+                        warn!(message = "XML element text too long, truncating.");
+                        break;
                     }
+                    current_element.push_str(&text);
                 }
-            }
+                Err(_) => return None,
+            },
             Ok(XmlEvent::End(ref e)) => {
                 let name = e.name();
                 let element_name = String::from_utf8_lossy(name.as_ref());
@@ -673,27 +669,24 @@ pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     None
 }
 
+/// One quoting style of `attr_name='value'`. Splitting rather than slicing by
+/// byte offset keeps the search on char boundaries by construction.
+#[cfg(test)]
+fn attribute_quoted_with(xml: &str, attr_name: &str, quote: char) -> Option<String> {
+    let needle = format!("{attr_name}={quote}");
+    let (_, rest) = xml.split_once(&needle)?;
+    let (value, _) = rest.split_once(quote)?;
+    Some(value.to_string())
+}
+
 /// Extract an XML attribute value by attribute name via string search.
 ///
 /// Prefer `parse_system_section` for bulk System field extraction (single pass).
 /// This function is retained for one-off lookups outside the hot path.
 #[cfg(test)]
 pub fn extract_xml_attribute(xml: &str, attr_name: &str) -> Option<String> {
-    let needle = format!("{attr_name}='");
-    if let Some(start) = xml.find(&needle) {
-        let value_start = start + needle.len();
-        if let Some(end) = xml[value_start..].find('\'') {
-            return Some(xml[value_start..value_start + end].to_string());
-        }
-    }
-    let needle = format!("{attr_name}=\"");
-    if let Some(start) = xml.find(&needle) {
-        let value_start = start + needle.len();
-        if let Some(end) = xml[value_start..].find('"') {
-            return Some(xml[value_start..value_start + end].to_string());
-        }
-    }
-    None
+    attribute_quoted_with(xml, attr_name, '\'')
+        .or_else(|| attribute_quoted_with(xml, attr_name, '"'))
 }
 
 #[cfg(test)]
@@ -966,8 +959,10 @@ mod tests {
         </Event>
         "#;
 
-        let mut config = WindowsEventLogConfig::default();
-        config.max_event_data_length = 20;
+        let config = WindowsEventLogConfig {
+            max_event_data_length: 20,
+            ..Default::default()
+        };
 
         let result = extract_event_data(xml, &config);
 
@@ -1136,8 +1131,11 @@ mod tests {
         </Event>
         "#;
 
-        let mut config = WindowsEventLogConfig::default();
-        config.max_event_age_secs = Some(3600); // 1 hour
+        // 1 hour
+        let config = WindowsEventLogConfig {
+            max_event_age_secs: Some(3600),
+            ..Default::default()
+        };
 
         let result = parse_event_xml(xml.to_string(), "Application", &config, None);
         assert!(
@@ -1166,8 +1164,11 @@ mod tests {
             "#
         );
 
-        let mut config = WindowsEventLogConfig::default();
-        config.max_event_age_secs = Some(3600); // 1 hour
+        // 1 hour
+        let config = WindowsEventLogConfig {
+            max_event_age_secs: Some(3600),
+            ..Default::default()
+        };
 
         let result = parse_event_xml(xml, "Application", &config, None);
         assert!(
