@@ -9,8 +9,15 @@ pub enum WindowsEventLogError {
         source: windows::core::Error,
     },
 
-    #[snafu(display("Failed to create event subscription: {}", source))]
-    CreateSubscriptionError { source: windows::core::Error },
+    #[snafu(display(
+        "Failed to create event subscription for channel '{}': {}",
+        channel,
+        source
+    ))]
+    CreateSubscriptionError {
+        channel: String,
+        source: windows::core::Error,
+    },
 
     #[snafu(display("Failed to query events: {}", source))]
     QueryEventsError { source: windows::core::Error },
@@ -60,8 +67,11 @@ pub enum WindowsEventLogError {
     #[snafu(display("Failed to render event: {}", message))]
     RenderError { message: String },
 
-    #[snafu(display("Failed to create subscription: {}", source))]
-    SubscriptionError { source: windows::core::Error },
+    #[snafu(display("Subscription error on channel '{}': {}", channel, source))]
+    SubscriptionError {
+        channel: String,
+        source: windows::core::Error,
+    },
 
     #[snafu(display("Failed to seek events: {}", source))]
     SeekEventsError { source: windows::core::Error },
@@ -231,6 +241,60 @@ mod tests {
 
         let error = WindowsEventLogError::TimeoutError { timeout_secs: 30 };
         assert!(error.user_message().contains("timed out"));
+    }
+
+    /// Every channel-scoped variant must name its channel in the RENDERED
+    /// message, not only in a structured field.
+    ///
+    /// A downstream reader that only has the message line and no channel in it
+    /// will guess, and a misattributed channel sends an operator to investigate
+    /// the wrong thing. This is asserted per variant so a new one cannot be
+    /// added without a channel and go unnoticed.
+    #[test]
+    fn channel_scoped_errors_name_their_channel_in_the_message() {
+        const CHANNEL: &str = "Microsoft-Windows-Windows Defender/Operational";
+
+        let win32 = || windows::core::Error::from_hresult(windows::core::HRESULT(5));
+
+        let channel_scoped: Vec<WindowsEventLogError> = vec![
+            WindowsEventLogError::OpenChannelError {
+                channel: CHANNEL.to_string(),
+                source: win32(),
+            },
+            WindowsEventLogError::CreateSubscriptionError {
+                channel: CHANNEL.to_string(),
+                source: win32(),
+            },
+            WindowsEventLogError::SubscriptionError {
+                channel: CHANNEL.to_string(),
+                source: win32(),
+            },
+            WindowsEventLogError::PullEventsError {
+                channel: CHANNEL.to_string(),
+                source: win32(),
+            },
+            WindowsEventLogError::AccessDeniedError {
+                channel: CHANNEL.to_string(),
+            },
+            WindowsEventLogError::ChannelNotFoundError {
+                channel: CHANNEL.to_string(),
+            },
+        ];
+
+        for error in channel_scoped {
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(CHANNEL),
+                "the rendered message must name the channel, or a reader with only \
+                 this line will attribute the failure to the wrong channel. Got: \
+                 {rendered}"
+            );
+            let user = error.user_message();
+            assert!(
+                user.contains(CHANNEL),
+                "user_message must name the channel too. Got: {user}"
+            );
+        }
     }
 
     #[test]

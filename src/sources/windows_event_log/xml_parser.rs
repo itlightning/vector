@@ -406,7 +406,10 @@ pub fn build_event(
             let diff = (Utc::now() - dt_utc).num_days().abs();
             if diff > 365 * 10 {
                 warn!(
-                    message = "Event timestamp is more than 10 years from current time.",
+                    message = format!(
+                        "Event timestamp is more than 10 years from current time \
+                         (channel={channel}, record_id={record_id})."
+                    ),
                     timestamp = %dt_utc,
                     channel = %channel,
                     record_id = record_id,

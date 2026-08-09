@@ -20,9 +20,14 @@ const MAX_BOOKMARK_XML_SIZE: usize = 1024 * 1024;
 ///
 /// Bookmarks provide robust, Windows-managed position tracking in event logs.
 /// They are opaque handles that can be serialized to XML for persistence.
+///
+/// The channel is carried purely so that every failure this type raises or logs
+/// can name it. A bookmark belongs to exactly one channel, and an error line
+/// that does not say which one sends an operator to the wrong place.
 #[derive(Debug)]
 pub struct BookmarkManager {
     handle: EVT_HANDLE,
+    channel: String,
 }
 
 impl BookmarkManager {
@@ -31,16 +36,26 @@ impl BookmarkManager {
     /// # Errors
     ///
     /// Returns an error if the Windows API fails to create the bookmark.
-    pub fn new() -> Result<Self, WindowsEventLogError> {
+    pub fn new(channel: &str) -> Result<Self, WindowsEventLogError> {
         unsafe {
             let handle = EvtCreateBookmark(None).map_err(|e| {
-                error!(message = "Failed to create bookmark.", error = %e);
-                WindowsEventLogError::CreateSubscriptionError { source: e }
+                error!(
+                    message = format!("Failed to create bookmark (channel={channel})."),
+                    channel = %channel,
+                    error = %e
+                );
+                WindowsEventLogError::CreateSubscriptionError {
+                    channel: channel.to_string(),
+                    source: e,
+                }
             })?;
 
             debug!(message = "Created new bookmark.", handle = ?handle);
 
-            Ok(Self { handle })
+            Ok(Self {
+                handle,
+                channel: channel.to_string(),
+            })
         }
     }
 
@@ -55,9 +70,9 @@ impl BookmarkManager {
     /// # Errors
     ///
     /// Returns an error if the XML is invalid or the Windows API fails.
-    pub fn from_xml(xml: &str) -> Result<Self, WindowsEventLogError> {
+    pub fn from_xml(xml: &str, channel: &str) -> Result<Self, WindowsEventLogError> {
         if xml.is_empty() {
-            return Self::new(); // Empty XML = fresh bookmark
+            return Self::new(channel); // Empty XML = fresh bookmark
         }
 
         unsafe {
@@ -65,12 +80,18 @@ impl BookmarkManager {
             match EvtCreateBookmark(&xml_hstring) {
                 Ok(handle) => {
                     debug!(message = "Created bookmark from XML.", handle = ?handle);
-                    Ok(Self { handle })
+                    Ok(Self {
+                        handle,
+                        channel: channel.to_string(),
+                    })
                 }
                 Err(e) => {
                     // Propagate the error so the caller can decide how to handle it
                     // (e.g., fall back to a fresh bookmark with has_valid_checkpoint = false)
-                    Err(WindowsEventLogError::CreateSubscriptionError { source: e })
+                    Err(WindowsEventLogError::CreateSubscriptionError {
+                        channel: channel.to_string(),
+                        source: e,
+                    })
                 }
             }
         }
@@ -97,14 +118,25 @@ impl BookmarkManager {
         if super::subscription::FAIL_ALL_BOOKMARK_UPDATES.load(std::sync::atomic::Ordering::SeqCst)
         {
             return Err(WindowsEventLogError::SubscriptionError {
+                channel: self.channel.clone(),
                 source: windows::core::Error::from_hresult(windows::core::HRESULT(6)),
             });
         }
 
         unsafe {
             EvtUpdateBookmark(self.handle, event_handle).map_err(|e| {
-                error!(message = "Failed to update bookmark.", error = %e);
-                WindowsEventLogError::SubscriptionError { source: e }
+                error!(
+                    message = format!(
+                        "Failed to update bookmark (channel={}).",
+                        self.channel
+                    ),
+                    channel = %self.channel,
+                    error = %e
+                );
+                WindowsEventLogError::SubscriptionError {
+                    channel: self.channel.clone(),
+                    source: e,
+                }
             })?;
 
             debug!(message = "Updated bookmark.", event_handle = ?event_handle);
@@ -286,7 +318,7 @@ mod tests {
     #[test]
     fn test_bookmark_lifecycle() {
         // Test creating a new bookmark
-        let bookmark = BookmarkManager::new();
+        let bookmark = BookmarkManager::new("Application");
         assert!(bookmark.is_ok());
 
         // Test serialization (should work even without updating)
@@ -297,13 +329,13 @@ mod tests {
     #[test]
     fn test_bookmark_from_empty_xml() {
         // Empty XML should create a fresh bookmark
-        let bookmark = BookmarkManager::from_xml("");
+        let bookmark = BookmarkManager::from_xml("", "Application");
         assert!(bookmark.is_ok());
     }
 
     #[test]
     fn test_bookmark_handle() {
-        let bookmark = BookmarkManager::new().unwrap();
+        let bookmark = BookmarkManager::new("Application").unwrap();
         let handle = bookmark.as_handle();
         assert!(!handle.is_invalid(), "Bookmark handle should be valid");
     }
