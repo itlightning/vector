@@ -154,13 +154,13 @@ pub(super) static EVT_NEXT_SCRIPT: std::sync::Mutex<
 ///
 /// A failed rebuild is otherwise unreachable from a test on a healthy host, and
 /// the interesting case is precisely a failure that arrives while the current
-/// subscription is still serving events (D22).
+/// subscription is still serving events.
 #[cfg(test)]
 pub(super) static EVT_SUBSCRIBE_SCRIPT: std::sync::Mutex<Option<std::collections::VecDeque<u32>>> =
     std::sync::Mutex::new(None);
 
 /// Test-only: force `render_event_xml` to fail, so the unprocessable-event path
-/// (D19) can be exercised without a real malformed event.
+/// can be exercised without a real malformed event.
 #[cfg(test)]
 pub(super) static FAIL_ALL_RENDERS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -176,10 +176,9 @@ pub(super) static FAIL_ALL_BOOKMARK_UPDATES: std::sync::atomic::AtomicBool =
 /// Test-only record of the batch size requested from each `EvtNext` call, as
 /// `(channel, requested)`.
 ///
-/// The batch ladder (D11) is only meaningful as what we ASK the API for next, so
-/// this is the observable the adaptation tests assert on. Asserting the internal
-/// counter instead is exactly the failure mode section 10.4 of the plan
-/// describes. It doubles as the round-robin observable: the channel order across
+/// The batch ladder is only meaningful as what we ASK the API for next, so this
+/// is the observable the adaptation tests assert on, rather than the internal
+/// counter. It doubles as the round-robin observable: the channel order across
 /// calls is visible here and nowhere else.
 #[cfg(test)]
 pub(super) static EVT_NEXT_REQUESTS: std::sync::Mutex<Option<Vec<(String, usize)>>> =
@@ -197,7 +196,7 @@ pub(super) static EVT_NEXT_RETURNED_TOTAL: std::sync::atomic::AtomicU64 =
 
 /// Test-only record of the flags passed to each `EvtSubscribe` call.
 ///
-/// `EvtSubscribeStrict` is D20 and load-bearing: without it Windows silently
+/// `EvtSubscribeStrict` is load-bearing: without it Windows silently
 /// repositions on a dead bookmark and silent data loss presents as a healthy
 /// subscription. Nothing else in the system can observe that a flag was dropped,
 /// so the exact argument is recorded and asserted. The length also counts
@@ -209,7 +208,7 @@ pub(super) static EVT_SUBSCRIBE_FLAG_LOG: std::sync::Mutex<Option<Vec<u32>>> =
 
 /// Why a rebuild is happening, which decides what a failure is allowed to cost.
 ///
-/// The distinction is the whole of D22: rebuilding a channel that is already
+/// The distinction is the whole point: rebuilding a channel that is already
 /// dead has nothing to preserve, but a proactive rebuild (periodic refresh,
 /// batch reduction) runs against a HEALTHY subscription, and tearing that down
 /// because its replacement failed to open is a self-inflicted outage.
@@ -267,8 +266,7 @@ fn escape_xml_attr(raw: &str) -> String {
 impl SubscriptionFactory {
     /// The query to subscribe with at this ladder rung, and its origin.
     ///
-    /// Two shapes carry the floor, chosen by what the operator configured
-    /// (D32, section 4.0.2).
+    /// Two shapes carry the floor, chosen by what the operator configured.
     ///
     /// With no `event_query`, the floor becomes a plain XPath predicate.
     ///
@@ -283,7 +281,7 @@ impl SubscriptionFactory {
     ///
     /// Nothing trims the over-delivery that remains. The in-process
     /// `(TimeCreated, RecordId)` boundary that used to do it discarded real
-    /// events and was deleted (D31).
+    /// events and was deleted.
     fn query_for(&self, resume: &ResumeState) -> (String, QueryOrigin) {
         let Some(floor) = resume.time_floor() else {
             return (self.base_query.clone(), self.base_origin);
@@ -382,13 +380,13 @@ impl SubscriptionFactory {
         match result {
             Ok(handle) => Ok((handle, origin)),
             Err(e) => {
-                // D32 safety valve. A composed structured query is OURS, so a
-                // rejection must not be charged to the ladder: every rung would
-                // compose the same shape, fail the same way, and walk to
-                // `FutureOnly`, discarding the backlog over a query we wrote.
-                // Retry once with the operator's query alone, which is the
-                // pre-D32 behavior (a full re-read), and let the ladder judge
-                // that instead.
+                // Composition safety valve. A composed structured query is
+                // OURS, so a rejection must not be charged to the ladder: every
+                // rung would compose the same shape, fail the same way, and
+                // walk to `FutureOnly`, discarding the backlog over a query we
+                // wrote. Retry once with the operator's query alone, which is
+                // the behavior from before composition existed (a full
+                // re-read), and let the ladder judge that instead.
                 if origin == QueryOrigin::Generated && query.trim_start().starts_with('<') {
                     warn!(
                         message = "Composed Windows Event Log resume query was rejected; falling back to the operator query and reading from the oldest record.",
@@ -416,7 +414,7 @@ impl SubscriptionFactory {
 
     /// One `EvtSubscribe` attempt.
     ///
-    /// Split out so the D32 fallback can make a second attempt with a
+    /// Split out so the composed-query fallback can make a second attempt with a
     /// different query without duplicating the fault-injection seam.
     fn subscribe_with(
         &self,
@@ -594,7 +592,7 @@ impl ChannelSubscription {
     /// not only about the order of two calls: a proactive rebuild runs against a
     /// live subscription, so a failed replacement must leave that subscription
     /// serving events and be retried later. Closing it would be exactly the
-    /// strand D22 exists to prevent.
+    /// strand this ordering exists to prevent.
     fn rebuild(&mut self, cause: &str, kind: RebuildKind) -> bool {
         self.retry_at = None;
 
@@ -655,7 +653,7 @@ impl ChannelSubscription {
             Err((error, origin)) => {
                 let code = win32_code(&error);
 
-                // D22. A proactive rebuild's replacement failed, but the current
+                // A proactive rebuild's replacement failed, but the current
                 // subscription is healthy and still serving events. Keep it,
                 // say so at DEBUG (this is not an episode: nothing is down), and
                 // come back to it on a backoff-spaced schedule.
@@ -692,7 +690,7 @@ impl ChannelSubscription {
                     }
                     SubscribeOutcome::GeneratedQueryInvalid => {
                         // Our own ladder predicate is invalid. Advance exactly
-                        // one rung (D21) and never retry the same predicate.
+                        // one rung and never retry the same predicate.
                         let rung = self.resume.advance_rung();
                         self.log_rung_advance(rung, code, "generated_query_invalid");
                         if rung == Rung::IsolateOne {
@@ -709,7 +707,7 @@ impl ChannelSubscription {
 
     /// Announce a resume-ladder move. Every rung is deliberate data loss and
     /// must be visible; the terminal rung discards the whole backlog and is
-    /// therefore an ERROR (D16).
+    /// therefore an ERROR.
     fn log_rung_advance(&self, rung: Rung, code: u32, reason: &str) {
         if rung == Rung::FutureOnly {
             error!(
@@ -740,7 +738,7 @@ impl ChannelSubscription {
     /// Skip this channel for this subscription generation.
     ///
     /// The 24h periodic refresh is what retries it, so a transient ACL flap
-    /// heals within a day out of a mechanism already in the plan, and a
+    /// heals within a day out of a mechanism that already exists, and a
     /// permanently unreadable channel costs one warning per day rather than one
     /// per minute.
     fn skip_channel(&mut self, reason: SkipReason, code: u32, error: &windows::core::Error) {
@@ -1092,7 +1090,7 @@ impl EventLogSubscription {
                 // event arrives. An onset ERROR raised right after a restart
                 // would otherwise report `last_event_at=never` on a channel
                 // that has been collecting for weeks, which is the opposite of
-                // the triage fact D29 exists to carry.
+                // the triage fact this field exists to carry.
                 last_event_at: resume_seed_time,
                 last_record_id_seen: None,
                 query_filters,
@@ -1562,7 +1560,7 @@ impl EventLogSubscription {
                                 event.keyword_names = display.keyword_names;
 
                                 // The ONLY reason an event that rendered is not
-                                // sent (D31, rules 6 and 7). There is no time
+                                // sent. There is no time
                                 // comparison here and there must never be one:
                                 // the API delivers in record order, the
                                 // provider writes the time, and a gate on time
@@ -1850,7 +1848,7 @@ impl EventLogSubscription {
     ///
     /// This is a decision, not a field: forwarded rendered-text delivery marks a
     /// channel's record ids as untrustworthy and self-disables gap detection
-    /// (D23), and the only way that decision shows up anywhere is in the verdict
+    /// and the only way that decision shows up anywhere is in the verdict
     /// `evaluate_gap` returns.
     #[cfg(test)]
     pub(super) fn first_channel_reports_record_id_gaps(&self) -> bool {
@@ -2667,9 +2665,9 @@ mod tests {
     }
 
     /// A failed PROACTIVE rebuild must leave the live subscription serving
-    /// events (D22).
+    /// events.
     ///
-    /// The periodic refresh (D9) and batch reduction (D11) both rebuild while
+    /// The periodic refresh and batch reduction both rebuild while
     /// the current subscription is HEALTHY. Closing it because its replacement
     /// failed to open is a self-inflicted outage, and it is the exact failure
     /// mode build-new-then-swap exists to prevent.
@@ -2730,7 +2728,7 @@ mod tests {
         );
     }
 
-    /// D19: an event we cannot process costs exactly that event, ONCE.
+    /// An event we cannot process costs exactly that event, ONCE.
     ///
     /// Skipping it without advancing the bookmark past it means a restart reads
     /// it again and skips it again, forever: the channel can never make progress
@@ -3035,8 +3033,7 @@ mod tests {
     // below asserts an observable outcome (what batch size is requested next,
     // which channel is drained next, what flag word reaches the API, what is
     // delivered), never a field the implementation happens to set. That
-    // distinction is section 10.4 of the plan and it is why these tests are
-    // phrased the way they are.
+    // distinction is why these tests are phrased the way they are.
     // ---------------------------------------------------------------------
 
     /// Records the batch size asked of each `EvtNext` call.
@@ -3168,7 +3165,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // D20: the subscribe flag word.
+    // The subscribe flag word.
     // ---------------------------------------------------------------------
 
     /// `EvtSubscribeStrict` is the mechanism that makes a dead bookmark fail
@@ -3205,7 +3202,7 @@ mod tests {
             0,
             "EvtSubscribeStrict must be set: without it Windows silently \
              repositions on a dead bookmark and data loss presents as a healthy \
-             subscription (D20)"
+             subscription"
         );
     }
 
@@ -3237,10 +3234,11 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // D22: what a failed rebuild is allowed to cost, per rebuild kind.
+    // What a failed rebuild is allowed to cost, per rebuild kind.
     // ---------------------------------------------------------------------
 
-    /// The two operands of the D22 guard mean different things and must be
+    /// The two operands of the proactive-rebuild guard mean different things and
+    /// must be
     /// pinned independently. This is the FromDead-with-a-live-handle case: the
     /// periodic refresh is not in play, so there is nothing to preserve and the
     /// failed rebuild legitimately leaves the channel down.
@@ -3327,7 +3325,7 @@ mod tests {
         );
     }
 
-    /// D21: our OWN generated predicate coming back invalid advances one rung,
+    /// Our OWN generated predicate coming back invalid advances one rung,
     /// and the isolate rung's whole purpose is that the next read asks for one
     /// record so a failure is attributable to exactly one record.
     #[tokio::test]
@@ -3426,7 +3424,7 @@ mod tests {
     // Periodic refresh and backoff scheduling.
     // ---------------------------------------------------------------------
 
-    /// D9: the refresh fires when it is DUE and then schedules the next one into
+    /// The refresh fires when it is DUE and then schedules the next one into
     /// the future. Firing early wastes rebuilds; rescheduling into the past
     /// rebuilds on every single pull.
     #[tokio::test]
@@ -3532,8 +3530,8 @@ mod tests {
         );
     }
 
-    /// D23 self-disables record-id gap detection for channels delivered as
-    /// forwarded rendered text. Reading LOCAL events must not trip that: doing so
+    /// The source self-disables record-id gap detection for channels delivered
+    /// as forwarded rendered text. Reading LOCAL events must not trip that: doing so
     /// would silently switch off the only signal we have for retention-overwrite
     /// data loss, on every channel, forever.
     #[tokio::test]
@@ -3555,7 +3553,7 @@ mod tests {
         );
     }
 
-    /// Rule 3: the source sends every event in the batch.
+    /// The source sends every event in the batch.
     ///
     /// Asserted against the count `EvtNext` handed back, which is the only
     /// oracle in reach that does not itself pass through the drain's own
@@ -3589,7 +3587,7 @@ mod tests {
                 "record {record_id} was delivered twice within one drain"
             );
         }
-        // Rule 2, on real record numbers rather than injected ones: the API
+        // On real record numbers rather than injected ones: the API
         // hands events back in record order and the source preserves it.
         // Record order is the ONLY order the source may rely on, because the
         // times in this very backlog are not sorted.
@@ -3598,8 +3596,9 @@ mod tests {
             "EvtNext delivers in record order and the source must preserve it"
         );
         // Equality, on a healthy host with no injected render failure and no
-        // armed poison skip: rules 5 and 6 are the only subtractions and
-        // neither is in play here, so rule 7 leaves nothing else to subtract.
+        // armed poison skip: a failed render and the poison skip are the only
+        // subtractions, and neither is in play here, so nothing else can be
+        // subtracted.
         let returned = request_log.returned_total();
         assert_eq!(
             delivered.len() as u64,
@@ -3727,7 +3726,7 @@ mod tests {
         );
     }
 
-    /// D17, at the layer that actually runs it: the deliberate one-shot skip.
+    /// The deliberate one-shot skip, at the layer that actually runs it.
     ///
     /// `admit` has good unit tests and they are load-bearing for nothing on
     /// their own, because the drain loop is `admit`'s only caller. Driven from
@@ -3778,7 +3777,7 @@ mod tests {
             "record {poisoned} sat immediately past the resume boundary on the \
              skip rung and had to be dropped; the escape did nothing"
         );
-        // Rule 6: deliberate loss of a real event is never silent.
+        // Deliberate loss of a real event is never silent.
         assert!(
             warns
                 .iter()
@@ -3808,7 +3807,7 @@ mod tests {
         );
     }
 
-    /// D24: the periodic refresh is the ONLY thing that ever un-skips a channel.
+    /// The periodic refresh is the ONLY thing that ever un-skips a channel.
     /// A skipped channel is deliberately not retried on the pull path, so if the
     /// refresh does not clear the skip, a transient ACL flap or a momentary bad
     /// channel path becomes a permanent outage for the life of the process.
@@ -3833,7 +3832,7 @@ mod tests {
         assert!(
             !subscription.first_channel_is_live(),
             "the pull path must not retry a skipped channel; that is the retry \
-             loop and the log noise D24 removes"
+             loop and the log noise that refresh-only un-skipping removes"
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -3846,10 +3845,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // D11: the halve-and-recover cycle on RPC_S_INVALID_BOUND (1734).
+    // The halve-and-recover cycle on RPC_S_INVALID_BOUND (1734).
     //
     // 1734 is a real platform condition we have never been able to trigger on
-    // our hardware (plan 10.2 leg 5, 10.5), so until now our response to it was
+    // our hardware, so until now our response to it was
     // verified by nothing but a classifier routing test. These drive the whole
     // cycle through the EvtNext seam and assert it in terms of what we ask the
     // API for next and what comes back.
@@ -4012,7 +4011,7 @@ mod tests {
 
     /// Nothing is lost and nothing is duplicated across the whole cycle.
     ///
-    /// This is the invariant D8 trades partial-batch emit away for: on 1734 the
+    /// This is the invariant that discarding a partial batch buys: on 1734 the
     /// API cursor advances even when the call fails, so the returned handles are
     /// discarded and the position is taken from the bookmark instead. If that
     /// were wrong, the events in flight at each fault would silently vanish.
@@ -4267,7 +4266,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Generated query composition (D21).
+    // Generated query composition.
     // ---------------------------------------------------------------------
 
     /// The generated time predicate is composed onto a wildcard base and
@@ -4319,7 +4318,7 @@ mod tests {
         );
 
         // Time rung over an operator query: composed as a structured query
-        // with the floor in a Suppress clause (D32). The operator's XPath is
+        // with the floor in a Suppress clause. The operator's XPath is
         // carried through verbatim as the Select body, never rewritten.
         let (composed, origin) = factory(OPERATOR_QUERY).query_for(&resume);
         assert_eq!(origin, QueryOrigin::Generated);
@@ -4414,7 +4413,7 @@ mod tests {
 
     /// Windows must ACCEPT the composed structured query.
     ///
-    /// The whole of D32 rests on `Suppress` taking an absolute `@SystemTime`
+    /// The whole composition rests on `Suppress` taking an absolute `@SystemTime`
     /// bound. Nothing in the unit tests above can prove that: they assert the
     /// string we generate, not that `wevtapi` parses it. This subscribes for
     /// real against `Application`.
@@ -4441,7 +4440,7 @@ mod tests {
         let built = factory.build(signal, &bookmark, false, &resume);
         let (handle, origin) = built.unwrap_or_else(|(e, _)| {
             panic!(
-                "Windows rejected the composed query, so D32's premise is wrong \
+                "Windows rejected the composed query, so the composition's premise is wrong \
                  and the Suppress mechanism must be replaced: {e}\nquery: {composed}"
             )
         });
@@ -4514,7 +4513,8 @@ mod tests {
             suppressed, 0,
             "a Suppress floor ten years in the future must hide every existing \
              event; {unfiltered} came back unfiltered but {suppressed} survived \
-             the floor, so Suppress is being ignored and D32 does not work"
+             the floor, so Suppress is being ignored and the composed floor \
+             does not work"
         );
     }
 
@@ -4563,7 +4563,7 @@ mod tests {
         }
     }
 
-    /// D16: the terminal rung discards the channel's whole backlog and is an
+    /// The terminal rung discards the channel's whole backlog and is an
     /// ERROR. Every other rung discards a bounded window and is a WARN.
     ///
     /// The severity IS the decision here, so both directions are asserted: a
@@ -4623,7 +4623,7 @@ mod tests {
     }
 
     /// `last_event_at` is the triage fact on the onset ERROR and the recovery
-    /// WARN (D29), and the agent's give-up WARN (D30) reads it. It is absolute
+    /// WARN, and the agent's give-up WARN reads it. It is absolute
     /// so consumers derive the age, and "never" is a distinct, meaningful value.
     #[tokio::test]
     async fn last_event_at_reads_never_until_an_event_arrives_and_a_timestamp_after() {
@@ -4681,7 +4681,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // D23: rendered-text delivery revokes record-id trust.
+    // Rendered-text delivery revokes record-id trust.
     // ---------------------------------------------------------------------
 
     /// Rewrites the XML of every rendered event.
@@ -4775,7 +4775,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // D31, section 4.0: every event `EvtNext` returns is sent.
+    // Every event `EvtNext` returns is sent.
     //
     // Event time never decides delivery. The API delivers in RECORD order and
     // the time is written by the PROVIDER, so the two are not ordered together:
@@ -5161,8 +5161,8 @@ mod tests {
     /// in play, the bookmark is healthy, and the only unusual thing about the
     /// events is the time their providers wrote. The stored position is loaded
     /// from the checkpoint here rather than held in memory, so this also pins
-    /// rule 31 against the PERSISTED value: it builds the floor time and it
-    /// decides nothing.
+    /// the rule against the PERSISTED value: the stored position builds the
+    /// floor time and it decides nothing about delivery.
     #[tokio::test]
     async fn events_older_than_the_stored_resume_time_are_still_sent() {
         let _seams = SeamSession::acquire();
@@ -5206,7 +5206,7 @@ mod tests {
         );
     }
 
-    /// Rule 12: a first start is normal operation and says nothing.
+    /// A first start is normal operation and says nothing.
     ///
     /// The default is `read_existing_events = false`, so a fresh install reads
     /// only new events. That is a configuration choice, not data loss, and an
@@ -5219,7 +5219,8 @@ mod tests {
         let _seams = SeamSession::acquire();
         assert!(
             !WindowsEventLogConfig::default().read_existing_events,
-            "rule 11 calls this the default; if it changes, the rule changes"
+            "reading only new events is the documented default; if it changes, \
+             the documented contract changes with it"
         );
         let mut config = application_config();
         config.read_existing_events = false;
@@ -5241,7 +5242,7 @@ mod tests {
         );
     }
 
-    /// Rules 21 and 24: a time rung cannot compose onto an operator query, so
+    /// A time rung cannot compose onto an operator query, so
     /// the source re-reads the channel from the OLDEST record.
     ///
     /// That is a large duplicate burst, and it is a deliberate choice: the
@@ -5285,8 +5286,7 @@ mod tests {
         );
     }
 
-    /// Rules 23 and 25: the boundary-tick rung re-reads a millisecond and loses
-    /// nothing.
+    /// The boundary-tick rung re-reads a millisecond and loses nothing.
     ///
     /// It is the only lossless rung, and it is lossless BECAUSE it over-reads:
     /// the XPath floors to the millisecond, so events already sent can come

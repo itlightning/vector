@@ -213,7 +213,7 @@ const fn reuses_the_same_handle(outcome: DrainOutcome) -> bool {
 ///
 /// False for every variant by construction: `RenderDisposition` has no rebuild
 /// arm, which is how `ERROR_INSUFFICIENT_BUFFER` (122), routine on every size
-/// probe, is kept structurally incapable of tearing down a subscription (D18).
+/// probe, is kept structurally incapable of tearing down a subscription.
 const fn tears_down_the_subscription(disposition: RenderDisposition) -> bool {
     match disposition {
         RenderDisposition::UseBuffer => false,
@@ -507,11 +507,11 @@ fn replay(resume: &mut ResumeState, batch: &[(DateTime<Utc>, u64)]) -> (Vec<u64>
     (sent, withheld)
 }
 
-/// Rules 3 to 8 and rule 31, over arbitrary times: every event in the batch is
-/// sent, and the poison one-shot is the only thing that can withhold one.
+/// Over arbitrary times: every event in the batch is sent, and the poison
+/// one-shot is the only thing that can withhold one.
 ///
-/// The render skip (rule 5) is not reachable from the pure layer, so this
-/// property speaks for rule 6 and for the absence of any other exception.
+/// The render skip is not reachable from the pure layer, so this property
+/// speaks for the poison one-shot and for the absence of any other exception.
 #[test]
 fn every_event_is_sent_unless_the_poison_one_shot_withholds_it() {
     check(
@@ -552,7 +552,7 @@ fn every_event_is_sent_unless_the_poison_one_shot_withholds_it() {
     );
 }
 
-/// Rule 8 as a total claim: the times have NO effect.
+/// The total claim: the event times have NO effect.
 ///
 /// Two batches with the same record numbers and completely different times
 /// produce the same delivery decisions. A single comparison on an event time
