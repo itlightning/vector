@@ -91,11 +91,24 @@ pub(super) struct ChannelStatus {
     pub(super) rung: String,
     /// `TimeCreated` of the most recent event delivered from this channel.
     pub(super) last_event_at: Option<String>,
+    /// When this channel last returned zero events to a read, meaning the
+    /// subscription was at the head of the channel at that moment. `null` until
+    /// it has happened since the process started.
+    ///
+    /// Exact, unlike [`Self::newest_record_id`], and it is the fact a reader
+    /// should decide on: a read that comes back empty IS caught up, with no
+    /// arithmetic and no approximation. It has to be stamped here because the
+    /// source reads far more often than anything polling this file, so a busy
+    /// channel can reach the head many times between two samples and be caught
+    /// mid-batch by both of them.
+    pub(super) last_drained_at: Option<String>,
     /// `EventRecordID` of the most recent event delivered from this channel.
     pub(super) last_record_id: Option<u64>,
-    /// Estimated newest record id present in the channel. See
-    /// [`newest_record_estimate`] for what makes it an estimate and when it is
-    /// withheld.
+    /// Estimated newest record id present in the channel. Reported for a human
+    /// reading the file; it decides nothing, because it undershoots on a
+    /// channel whose record ids have holes and so is biased toward calling a
+    /// behind channel caught up. See [`newest_record_estimate`] for what makes
+    /// it an estimate and when it is withheld entirely.
     pub(super) newest_record_id: Option<u64>,
     /// Whether the stored bookmark marks a real position.
     pub(super) bookmark_positioned: bool,
@@ -504,6 +517,7 @@ mod tests {
                 skipped_reason: None,
                 rung: "bookmark".to_string(),
                 last_event_at: Some(rfc3339(ts(1_700_000_000))),
+                last_drained_at: Some(rfc3339(ts(1_700_000_090))),
                 last_record_id: Some(123_456),
                 newest_record_id: Some(123_460),
                 bookmark_positioned: true,
@@ -526,6 +540,7 @@ mod tests {
                 skipped_reason: Some("access_denied".to_string()),
                 rung: "bookmark".to_string(),
                 last_event_at: None,
+                last_drained_at: None,
                 last_record_id: None,
                 newest_record_id: None,
                 bookmark_positioned: false,
@@ -555,6 +570,7 @@ mod tests {
         assert_eq!(defender["last_record_id"], 123_456);
         assert_eq!(defender["newest_record_id"], 123_460);
         assert_eq!(defender["bookmark_positioned"], true);
+        assert_eq!(defender["last_drained_at"], "2023-11-14T22:14:50.000Z");
         assert_eq!(defender["retry_attempt"], 0);
         assert_eq!(defender["gaps"][0]["cause"], "skip_record");
         assert_eq!(defender["gaps"][0]["exact"], true);
@@ -565,6 +581,7 @@ mod tests {
         // it does not understand.
         let security = &value["channels"]["Security"];
         assert!(security["last_event_at"].is_null());
+        assert!(security["last_drained_at"].is_null());
         assert!(security["newest_record_id"].is_null());
         assert_eq!(security["skipped_reason"], "access_denied");
     }
