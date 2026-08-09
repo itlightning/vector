@@ -395,6 +395,10 @@ impl SubscriptionFactory {
                              the oldest record (channel={}).",
                             self.channel
                         ),
+                        // Structured key so consumers never have to match this
+                        // sentence. Message text is prose for humans and will
+                        // keep being improved; this is the stable handle.
+                        error_type = "resume_query_rejected",
                         channel = %self.channel,
                         win32_error = e.code().0,
                         error = %e,
@@ -1666,13 +1670,20 @@ impl EventLogSubscription {
                                             message = format!(
                                                 "Windows Event Log resume skip \
                                                  discarded records, as reported \
-                                                 (channel={}, skipped_records={}).",
+                                                 (channel={}, missing_records={}).",
                                                 channel_sub.channel, missing
                                             ),
                                             error_type = "record_id_gap_expected",
                                             channel = %channel_sub.channel,
-                                            skipped_records = missing,
-                                            rung = channel_sub.resume.rung.as_str(),
+                                            // `missing_records` and `cause` are named to
+                                            // match the per-source status file, so this
+                                            // event and the status entry describing the
+                                            // same skip join without translation. The
+                                            // count was `skipped_records` and the slug
+                                            // was `rung`: two names for two things that
+                                            // were already one.
+                                            missing_records = missing,
+                                            cause = channel_sub.resume.rung.as_str(),
                                             internal_log_rate_limit = false,
                                         );
                                     }
