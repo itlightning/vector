@@ -242,34 +242,85 @@ struct SubscriptionFactory {
     read_existing_events: bool,
 }
 
+/// Escape for XML text content.
+///
+/// Deliberately leaves quotes alone: an XPath `Select` body is text content,
+/// and `@Name='foo'` must keep its apostrophes to stay a valid string literal.
+fn escape_xml_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escape for a double-quoted XML attribute value.
+fn escape_xml_attr(raw: &str) -> String {
+    escape_xml_text(raw).replace('"', "&quot;")
+}
+
 impl SubscriptionFactory {
     /// The query to subscribe with at this ladder rung, and its origin.
     ///
-    /// A generated time predicate is only composed onto a wildcard base today.
-    /// With `event_query` set, this returns it unchanged and the subscription
-    /// reads from the oldest record, so EVERY time rung does the same thing and
-    /// the ladder escalates nothing (R8, L2).
+    /// Two shapes carry the floor, chosen by what the operator configured
+    /// (D32, section 4.0.2).
     ///
-    /// That is a gap, not a language limit: the WEL query subset composes a
-    /// user filter and a time predicate perfectly well, and wrapping the user
-    /// string in a structured query with a `Suppress` floor would need no
-    /// parsing of it. Planned as D32; see section 4.0.2 of the resiliency plan.
+    /// With no `event_query`, the floor becomes a plain XPath predicate.
     ///
-    /// Nothing trims the over-delivery any more. The in-process
+    /// With an `event_query`, the floor becomes a `Suppress` clause in a
+    /// structured query and the operator's XPath rides along untouched as the
+    /// `Select` body. That keeps the user string OPAQUE: nothing here parses
+    /// or rewrites it, which is what made composition look impossible.
+    ///
+    /// Without this, every time rung produced the identical unfiltered query,
+    /// so the ladder escalated nothing and paid a full-channel replay per rung
+    /// before falling forward to `FutureOnly`.
+    ///
+    /// Nothing trims the over-delivery that remains. The in-process
     /// `(TimeCreated, RecordId)` boundary that used to do it discarded real
     /// events and was deleted (D31).
     fn query_for(&self, resume: &ResumeState) -> (String, QueryOrigin) {
         let Some(floor) = resume.time_floor() else {
             return (self.base_query.clone(), self.base_origin);
         };
-        if !matches!(resume.rung, Rung::TimeAdvance(_)) || self.base_query != "*" {
+        if !matches!(resume.rung, Rung::TimeAdvance(_)) {
             return (self.base_query.clone(), self.base_origin);
         }
-        let predicate = format!(
-            "*[System[TimeCreated[@SystemTime>='{}']]]",
-            floor.format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        );
-        (predicate, QueryOrigin::Generated)
+        let stamp = floor.format("%Y-%m-%dT%H:%M:%S%.3fZ");
+
+        if self.base_query == "*" {
+            return (
+                format!("*[System[TimeCreated[@SystemTime>='{stamp}']]]"),
+                QueryOrigin::Generated,
+            );
+        }
+
+        // An operator who supplied a structured query already owns the
+        // `QueryList` element, and there is nowhere to nest a second one.
+        if self.base_query.trim_start().starts_with('<') {
+            debug!(
+                message = "Operator supplied a structured Windows Event Log query, so the resume floor cannot be composed onto it; reading the channel from the oldest record instead.",
+                channel = %self.channel,
+            );
+            return (self.base_query.clone(), self.base_origin);
+        }
+
+        (
+            format!(
+                "<QueryList><Query Id=\"0\" Path=\"{channel}\">\
+                 <Select Path=\"{channel}\">{select}</Select>\
+                 <Suppress Path=\"{channel}\">*[System[TimeCreated[@SystemTime&lt;'{stamp}']]]</Suppress>\
+                 </Query></QueryList>",
+                channel = escape_xml_attr(&self.channel),
+                select = escape_xml_text(&self.base_query),
+            ),
+            QueryOrigin::Generated,
+        )
     }
 
     /// Create a subscription handle. Never closes anything: the caller swaps
@@ -319,12 +370,69 @@ impl SubscriptionFactory {
             log.push(flags);
         }
 
+        let result = self.subscribe_with(
+            &channel_hstring,
+            &query_hstring,
+            signal_event,
+            bookmark_handle,
+            use_bookmark,
+            flags,
+        );
+
+        match result {
+            Ok(handle) => Ok((handle, origin)),
+            Err(e) => {
+                // D32 safety valve. A composed structured query is OURS, so a
+                // rejection must not be charged to the ladder: every rung would
+                // compose the same shape, fail the same way, and walk to
+                // `FutureOnly`, discarding the backlog over a query we wrote.
+                // Retry once with the operator's query alone, which is the
+                // pre-D32 behavior (a full re-read), and let the ladder judge
+                // that instead.
+                if origin == QueryOrigin::Generated && query.trim_start().starts_with('<') {
+                    warn!(
+                        message = "Composed Windows Event Log resume query was rejected; falling back to the operator query and reading from the oldest record.",
+                        channel = %self.channel,
+                        win32_error = e.code().0,
+                        error = %e,
+                    );
+                    let plain = HSTRING::from(self.base_query.as_str());
+                    return match self.subscribe_with(
+                        &channel_hstring,
+                        &plain,
+                        signal_event,
+                        bookmark_handle,
+                        use_bookmark,
+                        flags,
+                    ) {
+                        Ok(handle) => Ok((handle, self.base_origin)),
+                        Err(e) => Err((e, self.base_origin)),
+                    };
+                }
+                Err((e, origin))
+            }
+        }
+    }
+
+    /// One `EvtSubscribe` attempt.
+    ///
+    /// Split out so the D32 fallback can make a second attempt with a
+    /// different query without duplicating the fault-injection seam.
+    fn subscribe_with(
+        &self,
+        channel: &HSTRING,
+        query: &HSTRING,
+        signal_event: HANDLE,
+        bookmark_handle: EVT_HANDLE,
+        use_bookmark: bool,
+        flags: u32,
+    ) -> Result<EVT_HANDLE, windows::core::Error> {
         let result = unsafe {
             EvtSubscribe(
                 None,
                 signal_event,
-                &channel_hstring,
-                &query_hstring,
+                channel,
+                query,
                 if use_bookmark {
                     bookmark_handle
                 } else {
@@ -361,10 +469,7 @@ impl SubscriptionFactory {
             }
         };
 
-        match result {
-            Ok(handle) => Ok((handle, origin)),
-            Err(e) => Err((e, origin)),
-        }
+        result
     }
 }
 
@@ -645,14 +750,14 @@ impl ChannelSubscription {
         error!(
             message = format!(
                 "Windows Event Log channel skipped for this subscription generation \
-                 (channel={}, reason={:?}, last_event_at={}).",
+                 (channel={}, reason={}, last_event_at={}).",
                 self.channel,
-                reason,
+                reason.as_str(),
                 self.last_event_at_rfc3339()
             ),
             error_type = "channel_skipped",
             channel = %self.channel,
-            reason = ?reason,
+            reason = reason.as_str(),
             win32_error = code,
             win32_error_name = describe(code).unwrap_or("unknown"),
             hresult = error.code().0,
@@ -1690,6 +1795,12 @@ impl EventLogSubscription {
     #[cfg(test)]
     pub(super) fn first_channel_resumes_by_time(&self) -> bool {
         matches!(self.channels[0].resume.rung, Rung::TimeAdvance(_))
+    }
+
+    /// Test-only: whether the first channel has reached the terminal rung.
+    #[cfg(test)]
+    pub(super) fn first_channel_is_future_only(&self) -> bool {
+        self.channels[0].resume.rung == Rung::FutureOnly
     }
 
     /// Test-only: whether the first channel currently has a live subscription.
@@ -2856,12 +2967,12 @@ mod tests {
 
     /// No re-delivery across a HEALTHY rebuild.
     ///
-    /// This is the bookmark path (R2): the rung is `Bookmark`, so the rebuild
+    /// This is the bookmark path: the rung is `Bookmark`, so the rebuild
     /// resumes `StartAfterBookmark | Strict` with no generated time predicate
     /// and therefore no over-delivery to trim. That is why no record id may
     /// appear in two consecutive reads even though the admission gate is gone.
     ///
-    /// The over-delivering path is the time ladder (R4 to R7), which re-reads
+    /// The over-delivering path is the time ladder, which re-reads
     /// the last event's millisecond on purpose and is covered separately.
     #[tokio::test]
     async fn rebuild_does_not_redeliver_events() {
@@ -4207,12 +4318,203 @@ mod tests {
              failing the channel"
         );
 
-        // Time rung over an operator query: not composable, so the operator's
-        // query stands and the exact in-process boundary does the trimming.
+        // Time rung over an operator query: composed as a structured query
+        // with the floor in a Suppress clause (D32). The operator's XPath is
+        // carried through verbatim as the Select body, never rewritten.
+        let (composed, origin) = factory(OPERATOR_QUERY).query_for(&resume);
+        assert_eq!(origin, QueryOrigin::Generated);
         assert_eq!(
-            factory(OPERATOR_QUERY).query_for(&resume),
-            (OPERATOR_QUERY.to_string(), QueryOrigin::Operator),
-            "an operator XPath is never intersected with a generated predicate"
+            composed,
+            "<QueryList><Query Id=\"0\" Path=\"Application\">\
+             <Select Path=\"Application\">*[System[EventID=4624]]</Select>\
+             <Suppress Path=\"Application\">*[System[TimeCreated[@SystemTime&lt;'2026-08-07T12:00:00.000Z']]]</Suppress>\
+             </Query></QueryList>",
+            "the floor rides in a Suppress clause and the operator XPath is untouched"
+        );
+        assert!(
+            composed.contains(OPERATOR_QUERY),
+            "the operator query must appear VERBATIM: composition works precisely \
+             because nothing here parses or rewrites it"
+        );
+    }
+
+    /// Apostrophes in the operator query must survive composition.
+    ///
+    /// XML text content does not require escaping them, and escaping them
+    /// anyway would turn `@Name='foo'` into `@Name=&apos;foo&apos;`, which is
+    /// not a valid XPath string literal. This is the failure a naive
+    /// "escape everything" helper produces, and it would only show up against
+    /// a real subscribe.
+    #[test]
+    fn composition_preserves_xpath_string_literals_and_escapes_markup() {
+        use chrono::TimeZone;
+
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(
+            chrono::Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap(),
+            1,
+        );
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+
+        let quoted = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing']]]";
+        let factory = SubscriptionFactory {
+            channel: "Application".to_string(),
+            base_query: quoted.to_string(),
+            base_origin: QueryOrigin::Operator,
+            read_existing_events: true,
+        };
+        let (composed, _) = factory.query_for(&resume);
+        assert!(
+            composed.contains(quoted),
+            "apostrophes must not be escaped; got {composed}"
+        );
+
+        // Markup characters, by contrast, MUST be escaped or the document is
+        // malformed. `Level<=3` is an ordinary thing to configure.
+        let markup = "*[System[Level<=3]]";
+        let factory = SubscriptionFactory {
+            channel: "Application".to_string(),
+            base_query: markup.to_string(),
+            base_origin: QueryOrigin::Operator,
+            read_existing_events: true,
+        };
+        let (composed, _) = factory.query_for(&resume);
+        assert!(
+            composed.contains("*[System[Level&lt;=3]]"),
+            "a `<` in the operator query must be escaped; got {composed}"
+        );
+    }
+
+    /// An operator who supplied a structured query already owns `QueryList`,
+    /// so there is nowhere to nest ours. Fall back rather than emit garbage.
+    #[test]
+    fn a_structured_operator_query_is_not_wrapped() {
+        use chrono::TimeZone;
+
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(
+            chrono::Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap(),
+            1,
+        );
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+
+        let structured = "<QueryList><Query Id=\"0\"><Select>*</Select></Query></QueryList>";
+        let factory = SubscriptionFactory {
+            channel: "Application".to_string(),
+            base_query: structured.to_string(),
+            base_origin: QueryOrigin::Operator,
+            read_existing_events: true,
+        };
+        assert_eq!(
+            factory.query_for(&resume),
+            (structured.to_string(), QueryOrigin::Operator),
+            "a structured operator query is passed through, not nested"
+        );
+    }
+
+    /// Windows must ACCEPT the composed structured query.
+    ///
+    /// The whole of D32 rests on `Suppress` taking an absolute `@SystemTime`
+    /// bound. Nothing in the unit tests above can prove that: they assert the
+    /// string we generate, not that `wevtapi` parses it. This subscribes for
+    /// real against `Application`.
+    #[tokio::test]
+    async fn windows_accepts_the_composed_structured_query() {
+        let _seams = SeamSession::acquire();
+        let signal = unsafe { CreateEventW(None, true, false, None) }.expect("event handle");
+        let bookmark = BookmarkManager::new().expect("bookmark");
+
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(chrono::Utc::now() - chrono::Duration::hours(1), 1);
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+
+        let factory = SubscriptionFactory {
+            channel: "Application".to_string(),
+            base_query: "*[System[Level=4]]".to_string(),
+            base_origin: QueryOrigin::Operator,
+            read_existing_events: true,
+        };
+
+        let (composed, _) = factory.query_for(&resume);
+        assert!(composed.starts_with("<QueryList>"), "precondition");
+
+        let built = factory.build(signal, &bookmark, false, &resume);
+        let (handle, origin) = built.unwrap_or_else(|(e, _)| {
+            panic!(
+                "Windows rejected the composed query, so D32's premise is wrong \
+                 and the Suppress mechanism must be replaced: {e}\nquery: {composed}"
+            )
+        });
+        assert_eq!(
+            origin,
+            QueryOrigin::Generated,
+            "accepted on the FIRST attempt: a Generated origin here proves the \
+             fallback path was not silently taken"
+        );
+        unsafe {
+            _ = EvtClose(handle);
+            _ = CloseHandle(signal);
+        }
+    }
+
+    /// Windows must HONOR the Suppress floor, not merely parse it.
+    ///
+    /// A floor in the future must yield nothing, while the same operator query
+    /// with no floor yields events. If `Suppress` were ignored, both would
+    /// return events and the ladder would be silently doing nothing.
+    #[tokio::test]
+    async fn the_suppress_floor_actually_filters() {
+        let _seams = SeamSession::acquire();
+
+        fn drain(query: &str) -> usize {
+            let signal = unsafe { CreateEventW(None, true, false, None) }.expect("event handle");
+            let bookmark = BookmarkManager::new().expect("bookmark");
+            let factory = SubscriptionFactory {
+                channel: "Application".to_string(),
+                base_query: query.to_string(),
+                base_origin: QueryOrigin::Operator,
+                read_existing_events: true,
+            };
+            let resume = ResumeState::new(true);
+            let (handle, _) = factory
+                .build(signal, &bookmark, false, &resume)
+                .unwrap_or_else(|(e, _)| panic!("subscribe failed for {query}: {e}"));
+            let mut buffer = [0isize; 8];
+            let mut returned = 0u32;
+            let got = unsafe { EvtNext(handle, &mut buffer, 2000, 0, &mut returned) };
+            let count = if got.is_ok() { returned as usize } else { 0 };
+            for raw in buffer.iter().take(count) {
+                unsafe {
+                    _ = EvtClose(EVT_HANDLE(*raw));
+                }
+            }
+            unsafe {
+                _ = EvtClose(handle);
+                _ = CloseHandle(signal);
+            }
+            count
+        }
+
+        let unfiltered = drain("*");
+        if unfiltered == 0 {
+            // An empty Application log makes the comparison vacuous.
+            return;
+        }
+
+        let future = chrono::Utc::now() + chrono::Duration::days(3650);
+        let suppressed = drain(&format!(
+            "<QueryList><Query Id=\"0\" Path=\"Application\">\
+             <Select Path=\"Application\">*</Select>\
+             <Suppress Path=\"Application\">*[System[TimeCreated[@SystemTime&lt;'{}']]]</Suppress>\
+             </Query></QueryList>",
+            future.format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        ));
+
+        assert_eq!(
+            suppressed, 0,
+            "a Suppress floor ten years in the future must hide every existing \
+             event; {unfiltered} came back unfiltered but {suppressed} survived \
+             the floor, so Suppress is being ignored and D32 does not work"
         );
     }
 
@@ -5026,5 +5328,75 @@ mod tests {
             missing.len(),
             missing.iter().take(10).collect::<Vec<_>>()
         );
+    }
+
+    /// The terminal rung subscribes to FUTURE events only.
+    ///
+    /// The ERROR and the rung transition are asserted elsewhere; the flag word
+    /// is the part that decides what the rung actually costs. A mutation that
+    /// resumed `FutureOnly` from the oldest record would convert a bounded,
+    /// logged, deliberate loss into a silent full-channel replay, and every
+    /// other assertion about this rung would still pass.
+    #[tokio::test]
+    async fn the_terminal_rung_subscribes_to_future_events_only() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+
+        // Establish a stored time, otherwise `bookmark_dead` short-circuits to
+        // the terminal rung for a different reason and proves nothing.
+        let first = subscription.pull_events(1).unwrap_or_default();
+        assert_eq!(first.len(), 1, "this test needs one delivered event");
+
+        // Walk the whole ladder: six time rungs, then the terminal one.
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011; 7]);
+            for _ in 0..7 {
+                subscription.force_rebuild_all();
+            }
+        }
+        assert!(
+            subscription.first_channel_is_future_only(),
+            "the premise is the terminal rung"
+        );
+
+        let flag_log = FlagLog::install(&_seams);
+        subscription.force_rebuild_all();
+        assert_eq!(
+            flag_log.flags(),
+            vec![EvtSubscribeToFutureEvents.0],
+            "the terminal rung must discard the backlog, not re-read it"
+        );
+    }
+
+    /// A restart with a bookmark that marks no position falls back to the
+    /// FIRST-START rules, not to a resume.
+    ///
+    /// A checkpoint exists but nothing was ever delivered from the channel, so
+    /// there is no position and no stored time. The start point must come from
+    /// `read_existing_events`, and this must not read as a fault: no backlog
+    /// exists to lose.
+    #[tokio::test]
+    async fn an_unpositioned_bookmark_starts_from_the_configured_point() {
+        let _seams = SeamSession::acquire();
+
+        for (read_existing, expected) in [
+            (false, EvtSubscribeToFutureEvents.0),
+            (true, EvtSubscribeStartAtOldestRecord.0),
+        ] {
+            let config = WindowsEventLogConfig {
+                channels: vec!["Application".to_string()],
+                read_existing_events: read_existing,
+                event_timeout_ms: 500,
+                ..Default::default()
+            };
+            let flag_log = FlagLog::install(&_seams);
+            let _subscription = subscription_from(&config).await;
+            assert_eq!(
+                flag_log.flags(),
+                vec![expected],
+                "with no stored position, read_existing_events={read_existing} \
+                 decides the start point"
+            );
+        }
     }
 }

@@ -96,6 +96,24 @@ pub(super) enum SkipReason {
     AccessDenied,
 }
 
+impl SkipReason {
+    /// The stable slug for this reason.
+    ///
+    /// This is a WIRE vocabulary, not a debug aid: the source pack keys on
+    /// these exact strings, and the agent forwards them verbatim as the
+    /// liveness `health_reason`. Deriving them from `Debug` would make the
+    /// wire depend on Rust variant spelling, and minting a second vocabulary
+    /// downstream would let the two drift. One name, defined here.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidChannelPath => "invalid_channel_path",
+            Self::DirectChannel => "direct_channel",
+            Self::OperatorQueryInvalid => "operator_query_invalid",
+            Self::AccessDenied => "access_denied",
+        }
+    }
+}
+
 /// What the drain loop should do about an `EvtNext` error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DrainOutcome {
@@ -306,6 +324,26 @@ pub(super) const fn classify_render(code: u32) -> RenderDisposition {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+
+    /// Pin every skip slug.
+    ///
+    /// These cross a wire: the source pack keys on them and the agent forwards
+    /// them as the liveness `health_reason`. Renaming a Rust variant must not
+    /// silently rename a wire value, so the mapping is asserted literally
+    /// rather than derived.
+    #[test]
+    fn skip_reason_slugs_are_the_exact_wire_strings() {
+        assert_eq!(
+            SkipReason::InvalidChannelPath.as_str(),
+            "invalid_channel_path"
+        );
+        assert_eq!(SkipReason::DirectChannel.as_str(), "direct_channel");
+        assert_eq!(
+            SkipReason::OperatorQueryInvalid.as_str(),
+            "operator_query_invalid"
+        );
+        assert_eq!(SkipReason::AccessDenied.as_str(), "access_denied");
+    }
 
     /// The four inherited constants were all wrong. Pin the real values so a
     /// future crate bump or edit cannot silently reintroduce the bug class.
