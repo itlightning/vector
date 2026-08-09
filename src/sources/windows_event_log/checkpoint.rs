@@ -333,7 +333,7 @@ impl Checkpointer {
         self.save_to_disk(&state).await?;
 
         info!(
-            message = "Removed checkpoint for channel.",
+            message = format!("Removed Windows Event Log checkpoint (channel={channel})."),
             channel = %channel
         );
 

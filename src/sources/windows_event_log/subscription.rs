@@ -389,7 +389,12 @@ impl SubscriptionFactory {
                 // re-read), and let the ladder judge that instead.
                 if origin == QueryOrigin::Generated && query.trim_start().starts_with('<') {
                     warn!(
-                        message = "Composed Windows Event Log resume query was rejected; falling back to the operator query and reading from the oldest record.",
+                        message = format!(
+                            "Composed Windows Event Log resume query was rejected; \
+                             falling back to the operator query and reading from \
+                             the oldest record (channel={}).",
+                            self.channel
+                        ),
                         channel = %self.channel,
                         win32_error = e.code().0,
                         error = %e,
@@ -724,7 +729,11 @@ impl ChannelSubscription {
             );
         } else {
             warn!(
-                message = "Advancing Windows Event Log resume ladder.",
+                message = format!(
+                    "Advancing Windows Event Log resume ladder (channel={}, rung={}).",
+                    self.channel,
+                    rung.as_str()
+                ),
                 channel = %self.channel,
                 rung = rung.as_str(),
                 reason = reason,
@@ -995,30 +1004,40 @@ impl EventLogSubscription {
             let mut resume = ResumeState::new(true);
             let mut bookmark_positioned = false;
             let bookmark = match checkpoint.as_ref() {
-                Some(checkpoint) => match BookmarkManager::from_xml(&checkpoint.bookmark_xml) {
-                    Ok(bm) => {
-                        info!(
-                            message = "Resuming from checkpoint bookmark.",
-                            channel = %channel
-                        );
-                        bookmark_positioned = true;
-                        bm
+                Some(checkpoint) => {
+                    match BookmarkManager::from_xml(&checkpoint.bookmark_xml, channel) {
+                        Ok(bm) => {
+                            info!(
+                                message = format!(
+                                    "Resuming from checkpoint bookmark (channel={channel})."
+                                ),
+                                channel = %channel
+                            );
+                            bookmark_positioned = true;
+                            bm
+                        }
+                        Err(e) => {
+                            warn!(
+                                message = format!(
+                                    "Corrupted bookmark XML in checkpoint, creating fresh \
+                                     bookmark. Potential re-delivery of events \
+                                     (channel={channel})."
+                                ),
+                                channel = %channel,
+                                error = %e
+                            );
+                            BookmarkManager::new(channel)?
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            message = "Corrupted bookmark XML in checkpoint, creating fresh bookmark. Potential re-delivery of events.",
-                            channel = %channel,
-                            error = %e
-                        );
-                        BookmarkManager::new()?
-                    }
-                },
+                }
                 None => {
                     info!(
-                        message = "No checkpoint found, creating fresh bookmark.",
+                        message = format!(
+                            "No checkpoint found, creating fresh bookmark (channel={channel})."
+                        ),
                         channel = %channel
                     );
-                    BookmarkManager::new()?
+                    BookmarkManager::new(channel)?
                 }
             };
 
@@ -1417,7 +1436,11 @@ impl EventLogSubscription {
                         DrainOutcome::ReduceBatch => {
                             let reduced = channel_sub.batch.halve();
                             warn!(
-                                message = "Reducing Windows Event Log batch size after an oversized read.",
+                                message = format!(
+                                    "Reducing Windows Event Log batch size after an \
+                                     oversized read (channel={}, batch_size={}).",
+                                    channel_sub.channel, reduced
+                                ),
                                 channel = %channel_sub.channel,
                                 batch_size = reduced,
                                 win32_error = code,
@@ -1585,7 +1608,12 @@ impl EventLogSubscription {
                                     // unexplained gap.
                                     channel_sub.last_record_id_seen = Some(event.record_id);
                                     warn!(
-                                        message = "Windows Event Log poison-event escape skipped one record.",
+                                        message = format!(
+                                            "Windows Event Log poison-event escape \
+                                             skipped one record (channel={}, \
+                                             record_id={}).",
+                                            channel_sub.channel, event.record_id
+                                        ),
                                         error_type = "poison_record_skipped",
                                         channel = %channel_sub.channel,
                                         record_id = event.record_id,
@@ -1613,7 +1641,13 @@ impl EventLogSubscription {
                                 ) {
                                     GapVerdict::Gap { missing } => {
                                         warn!(
-                                            message = "Windows Event Log record ID gap detected; events were overwritten before they could be read.",
+                                            message = format!(
+                                                "Windows Event Log record ID gap \
+                                                 detected; events were overwritten \
+                                                 before they could be read \
+                                                 (channel={}, missing_records={}).",
+                                                channel_sub.channel, missing
+                                            ),
                                             error_type = "record_id_gap",
                                             channel = %channel_sub.channel,
                                             missing_records = missing,
@@ -1629,7 +1663,12 @@ impl EventLogSubscription {
                                         // intentional. Quantify it without a
                                         // second, unexplained-sounding alarm.
                                         warn!(
-                                            message = "Windows Event Log resume skip discarded records, as reported.",
+                                            message = format!(
+                                                "Windows Event Log resume skip \
+                                                 discarded records, as reported \
+                                                 (channel={}, skipped_records={}).",
+                                                channel_sub.channel, missing
+                                            ),
                                             error_type = "record_id_gap_expected",
                                             channel = %channel_sub.channel,
                                             skipped_records = missing,
@@ -1700,7 +1739,11 @@ impl EventLogSubscription {
                                 channel_sub.bookmark_positioned = true;
                             }
                             warn!(
-                                message = "Failed to render event XML; skipping this event and continuing the batch.",
+                                message = format!(
+                                    "Failed to render event XML; skipping this event \
+                                     and continuing the batch (channel={}).",
+                                    channel_sub.channel
+                                ),
                                 channel = %channel_sub.channel,
                                 batch_index = idx,
                                 bookmark_advanced = advanced,
@@ -1934,7 +1977,13 @@ impl EventLogSubscription {
             match channel_handle {
                 Ok(handle) => {
                     if let Err(e) = unsafe { EvtClose(handle) } {
-                        warn!(message = "Failed to close channel config handle.", error = %e);
+                        warn!(
+                            message = format!(
+                                "Failed to close channel config handle (channel={channel})."
+                            ),
+                            channel = %channel,
+                            error = %e
+                        );
                     }
                 }
                 Err(e) => {
@@ -1945,7 +1994,10 @@ impl EventLogSubscription {
                     // asking. The original nine-hour wedge was a channel that
                     // provably existed and came back.
                     warn!(
-                        message = "Channel not readable at startup; the subscription loop will keep retrying it.",
+                        message = format!(
+                            "Channel not readable at startup; the subscription loop \
+                             will keep retrying it (channel={channel})."
+                        ),
                         channel = %channel,
                         win32_error = code,
                         win32_error_name = describe(code).unwrap_or("unknown"),
@@ -4421,7 +4473,7 @@ mod tests {
     async fn windows_accepts_the_composed_structured_query() {
         let _seams = SeamSession::acquire();
         let signal = unsafe { CreateEventW(None, true, false, None) }.expect("event handle");
-        let bookmark = BookmarkManager::new().expect("bookmark");
+        let bookmark = BookmarkManager::new("Application").expect("bookmark");
 
         let mut resume = ResumeState::new(true);
         resume.observe_event(chrono::Utc::now() - chrono::Duration::hours(1), 1);
@@ -4467,7 +4519,7 @@ mod tests {
 
         fn drain(query: &str) -> usize {
             let signal = unsafe { CreateEventW(None, true, false, None) }.expect("event handle");
-            let bookmark = BookmarkManager::new().expect("bookmark");
+            let bookmark = BookmarkManager::new("Application").expect("bookmark");
             let factory = SubscriptionFactory {
                 channel: "Application".to_string(),
                 base_query: query.to_string(),
