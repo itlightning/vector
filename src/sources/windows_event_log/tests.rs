@@ -1703,3 +1703,148 @@ mod truncation_tests {
         );
     }
 }
+
+// ================================================================================================
+// ACK DRAIN ON SHUTDOWN TESTS
+// ================================================================================================
+
+/// The restart-duplicate defect lived here: acks that landed while the source
+/// was shutting down were dropped, their checkpoints were never written, and
+/// the next start replayed the events. These tests assert on the checkpoint
+/// file, not on the drain returning, because returning promptly is exactly what
+/// the broken version did.
+#[cfg(test)]
+mod ack_drain_tests {
+    use std::{sync::Arc, time::Instant};
+
+    use super::super::{
+        Finalizer, FinalizerEntry, apply_ready_acks,
+        checkpoint::{ChannelPosition, Checkpointer},
+        drain_acks,
+    };
+    use super::*;
+    use crate::{event::BatchNotifier, test_util::temp_dir};
+
+    const BOOKMARK: &str =
+        "<BookmarkList><Bookmark Channel='Security' RecordId='42'/></BookmarkList>";
+
+    fn security_entry() -> FinalizerEntry {
+        FinalizerEntry {
+            positions: vec![ChannelPosition {
+                channel: "Security".to_string(),
+                bookmark_xml: BOOKMARK.to_string(),
+                last_event_time: Some("2026-08-09T00:00:00.0000000Z".to_string()),
+                last_record_id: Some(42),
+            }],
+        }
+    }
+
+    /// Read the checkpoint back through a fresh `Checkpointer` so the assertion
+    /// is about what is on disk, not about in-memory state.
+    async fn persisted_record_id(data_dir: &std::path::Path) -> Option<u64> {
+        Checkpointer::new(data_dir)
+            .await
+            .expect("checkpointer should load")
+            .get("Security")
+            .await
+            .and_then(|checkpoint| checkpoint.last_record_id)
+    }
+
+    #[tokio::test]
+    async fn ack_arriving_during_shutdown_is_checkpointed() {
+        let data_dir = temp_dir();
+        let checkpointer = Arc::new(
+            Checkpointer::new(&data_dir)
+                .await
+                .expect("checkpointer should initialize"),
+        );
+        let (finalizer, mut ack_stream) = Finalizer::new(true, Arc::clone(&checkpointer));
+
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        finalizer.finalize(security_entry(), Some(receiver)).await;
+
+        // Not acknowledged yet, so nothing may be checkpointed yet.
+        apply_ready_acks(&mut ack_stream, &checkpointer).await;
+        assert_eq!(
+            persisted_record_id(&data_dir).await,
+            None,
+            "checkpoint must not be written before the batch is acknowledged"
+        );
+
+        // The ack lands after the drain is already running: the delivered-but-
+        // not-yet-acknowledged window that produced the duplicates.
+        let ack_delay = std::time::Duration::from_millis(300);
+        let acker = tokio::spawn(async move {
+            tokio::time::sleep(ack_delay).await;
+            drop(batch); // resolves the receiver as Delivered
+        });
+
+        let started = Instant::now();
+        drain_acks(finalizer, &mut ack_stream, &checkpointer).await;
+        let waited = started.elapsed();
+        acker.await.expect("ack task should not panic");
+
+        assert_eq!(
+            persisted_record_id(&data_dir).await,
+            Some(42),
+            "an ack delivered during shutdown must reach the checkpoint file"
+        );
+        assert!(
+            waited >= ack_delay,
+            "drain returned in {waited:?}, before the ack could arrive; it did not wait for the outstanding batch"
+        );
+
+        _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn ready_acks_are_checkpointed_while_running() {
+        let data_dir = temp_dir();
+        let checkpointer = Arc::new(
+            Checkpointer::new(&data_dir)
+                .await
+                .expect("checkpointer should initialize"),
+        );
+        let (finalizer, mut ack_stream) = Finalizer::new(true, Arc::clone(&checkpointer));
+
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        finalizer.finalize(security_entry(), Some(receiver)).await;
+        drop(batch);
+
+        // The pull loop polls without waiting, so give the ack a moment to
+        // become ready, then take the same non-blocking pass the loop takes.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        apply_ready_acks(&mut ack_stream, &checkpointer).await;
+
+        assert_eq!(
+            persisted_record_id(&data_dir).await,
+            Some(42),
+            "a ready ack must be checkpointed without waiting for shutdown"
+        );
+
+        drain_acks(finalizer, &mut ack_stream, &checkpointer).await;
+        _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn sync_mode_drain_returns_without_hanging() {
+        let data_dir = temp_dir();
+        let checkpointer = Arc::new(
+            Checkpointer::new(&data_dir)
+                .await
+                .expect("checkpointer should initialize"),
+        );
+        let (finalizer, mut ack_stream) = Finalizer::new(false, Arc::clone(&checkpointer));
+
+        // Acknowledgements disabled: checkpoints are written inline, and the
+        // drain must be a no-op rather than a wait for acks that never come.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_acks(finalizer, &mut ack_stream, &checkpointer),
+        )
+        .await
+        .expect("sync-mode drain must not block shutdown");
+
+        _ = std::fs::remove_dir_all(&data_dir);
+    }
+}

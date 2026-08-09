@@ -38,7 +38,7 @@ cfg_if::cfg_if! {
         use std::sync::Arc;
 
         use chrono::Utc;
-        use futures::StreamExt;
+        use futures::{FutureExt, StreamExt};
         use vector_lib::EstimatedJsonEncodedSizeOf;
         use vector_lib::finalizer::OrderedFinalizer;
         use vector_lib::internal_event::{
@@ -90,6 +90,13 @@ struct FinalizerEntry {
 /// Shared checkpointer type for use with the finalizer
 type SharedCheckpointer = Arc<Checkpointer>;
 
+/// Stream of acknowledged batches produced by the finalizer.
+///
+/// Owned by the source loop, never by a detached task: the checkpoint write is
+/// the last step of processing a batch, so whatever polls this stream has to be
+/// something shutdown waits for.
+type AckStream = futures::stream::BoxStream<'static, (BatchStatus, FinalizerEntry)>;
+
 /// Finalizer for handling acknowledgments.
 /// Supports both synchronous (immediate checkpoint) and asynchronous (deferred checkpoint) modes.
 enum Finalizer {
@@ -102,44 +109,29 @@ enum Finalizer {
 }
 
 impl Finalizer {
-    /// Create a new finalizer based on acknowledgement configuration.
-    fn new(
-        acknowledgements: bool,
-        checkpointer: SharedCheckpointer,
-        shutdown: ShutdownSignal,
-    ) -> Self {
+    /// Create a new finalizer based on acknowledgement configuration, plus the
+    /// stream of acknowledged batches the caller must drive.
+    ///
+    /// The finalizer is built with no shutdown signal on purpose. Handing it a
+    /// shutdown signal ends the ack stream the instant shutdown fires, so acks
+    /// still in flight at that moment are discarded and their checkpoints are
+    /// never written. The events were delivered, the recorded position stayed
+    /// behind them, and the next start re-reads from that stale position and
+    /// ships the same events again. With no signal the stream ends only after
+    /// the finalizer is dropped AND every pending ack has been yielded, which
+    /// is what makes a real drain possible on the way out.
+    fn new(acknowledgements: bool, checkpointer: SharedCheckpointer) -> (Self, AckStream) {
         if acknowledgements {
-            let (finalizer, mut ack_stream) =
-                OrderedFinalizer::<FinalizerEntry>::new(Some(shutdown.clone()));
-
-            // Spawn background task to process acknowledgments and update checkpoints
-            crate::spawn_in_current_span(async move {
-                while let Some((status, entry)) = ack_stream.next().await {
-                    if status == BatchStatus::Delivered {
-                        if let Err(e) = checkpointer.set_batch(entry.positions.clone()).await {
-                            warn!(
-                                message = "Failed to update checkpoint after acknowledgement.",
-                                error = %e
-                            );
-                        } else {
-                            debug!(
-                                message = "Checkpoint updated after acknowledgement.",
-                                channels = entry.positions.len()
-                            );
-                        }
-                    } else {
-                        debug!(
-                            message = "Events not delivered, checkpoint not updated.",
-                            status = ?status
-                        );
-                    }
-                }
-                debug!(message = "Acknowledgement stream completed.");
-            });
-
-            Self::Async(finalizer)
+            let (finalizer, ack_stream) = OrderedFinalizer::<FinalizerEntry>::new(None);
+            (Self::Async(finalizer), ack_stream)
         } else {
-            Self::Sync(checkpointer)
+            // Sync mode checkpoints inline, so there is nothing to acknowledge.
+            // An empty (not pending) stream keeps the drain a no-op instead of
+            // a hang.
+            (
+                Self::Sync(checkpointer),
+                futures::stream::empty::<(BatchStatus, FinalizerEntry)>().boxed(),
+            )
         }
     }
 
@@ -169,6 +161,75 @@ impl Finalizer {
             }
         }
     }
+}
+
+/// Comma-separated channel names in a batch, for log text.
+fn channel_list(positions: &[checkpoint::ChannelPosition]) -> String {
+    positions
+        .iter()
+        .map(|position| position.channel.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Write the checkpoint for one acknowledged batch.
+async fn apply_ack(checkpointer: &Checkpointer, status: BatchStatus, entry: FinalizerEntry) {
+    let channels = channel_list(&entry.positions);
+    if status != BatchStatus::Delivered {
+        debug!(
+            message = format!("Events not delivered, checkpoint not updated (channels={channels})."),
+            channels = %channels,
+            status = ?status
+        );
+        return;
+    }
+
+    if let Err(e) = checkpointer.set_batch(entry.positions).await {
+        warn!(
+            message = format!(
+                "Failed to update checkpoint after acknowledgement (channels={channels}). These events will be read again on restart."
+            ),
+            channels = %channels,
+            error = %e
+        );
+    } else {
+        debug!(
+            message = format!("Checkpoint updated after acknowledgement (channels={channels})."),
+            channels = %channels
+        );
+    }
+}
+
+/// Apply every acknowledgement that is already available, without waiting.
+///
+/// The pull loop blocks on Windows wait handles, so acks can only be picked up
+/// between iterations. Nothing is lost by not waiting here: an ack that is not
+/// ready yet stays queued in the stream and is applied on a later pass, or in
+/// the shutdown drain.
+async fn apply_ready_acks(ack_stream: &mut AckStream, checkpointer: &Checkpointer) {
+    while let Some(Some((status, entry))) = ack_stream.next().now_or_never() {
+        apply_ack(checkpointer, status, entry).await;
+    }
+}
+
+/// Drop the finalizer and apply every acknowledgement still outstanding.
+///
+/// This is the shutdown path, and it is the whole point of building the
+/// finalizer without a shutdown signal. Dropping the finalizer closes the entry
+/// side, so the stream yields the acks already pending and then ends. Returning
+/// early instead would leave delivered events uncheckpointed, which is exactly
+/// how a restart produces duplicates.
+async fn drain_acks(finalizer: Finalizer, ack_stream: &mut AckStream, checkpointer: &Checkpointer) {
+    drop(finalizer);
+    let mut drained = 0usize;
+    while let Some((status, entry)) = ack_stream.next().await {
+        drained += 1;
+        apply_ack(checkpointer, status, entry).await;
+    }
+    debug!(
+        message = "Acknowledgement stream drained.",
+        acknowledgements = drained
+    );
 }
 
 /// Parse, emit metrics for, send, and finalize a non-empty batch of pulled Windows events.
@@ -308,11 +369,8 @@ impl WindowsEventLogSource {
     ) -> Result<(), WindowsEventLogError> {
         let checkpointer = Arc::new(Checkpointer::new(&self.data_dir).await?);
 
-        let finalizer = Finalizer::new(
-            self.acknowledgements,
-            Arc::clone(&checkpointer),
-            shutdown.clone(),
-        );
+        let (finalizer, mut ack_stream) =
+            Finalizer::new(self.acknowledgements, Arc::clone(&checkpointer));
 
         let mut subscription = EventLogSubscription::new(
             &self.config,
@@ -396,6 +454,10 @@ impl WindowsEventLogSource {
         let health_interval_timeouts = (30_000 / self.config.event_timeout_ms).max(1) as u32;
 
         loop {
+            // Checkpoint whatever downstream has already acknowledged. The
+            // stream is only polled here, so this has to run every pass.
+            apply_ready_acks(&mut ack_stream, &checkpointer).await;
+
             // Move subscription into blocking thread for WaitForMultipleObjects.
             // Ownership transfer ensures no data races between the blocking thread
             // and async code. The shutdown watcher uses a raw HANDLE value (just an
@@ -607,6 +669,11 @@ impl WindowsEventLogSource {
                 }
             }
         }
+
+        // Every exit from the loop goes through the drain, not just the
+        // shutdown one: a batch that was delivered but not yet acknowledged is
+        // uncheckpointed no matter why the loop ended.
+        drain_acks(finalizer, &mut ack_stream, &checkpointer).await;
 
         Ok(())
     }
