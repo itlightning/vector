@@ -5368,6 +5368,80 @@ mod tests {
         );
     }
 
+    /// A composed query Windows rejects costs ONE retry, not the ladder.
+    ///
+    /// Every rung composes the same shape, so if a rejection advanced the rung
+    /// the channel would walk to future-only and discard its backlog over a
+    /// query we generated. The fallback re-subscribes with the operator's
+    /// query alone, which is bounded and recoverable.
+    ///
+    /// The control matters as much as the case: the same scripted rejection on
+    /// a channel with no `event_query` composes no structured query, so there
+    /// is nothing to fall back to and the channel stays down.
+    #[tokio::test]
+    async fn a_rejected_composed_query_falls_back_instead_of_advancing_the_rung() {
+        let _seams = SeamSession::acquire();
+
+        async fn drive_to_time_rung(
+            seams: &SeamSession,
+            event_query: Option<String>,
+        ) -> EventLogSubscription {
+            let config = WindowsEventLogConfig {
+                channels: vec!["Application".to_string()],
+                read_existing_events: true,
+                event_timeout_ms: 500,
+                event_query,
+                ..Default::default()
+            };
+            let mut subscription = subscription_from(&config).await;
+            assert_eq!(
+                subscription.pull_events(1).unwrap_or_default().len(),
+                1,
+                "a stored time is the precondition for a time rung"
+            );
+            {
+                let _guard = SubscribeScriptGuard::install(seams, &[15011]);
+                subscription.force_rebuild_all();
+            }
+            assert!(subscription.first_channel_resumes_by_time(), "premise");
+            subscription
+        }
+
+        // With an operator query: the compose is rejected, the fallback runs,
+        // the channel comes back up on the same rung.
+        let mut composed = drive_to_time_rung(&_seams, Some("*[System[Level=4]]".into())).await;
+        let rung_before = composed.first_channel_resumes_by_time();
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15001]);
+            composed.force_rebuild_all();
+        }
+        assert!(
+            composed.first_channel_is_live(),
+            "the fallback must recover the channel with the operator query"
+        );
+        assert_eq!(
+            composed.first_channel_resumes_by_time(),
+            rung_before,
+            "a rejected compose must not advance the ladder"
+        );
+        assert!(
+            !composed.first_channel_is_future_only(),
+            "walking to future-only over our own query is the failure this exists to prevent"
+        );
+
+        // Control: no operator query, so no structured compose and no fallback.
+        let mut plain = drive_to_time_rung(&_seams, None).await;
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15001]);
+            plain.force_rebuild_all();
+        }
+        assert!(
+            !plain.first_channel_is_live(),
+            "without a composed structured query there is nothing to fall back \
+             to; if this is live the fallback is firing on the wrong path"
+        );
+    }
+
     /// A restart with a bookmark that marks no position falls back to the
     /// FIRST-START rules, not to a resume.
     ///
