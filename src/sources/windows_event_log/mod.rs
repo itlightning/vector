@@ -28,6 +28,7 @@ cfg_if::cfg_if! {
         /// and SIDs, with the lock discipline that keeps them safe to share.
         mod shared_cache;
         mod sid_resolver;
+        mod status;
         mod subscription;
         /// Invariants of the pure decision layer over randomly generated
         /// `(call site, code, returned count)` triples. Needs no Windows.
@@ -375,6 +376,15 @@ impl WindowsEventLogSource {
         })
     }
 
+    /// Where this source writes its channel status.
+    ///
+    /// `data_dir` is already resolved to this source's own subdirectory, so the
+    /// default sits beside the checkpoint file and needs no component id of its
+    /// own. An explicit `status_path` overrides it outright.
+    fn status_file_path(&self) -> PathBuf {
+        status::StatusWriter::resolve_path(self.config.status_path.as_ref(), &self.data_dir)
+    }
+
     async fn run_internal(
         &mut self,
         mut out: SourceSender,
@@ -453,6 +463,21 @@ impl WindowsEventLogSource {
             }
         });
 
+        // Per-channel status file. Written by default into this source's own
+        // data directory, next to the checkpoint file, because that is where
+        // the reader looks for it.
+        let status_path = self.status_file_path();
+        info!(
+            message = "Writing Windows Event Log channel status.",
+            path = %status_path.display(),
+            interval_secs = self.config.status_interval_secs,
+        );
+        let mut status_writer = status::StatusWriter::new(
+            status_path,
+            self.config.status_interval_secs,
+            std::time::Instant::now(),
+        );
+
         // Track when we last flushed checkpoints
         let mut last_checkpoint = std::time::Instant::now();
         let checkpoint_interval =
@@ -469,7 +494,33 @@ impl WindowsEventLogSource {
         loop {
             // Checkpoint whatever downstream has already acknowledged. The
             // stream is only polled here, so this has to run every pass.
+            //
+            // Runs before the status write on purpose: it is cheap and
+            // non-blocking, while the status write hands the subscription to a
+            // blocking thread. Checkpointing first keeps the position the
+            // status file reports from lagging the position we have already
+            // durably recorded.
             apply_ready_acks(&mut ack_stream, &checkpointer).await;
+
+            // The status file runs on its own cadence and refreshes channel
+            // metadata itself. It deliberately does not reuse what the pull
+            // loop maintains: that refresh is skipped for channels that
+            // returned no events, and a quiet channel is exactly the case a
+            // reader has to tell apart from a wedged one. Both the metadata
+            // queries and the file write are blocking, so they ride the same
+            // blocking thread as the subscription.
+            if status_writer.is_due(std::time::Instant::now()) {
+                let mut writer = status_writer;
+                let (returned_sub, returned_writer) =
+                    with_subscription_blocking(subscription, move |sub| {
+                        let snapshot = sub.status_snapshot();
+                        writer.write(&snapshot, std::time::Instant::now());
+                        (sub, writer)
+                    })
+                    .await?;
+                subscription = returned_sub;
+                status_writer = returned_writer;
+            }
 
             // Move subscription into blocking thread for WaitForMultipleObjects.
             // Ownership transfer ensures no data races between the blocking thread
