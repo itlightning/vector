@@ -467,8 +467,16 @@ impl WindowsEventLogSource {
         // data directory, next to the checkpoint file, because that is where
         // the reader looks for it.
         let status_path = self.status_file_path();
+        // Announces configuration, once, at source start. It is NOT a record of a
+        // write: the writer runs on its own timer from here on and deliberately logs
+        // nothing per interval, so a line that reads like an action would be the only
+        // one ever printed and would imply the others were missing.
         info!(
-            message = "Writing Windows Event Log channel status.",
+            message = format!(
+                "Windows Event Log channel status file enabled; it will be rewritten \
+                 every {}s.",
+                self.config.status_interval_secs
+            ),
             path = %status_path.display(),
             interval_secs = self.config.status_interval_secs,
         );
