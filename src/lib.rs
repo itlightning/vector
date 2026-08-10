@@ -94,6 +94,9 @@ static ALLOC: global_allocator::Inner = global_allocator::INNER;
 #[cfg(windows)]
 mod heap_reclaim;
 
+#[cfg(feature = "mimalloc-pprof")]
+pub mod heap_profile;
+
 #[allow(unreachable_pub)]
 pub mod internal_telemetry;
 

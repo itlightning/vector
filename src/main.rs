@@ -13,6 +13,9 @@ fn main() -> ExitCode {
     #[cfg(feature = "allocation-tracing")]
     vector::internal_telemetry::allocations::init_tracing_from_cli();
 
+    #[cfg(feature = "mimalloc-pprof")]
+    vector::heap_profile::start();
+
     let exit_code = Application::run(ExtraContext::default())
         .code()
         .unwrap_or(exitcode::UNAVAILABLE) as u8;
@@ -25,6 +28,11 @@ pub fn main() -> ExitCode {
     // service or console path allocates anything long-lived.
     #[cfg(feature = "allocation-tracing")]
     vector::internal_telemetry::allocations::init_tracing_from_cli();
+
+    // Before either the service or the console path allocates, so the unsampled window is
+    // as small as it can be.
+    #[cfg(feature = "mimalloc-pprof")]
+    vector::heap_profile::start();
 
     // We need to be able to run vector in User Interactive mode. We first try
     // to run vector as a service. If we fail, we consider that we are in

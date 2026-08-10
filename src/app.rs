@@ -218,6 +218,10 @@ impl Application {
             opts.root.internal_logs_source_rate_limit,
         );
 
+        // Earliest point at which the profiler's startup outcome can reach a log sink.
+        #[cfg(feature = "mimalloc-pprof")]
+        crate::heap_profile::log_started();
+
         #[cfg(unix)]
         if opts.root.raise_fd_limit {
             crate::cli::raise_file_descriptor_limit();
@@ -321,7 +325,15 @@ pub struct StartedApplication {
 
 impl StartedApplication {
     pub async fn run(self) -> ExitStatus {
-        self.main().await.shutdown().await
+        let status = self.main().await.shutdown().await;
+
+        // Both the console entry point and the Windows service entry point return through
+        // here, and a console interrupt arrives as a shutdown signal rather than as an
+        // abrupt exit, so this one site covers every ordinary way the process ends.
+        #[cfg(feature = "mimalloc-pprof")]
+        crate::heap_profile::dump();
+
+        status
     }
 
     pub async fn main(self) -> FinishedApplication {
