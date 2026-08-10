@@ -17,7 +17,7 @@
 //! resolved at run time anyway (see [`HeapApi::resolve`]), and keeping the whole surface
 //! local means this file is the only thing a reader has to check.
 
-use std::ffi::{c_void, c_ulong};
+use std::ffi::{c_ulong, c_void};
 use std::mem::{size_of, transmute, zeroed};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,8 +58,7 @@ type Bool = i32;
 type ProcAddress = unsafe extern "system" fn() -> isize;
 
 type HeapSummaryFn = unsafe extern "system" fn(Handle, u32, *mut HeapSummary) -> Bool;
-type HeapSetInformationFn =
-    unsafe extern "system" fn(Handle, i32, *const c_void, usize) -> Bool;
+type HeapSetInformationFn = unsafe extern "system" fn(Handle, i32, *const c_void, usize) -> Bool;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
