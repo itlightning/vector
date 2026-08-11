@@ -261,6 +261,11 @@ impl Application {
         #[cfg(windows)]
         crate::heap_reclaim::spawn();
 
+        // Same placement, same reason. Off unless SPARKLOGS_RSS_LOG_INTERVAL_SECS is set; in a
+        // mimalloc-pprof build the heap snapshots already carry a sample without it.
+        #[cfg(windows)]
+        crate::process_memory::spawn();
+
         let config = runtime.block_on(ApplicationConfig::from_opts(
             &opts.root,
             &mut signals.handler,

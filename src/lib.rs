@@ -94,6 +94,12 @@ static ALLOC: global_allocator::Inner = global_allocator::INNER;
 #[cfg(windows)]
 mod heap_reclaim;
 
+// Always compiled on Windows, unlike `heap_profile`: the OS-level working set is the number the
+// allocator instrumentation cannot report, and its timer stays off unless an env var turns it on,
+// so it is safe in a shipping build.
+#[cfg(windows)]
+mod process_memory;
+
 #[cfg(feature = "mimalloc-pprof")]
 pub mod heap_profile;
 

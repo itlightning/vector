@@ -187,6 +187,12 @@ pub fn dump() {
     }
 
     log_allocator_stats();
+    // Always, and with no variable of its own: every allocator number logged above is
+    // allocator-internal, and the working set is the only one that says what the OS thinks the
+    // process is holding. It follows the allocator line immediately, so the two read as one
+    // snapshot.
+    #[cfg(windows)]
+    crate::process_memory::log_sample("heap_profile");
 }
 
 /// Log mimalloc's exact counters next to the sampled ones.
