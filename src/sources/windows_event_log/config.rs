@@ -16,6 +16,13 @@ const MAX_CONNECTION_TIMEOUT_SECS: u64 = 3600;
 const MAX_EVENT_TIMEOUT_MS: u64 = 60000;
 const MAX_BATCH_SIZE: u32 = 10000;
 
+/// The `channel` value on internal events raised for a failure that belongs to
+/// the source rather than to any single channel.
+///
+/// Defined once and rejected by `validate`, so a consumer keying on `channel`
+/// can treat it as unambiguous rather than as a name a config might also use.
+pub(super) const SOURCE_LEVEL_CHANNEL: &str = "<source>";
+
 /// Configuration for the `windows_event_log` source.
 #[configurable_component(source(
     "windows_event_log",
@@ -382,6 +389,22 @@ impl WindowsEventLogConfig {
         for channel in &self.channels {
             if channel.trim().is_empty() {
                 return Err("Channel names cannot be empty".into());
+            }
+
+            // `<source>` is the channel value the source-level internal events
+            // carry when a failure belongs to the source rather than to any
+            // one channel. Windows cannot name a channel that, but only
+            // validation makes it a guarantee: without this, a typo'd config
+            // could make a per-channel event indistinguishable from the
+            // source-level sentinel for anything keying on `channel`.
+            if channel.trim() == SOURCE_LEVEL_CHANNEL {
+                return Err(format!(
+                    "Channel name '{}' is reserved: it marks source-level \
+                     failures that belong to no single channel. Use the real \
+                     Windows channel name.",
+                    SOURCE_LEVEL_CHANNEL
+                )
+                .into());
             }
 
             // Prevent excessively long channel names

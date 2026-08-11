@@ -525,7 +525,7 @@ impl WindowsEventLogSource {
                             // source rather than to a fictitious channel named
                             // "all".
                             emit!(WindowsEventLogQueryError {
-                                channel: "<source>".to_string(),
+                                channel: config::SOURCE_LEVEL_CHANNEL.to_string(),
                                 query: None,
                                 error: e.to_string(),
                             });
@@ -643,7 +643,7 @@ impl WindowsEventLogSource {
                             // source rather than to a fictitious channel named
                             // "all".
                             emit!(WindowsEventLogQueryError {
-                                channel: "<source>".to_string(),
+                                channel: config::SOURCE_LEVEL_CHANNEL.to_string(),
                                 query: None,
                                 error: e.to_string(),
                             });
