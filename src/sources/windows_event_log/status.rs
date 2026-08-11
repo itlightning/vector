@@ -26,6 +26,7 @@ use std::{
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use vector_lib::internal_event::error_type;
 
 use super::recovery::{Rung, TimeRung};
 
@@ -340,7 +341,11 @@ impl StatusWriter {
                              Per-source liveness reporting is unavailable until it succeeds.",
                             self.path.display()
                         ),
-                        error_type = "status_write_failed",
+                        // Our slug goes in `error_code`; `error_type` is
+                        // Vector's fixed taxonomy, and what failed here is a
+                        // write.
+                        error_code = "status_write_failed",
+                        error_type = error_type::WRITER_FAILED,
                         path = %self.path.display(),
                         error = %e,
                         internal_log_rate_limit = false,
