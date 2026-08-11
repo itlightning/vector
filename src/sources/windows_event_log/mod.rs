@@ -237,9 +237,15 @@ async fn drain_acks(finalizer: Finalizer, ack_stream: &mut AckStream, checkpoint
 /// Both the `EventsAvailable` path and the speculative-timeout path share this
 /// logic. Returns `true` if the downstream pipeline closed and the caller
 /// should break out of the main event loop.
+///
+/// `events` is DRAINED rather than consumed: the container belongs to the
+/// subscription, which recycles it for the next pull (see
+/// `EventLogSubscription::recycle_event_buffer`). Taking it by `&mut` is also
+/// what lets the caller keep an immutable borrow of the subscription across
+/// this call.
 #[allow(clippy::too_many_arguments)]
 async fn process_event_batch(
-    events: Vec<WindowsEvent>,
+    events: &mut Vec<WindowsEvent>,
     parser: &EventLogParser,
     log_namespace: LogNamespace,
     acknowledgements: bool,
@@ -259,7 +265,7 @@ async fn process_event_batch(
     let mut total_byte_size = 0usize;
     let mut channels_in_batch = std::collections::HashSet::new();
 
-    for event in events {
+    for event in events.drain(..) {
         let channel = event.channel.clone();
         channels_in_batch.insert(channel.clone());
         let event_id = event.event_id;
@@ -482,29 +488,32 @@ impl WindowsEventLogSource {
                     subscription = returned_sub;
 
                     match events_result {
-                        Ok(events) if events.is_empty() => {
+                        Ok(mut events) => {
                             error_backoff = std::time::Duration::from_millis(100);
-                            continue;
-                        }
-                        Ok(events) => {
-                            error_backoff = std::time::Duration::from_millis(100);
-                            debug!(
-                                message = "Pulled Windows Event Log events.",
-                                event_count = events.len()
-                            );
-                            if process_event_batch(
-                                events,
-                                &parser,
-                                self.log_namespace,
-                                acknowledgements,
-                                &subscription,
-                                &mut out,
-                                &finalizer,
-                                &events_received,
-                                &bytes_received,
-                            )
-                            .await
-                            {
+                            let pipeline_closed = if events.is_empty() {
+                                false
+                            } else {
+                                debug!(
+                                    message = "Pulled Windows Event Log events.",
+                                    event_count = events.len()
+                                );
+                                process_event_batch(
+                                    &mut events,
+                                    &parser,
+                                    self.log_namespace,
+                                    acknowledgements,
+                                    &subscription,
+                                    &mut out,
+                                    &finalizer,
+                                    &events_received,
+                                    &bytes_received,
+                                )
+                                .await
+                            };
+                            // Every path that took the buffer returns it, empty
+                            // batches included: on a quiet host that IS the path.
+                            subscription.recycle_event_buffer(events);
+                            if pipeline_closed {
                                 break;
                             }
                         }
@@ -591,38 +600,38 @@ impl WindowsEventLogSource {
                     subscription = returned_sub;
 
                     match speculative_result {
-                        Ok(events) if events.is_empty() => {
+                        Ok(mut events) => {
                             // Healthy cycle: reset backoff so the next transient
                             // error starts fresh.
                             error_backoff = std::time::Duration::from_millis(100);
-                        }
-                        Ok(events) => {
-                            // Healthy cycle: reset backoff so the next transient
-                            // error starts fresh.
-                            error_backoff = std::time::Duration::from_millis(100);
-                            // DEBUG, not WARN. The speculative pull is a
-                            // self-heal that works: it recovering events is the
-                            // mechanism functioning, not a fault. It also fires
-                            // routinely on the batch right after a rebuild,
-                            // which put a third and fourth warn-band line on a
-                            // single unregister episode in the lab.
-                            debug!(
-                                message = "Speculative timeout pull recovered events; possible lost wakeup detected.",
-                                event_count = events.len(),
-                            );
-                            if process_event_batch(
-                                events,
-                                &parser,
-                                self.log_namespace,
-                                acknowledgements,
-                                &subscription,
-                                &mut out,
-                                &finalizer,
-                                &events_received,
-                                &bytes_received,
-                            )
-                            .await
-                            {
+                            let pipeline_closed = if events.is_empty() {
+                                false
+                            } else {
+                                // DEBUG, not WARN. The speculative pull is a
+                                // self-heal that works: it recovering events is the
+                                // mechanism functioning, not a fault. It also fires
+                                // routinely on the batch right after a rebuild,
+                                // which put a third and fourth warn-band line on a
+                                // single unregister episode in the lab.
+                                debug!(
+                                    message = "Speculative timeout pull recovered events; possible lost wakeup detected.",
+                                    event_count = events.len(),
+                                );
+                                process_event_batch(
+                                    &mut events,
+                                    &parser,
+                                    self.log_namespace,
+                                    acknowledgements,
+                                    &subscription,
+                                    &mut out,
+                                    &finalizer,
+                                    &events_received,
+                                    &bytes_received,
+                                )
+                                .await
+                            };
+                            subscription.recycle_event_buffer(events);
+                            if pipeline_closed {
                                 break;
                             }
                         }

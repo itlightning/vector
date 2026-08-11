@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::num::NonZeroUsize;
-
 use lru::LruCache;
 use metrics::Counter;
 use windows::Win32::System::EventLog::{
@@ -10,7 +7,7 @@ use windows::Win32::System::EventLog::{
 use windows::core::HSTRING;
 
 use super::rendering_info;
-use super::subscription::{FORMAT_CACHE_CAPACITY, PublisherHandle};
+use super::subscription::PublisherHandle;
 use super::win32_errors::{RenderDisposition, classify_render, win32_code};
 use super::xml_parser::SystemFields;
 
@@ -74,6 +71,20 @@ fn note_publisher_path_entry() {
     seam::PUBLISHER_PATH_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Cache key for one `EvtFormatMessage` result: publisher name, message flag
+/// (task / opcode / keyword), and the raw field value.
+///
+/// The publisher is part of the key rather than a level above it, which is what
+/// lets a SINGLE LRU serve every publisher. The previous shape was an unbounded
+/// `HashMap<String, LruCache<..>>`, so each distinct publisher preallocated its
+/// own 10k-entry hashbrown table (measured 272 KiB) on its first event and held
+/// it for the life of the process.
+pub(super) type FormatCacheKey = (String, u32, u64);
+
+/// Every publisher's `EvtFormatMessage` results in one bounded LRU, so cold
+/// publishers age out instead of each owning a table forever.
+pub(super) type FormatCache = LruCache<FormatCacheKey, Option<String>>;
+
 /// Display fields for one event: task/opcode/keyword names plus the rendered
 /// message, together with how they were obtained.
 #[derive(Debug, Clone, Default)]
@@ -102,7 +113,7 @@ pub(super) struct EventDisplay {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_event_display(
     publisher_cache: &mut LruCache<String, PublisherHandle>,
-    format_cache: &mut HashMap<String, LruCache<(u32, u64), Option<String>>>,
+    format_cache: &mut FormatCache,
     cache_hits_counter: &Counter,
     cache_misses_counter: &Counter,
     event_handle: EVT_HANDLE,
@@ -172,7 +183,7 @@ fn render_result_usable(result: &windows::core::Result<()>) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_event_metadata(
     publisher_cache: &mut LruCache<String, PublisherHandle>,
-    format_cache: &mut HashMap<String, LruCache<(u32, u64), Option<String>>>,
+    format_cache: &mut FormatCache,
     cache_hits_counter: &Counter,
     cache_misses_counter: &Counter,
     event_handle: EVT_HANDLE,
@@ -193,13 +204,19 @@ pub fn resolve_event_metadata(
     let opcode_flag = EvtFormatMessageOpcode.0;
     let keyword_flag = EvtFormatMessageKeyword.0;
 
+    // One key, built once and reused for all three lookups. The publisher name
+    // is now part of the key, and these three calls always carry the SAME
+    // publisher, so building a key per lookup would cost three identical
+    // `String` allocations per event instead of one.
+    let mut key: FormatCacheKey = (provider_name.to_string(), 0, 0);
+
     let task_name = cached_format(
         format_cache,
         cache_hits_counter,
         cache_misses_counter,
         metadata_handle,
         event_handle,
-        provider_name,
+        &mut key,
         task_flag,
         task,
     );
@@ -209,7 +226,7 @@ pub fn resolve_event_metadata(
         cache_misses_counter,
         metadata_handle,
         event_handle,
-        provider_name,
+        &mut key,
         opcode_flag,
         opcode,
     );
@@ -219,7 +236,7 @@ pub fn resolve_event_metadata(
         cache_misses_counter,
         metadata_handle,
         event_handle,
-        provider_name,
+        &mut key,
         keyword_flag,
         keywords,
     );
@@ -255,28 +272,29 @@ fn get_or_open_publisher(
     raw
 }
 
-/// Two-level cache lookup: outer HashMap keyed by `&str` (zero allocation),
-/// inner LRU keyed by `(flag, field_value)`.
+/// Single-LRU lookup keyed by `(publisher, flag, field_value)`.
+///
+/// `key` is owned by the CALLER and mutated in place: the caller builds the
+/// publisher `String` once per event and this sets the flag and value fields
+/// for each of the three lookups. The hit path therefore allocates nothing, and
+/// only a miss clones the key to insert it.
 #[allow(clippy::too_many_arguments)]
 fn cached_format(
-    cache: &mut HashMap<String, LruCache<(u32, u64), Option<String>>>,
+    cache: &mut FormatCache,
     cache_hits_counter: &Counter,
     cache_misses_counter: &Counter,
     metadata_handle: EVT_HANDLE,
     event_handle: EVT_HANDLE,
-    provider: &str,
+    key: &mut FormatCacheKey,
     flag: u32,
     field_value: u64,
 ) -> Option<String> {
-    let inner_key = (flag, field_value);
+    key.1 = flag;
+    key.2 = field_value;
 
-    // Fast path: borrowed &str lookup on outer HashMap â€” zero allocation.
-    // peek() intentionally skips LRU promotion â€” get() requires &mut which
-    // would need get_mut() on the outer HashMap. The put() on every miss
-    // already handles insertion/promotion, so peek is correct here.
-    if let Some(inner) = cache.get(provider)
-        && let Some(cached) = inner.peek(&inner_key)
-    {
+    // `get`, not `peek`: with one shared LRU across every publisher, promotion
+    // is what keeps a hot publisher's entries resident while cold ones age out.
+    if let Some(cached) = cache.get(key) {
         cache_hits_counter.increment(1);
         return cached.clone();
     }
@@ -284,10 +302,7 @@ fn cached_format(
     // Slow path: call API and populate cache
     cache_misses_counter.increment(1);
     let result = format_metadata_field(metadata_handle, event_handle, flag);
-    let inner = cache
-        .entry(provider.to_string())
-        .or_insert_with(|| LruCache::new(NonZeroUsize::new(FORMAT_CACHE_CAPACITY).unwrap()));
-    inner.put(inner_key, result.clone());
+    cache.put(key.clone(), result.clone());
     result
 }
 
@@ -400,17 +415,17 @@ pub fn format_event_message(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
     use crate::sources::windows_event_log::xml_parser::parse_system_section;
 
     const FORWARDED_FIXTURE: &str = include_str!("testdata/forwarded_rendering_info.xml");
     const LOCAL_FIXTURE: &str = include_str!("testdata/local_no_rendering_info.xml");
 
-    fn empty_caches() -> (
-        LruCache<String, PublisherHandle>,
-        HashMap<String, LruCache<(u32, u64), Option<String>>>,
-    ) {
-        (LruCache::new(NonZeroUsize::new(8).unwrap()), HashMap::new())
+    fn empty_caches() -> (LruCache<String, PublisherHandle>, FormatCache) {
+        let size = NonZeroUsize::new(8).expect("nonzero");
+        (LruCache::new(size), FormatCache::new(size))
     }
 
     /// MERGE GATE for the `<RenderingInfo>` crash guard.
