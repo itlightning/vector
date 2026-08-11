@@ -24,7 +24,7 @@ use vector_vrl_functions::set_semantic_meaning::MeaningList;
 use vector_vrl_metrics::MetricsStorage;
 use vrl::{
     compiler::{
-        CompileConfig, ExpressionError, Program, TypeState, VrlRuntime,
+        CompileConfig, ExpressionError, Program, RegexCache, TypeState, VrlRuntime,
         runtime::{Runtime, Terminate},
         state::ExternalEnv,
     },
@@ -90,14 +90,42 @@ fn program_cache() -> &'static Mutex<Vec<CachedProgram>> {
     PROGRAM_CACHE.get_or_init(Default::default)
 }
 
-/// Drops every memoized program. Called by the topology builder around a build or reload cycle:
-/// the memo exists to deduplicate compilations *within* one cycle, and a program compiled for a
-/// previous cycle can never be reused anyway, because its key pins the enrichment registry
-/// generation and the config text it was built from. Clearing bounds retention to the cycle in
-/// flight instead of the process lifetime, which matters for the long-running service; under
-/// `vector validate` the process exits immediately and the distinction does not arise.
+/// Compiled regex literals, shared by every VRL compilation in one build cycle.
+///
+/// A compiled `Regex` is roughly 56 KiB of automata and a rendered source pack repeats the same
+/// literals across many programs, so interning them leaves one object per distinct pattern instead
+/// of one per occurrence. Only the cache HANDLE is shared: the rest of a `CompileConfig` is
+/// per-transform (read-only paths, enrichment and metrics context) and must not be.
+///
+/// Its lifetime is the program memo's. It is created on the first compilation of a cycle and
+/// dropped by [`clear_compiled_program_cache`] at both ends of one, because the cache pins every
+/// pattern it has seen: a process-lifetime handle would keep the literals of programs that were
+/// discarded cycles ago. After the drop, only the regexes a live `Program` still holds survive.
+static REGEX_CACHE: OnceLock<Mutex<Option<RegexCache>>> = OnceLock::new();
+
+fn regex_cache_slot() -> &'static Mutex<Option<RegexCache>> {
+    REGEX_CACHE.get_or_init(Default::default)
+}
+
+/// The regex cache for the build cycle in flight, created if this is its first compilation.
+fn regex_cache_handle() -> RegexCache {
+    regex_cache_slot()
+        .lock()
+        .expect("Data poisoned")
+        .get_or_insert_with(RegexCache::default)
+        .clone()
+}
+
+/// Drops every memoized program and the interned regex literals. Called by the topology builder
+/// around a build or reload cycle: the memo exists to deduplicate compilations *within* one cycle,
+/// and a program compiled for a previous cycle can never be reused anyway, because its key pins the
+/// enrichment registry generation and the config text it was built from. Clearing bounds retention
+/// to the cycle in flight instead of the process lifetime, which matters for the long-running
+/// service; under `vector validate` the process exits immediately and the distinction does not
+/// arise.
 pub fn clear_compiled_program_cache() {
     program_cache().lock().expect("Data poisoned").clear();
+    *regex_cache_slot().lock().expect("Data poisoned") = None;
 }
 
 /// Configuration for the `remap` transform.
@@ -261,6 +289,10 @@ impl RemapConfig {
         config.set_custom(enrichment_tables.clone());
         config.set_custom(metrics_storage);
         config.set_custom(MeaningList::default());
+        // Only the handle crosses transforms; everything else on this config is per-transform.
+        // The returned `CompilationResult.config` is deliberately not kept anywhere: holding it
+        // would retain the whole custom map for as long as the transform lives.
+        config.set_regex_cache(regex_cache_handle());
 
         let res = compile_vrl(&source, &vector_vrl_functions::all(), &state, config)
             .map_err(|diagnostics| format_vrl_diagnostics(&source, diagnostics))
