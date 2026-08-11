@@ -23,6 +23,7 @@
 
 use std::ffi::c_ulong;
 use std::mem::{size_of, zeroed};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
@@ -172,8 +173,22 @@ pub(crate) fn spawn() {
     }
 }
 
-/// The configured sampling interval, or `None` when logging is off.
+/// Whether memory logging is armed, which is this module's standalone-timer gate. Other periodic
+/// Windows memory diagnostics reuse it (see [`crate::heap_reclaim`]) so that one variable arms all
+/// of them and the shipped default stays silent.
+pub(crate) fn logging_enabled() -> bool {
+    interval().is_some()
+}
+
+/// The configured sampling interval, or `None` when logging is off. Resolved once: the gate is
+/// consulted from more than one timer, and the warning below has to be a single line rather than
+/// one per consultation.
 fn interval() -> Option<Duration> {
+    static INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
+    *INTERVAL.get_or_init(resolve_interval)
+}
+
+fn resolve_interval() -> Option<Duration> {
     let value = std::env::var(INTERVAL_ENV).ok()?;
     let value = value.trim();
     if value.is_empty() {

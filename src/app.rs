@@ -570,6 +570,25 @@ fn get_log_levels(default: &str) -> String {
         .unwrap_or_else(|_| default.into())
 }
 
+/// How long an idle blocking-pool thread is kept before it is reaped.
+///
+/// Tokio's default is 10 seconds, which this replaces. The pool inflates during bursts and, at
+/// that default, never deflates on a pipeline that sees work every few seconds: a thread has to
+/// sit idle for the whole 10 seconds to be reaped, and the next batch always arrives first, so a
+/// pool inflated once stays inflated. Measured here: a first run against an empty data directory
+/// peaked at ~251 blocking threads, steady busy ingest sat at ~44, and a process left idle well
+/// after ingest still held 126, of which 113 were parked doing nothing. Steady-state need is 11
+/// blocking tasks (5 Windows Event Log `wait_for_events_blocking` readers, 4 file-source loops,
+/// 2 workers). 200ms drains the burst population between bursts instead.
+///
+/// The churn this trades against is close to zero, because every steady-state blocking task is
+/// long-lived and therefore occupied rather than parked, and the keep-alive only ever applies to
+/// a thread that is idle. Only the transient burst population is affected.
+///
+/// `max_blocking_threads(20_000)` above is a deliberate upstream choice and is intentionally left
+/// alone: it caps how far the pool may inflate, while this controls how long it stays inflated.
+const BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_millis(200);
+
 pub fn build_runtime(
     threads: Option<usize>,
     chunk_size_events: Option<NonZeroUsize>,
@@ -577,6 +596,7 @@ pub fn build_runtime(
 ) -> Result<Runtime, ExitCode> {
     let mut rt_builder = runtime::Builder::new_multi_thread();
     rt_builder.max_blocking_threads(20_000);
+    rt_builder.thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE);
     rt_builder.enable_all().thread_name(thread_name);
 
     let threads = threads.unwrap_or_else(crate::num_threads);

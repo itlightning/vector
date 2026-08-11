@@ -16,6 +16,11 @@
 //! crate depends on with a narrow feature set. Two of the four entry points have to be
 //! resolved at run time anyway (see [`HeapApi::resolve`]), and keeping the whole surface
 //! local means this file is the only thing a reader has to check.
+//!
+//! This whole file is a no-op in any `mimalloc-pprof` build. It operates on the NT process
+//! heap, which mimalloc replaces wholesale, so the summary reports a heap nothing allocates
+//! from and the optimize call has nothing to release. Whatever this reclaims can therefore
+//! only be measured on a system-allocator build, which is what ships.
 
 use std::ffi::{c_ulong, c_void};
 use std::mem::{size_of, transmute, zeroed};
@@ -179,14 +184,60 @@ fn run(api: HeapApi, heap: Handle) {
             return;
         }
         let elapsed_ms = started.elapsed().as_millis();
-        let reclaimed_bytes = api
-            .summary(heap)
-            .map_or(0, |after| before.committed.saturating_sub(after.committed));
-        debug!(
-            free_bytes = free,
-            reclaimed_bytes, elapsed_ms, "Reclaimed free heap resources."
-        );
+        let Some(after) = api.summary(heap) else {
+            debug!("Reclaimed free heap resources; the heap summary afterwards could not be read.");
+            previous_free = None;
+            continue;
+        };
+        log_reclaim(&before, &after, elapsed_ms);
         // Start the two-sample count over so the next reclaim needs a fresh quiet period.
         previous_free = None;
     }
+}
+
+/// Report what one reclaim achieved.
+///
+/// Every invocation is logged, not only one that released something. A reclaim that returned
+/// nothing is the denominator: without it, a measurement cannot tell a timer that never fired
+/// from one that fired and achieved nothing, which is the exact ambiguity this line exists to
+/// remove.
+///
+/// The gate is [`crate::process_memory::logging_enabled`], the same variable that arms that
+/// module's standalone timer, so this stays silent in normal operation and appears only when
+/// memory logging is on. Under that gate the line is emitted at the same level and with the same
+/// rate limiting as `Process memory.`, and carries `private_bytes` under that line's own field
+/// name, so a reclaim can be lined up against the OS-level numbers around it. Without the gate it
+/// falls back to `debug`, which is where this used to live.
+fn log_reclaim(before: &HeapSummary, after: &HeapSummary, elapsed_ms: u128) {
+    let free_bytes_before = before.committed.saturating_sub(before.allocated);
+    let free_bytes_after = after.committed.saturating_sub(after.allocated);
+    let freed_bytes = free_bytes_before.saturating_sub(free_bytes_after);
+    let decommitted_bytes = before.committed.saturating_sub(after.committed);
+
+    if !crate::process_memory::logging_enabled() {
+        debug!(
+            free_bytes_before,
+            free_bytes_after,
+            freed_bytes,
+            decommitted_bytes,
+            elapsed_ms,
+            "Heap resources reclaimed."
+        );
+        return;
+    }
+
+    // Tracing levels are compile-time constants, so the armed line is written out separately
+    // rather than selected at run time.
+    let private_bytes = crate::process_memory::sample().map_or(0, |sample| sample.private_bytes);
+    info!(
+        message = "Heap resources reclaimed.",
+        trigger = "heap_reclaim",
+        free_bytes_before,
+        free_bytes_after,
+        freed_bytes,
+        decommitted_bytes,
+        private_bytes,
+        elapsed_ms,
+        internal_log_rate_limit = false,
+    );
 }
