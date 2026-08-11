@@ -13,7 +13,7 @@ use governor::{
 use metrics::{Counter, Gauge};
 use vector_lib::{
     counter, gauge,
-    internal_event::{CounterName, GaugeName},
+    internal_event::{CounterName, GaugeName, error_type},
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::EventLog::{
@@ -398,7 +398,11 @@ impl SubscriptionFactory {
                         // Structured key so consumers never have to match this
                         // sentence. Message text is prose for humans and will
                         // keep being improved; this is the stable handle.
-                        error_type = "resume_query_rejected",
+                        // `error_code` carries our slug and `error_type` stays
+                        // Vector's fixed taxonomy, as the component spec
+                        // requires; the same split as the internal events.
+                        error_code = "resume_query_rejected",
+                        error_type = error_type::REQUEST_FAILED,
                         channel = %self.channel,
                         win32_error = e.code().0,
                         error = %e,
@@ -642,18 +646,26 @@ impl ChannelSubscription {
                             "Windows Event Log channel recovered (channel={}, resumed_from={}, last_event_at={}).",
                             self.channel, resumed_from, last_event_at
                         ),
-                        error_type = "channel_recovered",
+                        error_code = "channel_recovered",
+                        // The episode this closes was a run of failed
+                        // subscribe/query calls, so the taxonomy value names
+                        // what was failing rather than the recovery itself.
+                        error_type = error_type::REQUEST_FAILED,
                         channel = %self.channel,
                         resumed_from = resumed_from,
                         last_event_at = %last_event_at,
-                        cause = cause,
+                        // `rebuild_cause`, not `cause`: on
+                        // `record_id_gap_expected` and in the status file
+                        // `cause` means the ladder rung, and one name for two
+                        // meanings is how a consumer joins the wrong pair.
+                        rebuild_cause = cause,
                         internal_log_rate_limit = false,
                     );
                 } else {
                     debug!(
                         message = "Windows Event Log subscription created.",
                         channel = %self.channel,
-                        cause = cause,
+                        rebuild_cause = cause,
                         rung = self.resume.rung.as_str(),
                     );
                 }
@@ -672,7 +684,7 @@ impl ChannelSubscription {
                     debug!(
                         message = "Proactive Windows Event Log rebuild failed; keeping the live subscription.",
                         channel = %self.channel,
-                        cause = cause,
+                        rebuild_cause = cause,
                         win32_error = code,
                         win32_error_name = describe(code).unwrap_or("unknown"),
                         retry_in_ms = retry_in.as_millis() as u64,
@@ -725,7 +737,9 @@ impl ChannelSubscription {
                      backlog for this channel is not recoverable (channel={}).",
                     self.channel
                 ),
-                error_type = "resume_future_only",
+                error_code = "resume_future_only",
+                // The backlog is unreadable from any position we still hold.
+                error_type = error_type::READER_FAILED,
                 channel = %self.channel,
                 reason = reason,
                 win32_error = code,
@@ -766,7 +780,11 @@ impl ChannelSubscription {
                 reason.as_str(),
                 self.last_event_at_rfc3339()
             ),
-            error_type = "channel_skipped",
+            error_code = "channel_skipped",
+            // Every `SkipReason` is a binding the operator has to change:
+            // a bad channel path, a direct channel, an invalid operator
+            // query, or missing read access.
+            error_type = error_type::CONFIGURATION_FAILED,
             channel = %self.channel,
             reason = reason.as_str(),
             win32_error = code,
@@ -791,13 +809,19 @@ impl ChannelSubscription {
                          last_event_at={}).",
                         self.channel, code, last_event_at
                     ),
-                    error_type = "query_failed",
+                    // NOT `query_failed`: that slug is taken by the
+                    // source-level `WindowsEventLogQueryError`, which is
+                    // rate-limited, recurring, and tagged with the
+                    // `<source>` channel sentinel. This one is per-channel
+                    // and edge-triggered, once per episode.
+                    error_code = "channel_query_failed",
+                    error_type = error_type::REQUEST_FAILED,
                     channel = %self.channel,
                     win32_error = code,
                     win32_error_name = name,
                     hresult = error.code().0,
                     last_event_at = %last_event_at,
-                    cause = cause,
+                    rebuild_cause = cause,
                     retry_in_ms = delay.as_millis() as u64,
                     internal_log_rate_limit = false,
                 );
@@ -805,7 +829,8 @@ impl ChannelSubscription {
             FailureEdge::OngoingReminder => {
                 debug!(
                     message = "Windows Event Log channel still unavailable.",
-                    error_type = "channel_unavailable_ongoing",
+                    error_code = "channel_unavailable_ongoing",
+                    error_type = error_type::REQUEST_FAILED,
                     channel = %self.channel,
                     win32_error = code,
                     win32_error_name = name,
@@ -1519,7 +1544,10 @@ impl EventLogSubscription {
                                         rung.as_str(),
                                         channel_sub.channel
                                     ),
-                                    error_type = "poison_escape",
+                                    error_code = "poison_escape",
+                                    // `EvtNext` cannot get past the record at
+                                    // the resume position.
+                                    error_type = error_type::READER_FAILED,
                                     channel = %channel_sub.channel,
                                     rung = rung.as_str(),
                                     skipping_next_record = channel_sub.resume.skip_next_record,
@@ -1657,7 +1685,8 @@ impl EventLogSubscription {
                                              record_id={}).",
                                             channel_sub.channel, event.record_id
                                         ),
-                                        error_type = "poison_record_skipped",
+                                        error_code = "poison_record_skipped",
+                                        error_type = error_type::READER_FAILED,
                                         channel = %channel_sub.channel,
                                         record_id = event.record_id,
                                         rung = channel_sub.resume.rung.as_str(),
@@ -1691,7 +1720,11 @@ impl EventLogSubscription {
                                                  (channel={}, missing_records={}).",
                                                 channel_sub.channel, missing
                                             ),
-                                            error_type = "record_id_gap",
+                                            error_code = "record_id_gap",
+                                            // The missing records were
+                                            // overwritten before they could be
+                                            // read.
+                                            error_type = error_type::READER_FAILED,
                                             channel = %channel_sub.channel,
                                             missing_records = missing,
                                             previous_record_id =
@@ -1712,7 +1745,8 @@ impl EventLogSubscription {
                                                  (channel={}, missing_records={}).",
                                                 channel_sub.channel, missing
                                             ),
-                                            error_type = "record_id_gap_expected",
+                                            error_code = "record_id_gap_expected",
+                                            error_type = error_type::READER_FAILED,
                                             channel = %channel_sub.channel,
                                             // `missing_records` and `cause` are named to
                                             // match the per-source status file, so this
@@ -3927,7 +3961,7 @@ mod tests {
         }
         assert!(subscription.first_channel_is_live());
 
-        let (delivered, warns) = warn_band_error_types(|| drain_all(&mut subscription));
+        let (delivered, warns) = warn_band_error_codes(|| drain_all(&mut subscription));
         assert!(
             !delivered.contains(&poisoned),
             "record {poisoned} sat immediately past the resume boundary on the \
@@ -4678,29 +4712,32 @@ mod tests {
     // Log severity and triage fields.
     // ---------------------------------------------------------------------
 
-    /// Captures `(level, error_type)` for every warn-band record.
+    /// Captures `(level, error_code)` for every warn-band record.
+    ///
+    /// `error_code` is the slug field: `error_type` is Vector's fixed
+    /// taxonomy and cannot tell two of our events apart.
     #[derive(Clone, Default)]
-    struct ErrorTypeCapture {
+    struct ErrorCodeCapture {
         seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     }
 
-    struct ErrorTypeVisitor(Option<String>);
+    struct ErrorCodeVisitor(Option<String>);
 
-    impl tracing::field::Visit for ErrorTypeVisitor {
+    impl tracing::field::Visit for ErrorCodeVisitor {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "error_type" {
+            if field.name() == "error_code" {
                 self.0 = Some(value.to_string());
             }
         }
 
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "error_type" {
+            if field.name() == "error_code" {
                 self.0 = Some(format!("{value:?}"));
             }
         }
     }
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorTypeCapture {
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorCodeCapture {
         fn on_event(
             &self,
             event: &tracing::Event<'_>,
@@ -4710,7 +4747,7 @@ mod tests {
             if level > tracing::Level::WARN {
                 return;
             }
-            let mut visitor = ErrorTypeVisitor(None);
+            let mut visitor = ErrorCodeVisitor(None);
             event.record(&mut visitor);
             self.seen
                 .lock()
@@ -4731,7 +4768,7 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         fn capture<F: FnOnce()>(f: F) -> Vec<(String, String)> {
-            let capture = ErrorTypeCapture::default();
+            let capture = ErrorCodeCapture::default();
             let collector = tracing_subscriber::registry().with(capture.clone());
             tracing::subscriber::with_default(collector, f);
 
@@ -5040,10 +5077,10 @@ mod tests {
         }
     }
 
-    /// Captures `error_type` for every warn-band record raised inside `f`.
-    fn warn_band_error_types<F: FnOnce() -> T, T>(f: F) -> (T, Vec<(String, String)>) {
+    /// Captures `error_code` for every warn-band record raised inside `f`.
+    fn warn_band_error_codes<F: FnOnce() -> T, T>(f: F) -> (T, Vec<(String, String)>) {
         use tracing_subscriber::layer::SubscriberExt;
-        let capture = ErrorTypeCapture::default();
+        let capture = ErrorCodeCapture::default();
         let collector = tracing_subscriber::registry().with(capture.clone());
         let value = tracing::subscriber::with_default(collector, f);
         let seen = capture.seen.lock().unwrap().clone();
@@ -5125,7 +5162,7 @@ mod tests {
     ) {
         let request_log = RequestLog::install(seams);
         let timeline = InjectedTimeline::install(seams, offset_us);
-        let (delivered, warns) = warn_band_error_types(|| drain_all(subscription));
+        let (delivered, warns) = warn_band_error_codes(|| drain_all(subscription));
         (delivered, timeline, request_log, warns)
     }
 
@@ -5143,7 +5180,7 @@ mod tests {
     ) {
         let request_log = RequestLog::install(seams);
         let timeline = InjectedTimeline::install_from(seams, base, offset_us);
-        let (delivered, warns) = warn_band_error_types(|| drain_all(subscription));
+        let (delivered, warns) = warn_band_error_codes(|| drain_all(subscription));
         (delivered, timeline, request_log, warns)
     }
 
@@ -5381,7 +5418,7 @@ mod tests {
         let mut config = application_config();
         config.read_existing_events = false;
 
-        let capture = ErrorTypeCapture::default();
+        let capture = ErrorCodeCapture::default();
         let collector = tracing_subscriber::registry().with(capture.clone());
         // `set_default` rather than `with_default`: the subscription is built
         // across an await, and the guard has to span it.

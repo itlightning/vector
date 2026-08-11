@@ -201,6 +201,27 @@ mod config_tests {
         );
     }
 
+    /// The source-level sentinel is a reserved `channel` value, so a config
+    /// can never mint a real channel that collides with it. Windows will not
+    /// create such a channel either, but that is an assumption about another
+    /// product; this makes it a property of our own input.
+    #[test]
+    fn the_source_level_channel_sentinel_is_rejected_as_a_configured_channel() {
+        for spelling in ["<source>", "  <source>  "] {
+            let mut config = create_test_config();
+            config.channels = vec!["System".to_string(), spelling.to_string()];
+
+            let message = config
+                .validate()
+                .expect_err("the sentinel must not be accepted as a channel")
+                .to_string();
+            assert!(
+                message.contains("reserved") && message.contains("<source>"),
+                "the error has to name the reserved value, got: {message}"
+            );
+        }
+    }
+
     #[test]
     fn test_config_validation_empty_query() {
         let mut config = create_test_config();
