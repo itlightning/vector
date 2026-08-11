@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
 };
@@ -61,7 +60,8 @@ pub(super) static DRAIN_STEP_HOOK: std::sync::Mutex<
     Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>,
 > = std::sync::Mutex::new(None);
 
-/// Maximum number of entries in the EvtFormatMessage result cache.
+/// Maximum number of entries in the EvtFormatMessage result cache. One cache
+/// for the whole process, shared by every publisher.
 pub const FORMAT_CACHE_CAPACITY: usize = 10_000;
 /// Maximum number of cached publisher metadata handles.
 const PUBLISHER_CACHE_CAPACITY: usize = 256;
@@ -915,12 +915,24 @@ pub struct EventLogSubscription {
     rate_limiter: Option<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
     shutdown_event: HANDLE,
     render_buffer: Vec<u8>,
+    /// The per-pull batch container, parked here between pulls.
+    ///
+    /// A pull takes it, fills it, and hands it out; the caller drains the
+    /// events into the pipeline and gives the empty container back via
+    /// [`Self::recycle_event_buffer`]. So this subscription owns AT MOST ONE
+    /// such allocation at any time, and it is made once rather than per pull.
+    ///
+    /// This matters because a pull runs on a tokio blocking-pool thread while
+    /// the drain runs on a worker thread: a fresh buffer per pull is a
+    /// cross-thread free of a ~300 KB block thousands of times over, which the
+    /// allocator does not promptly return.
+    event_buffer: Vec<xml_parser::WindowsEvent>,
     /// Cached EvtOpenPublisherMetadata handles keyed by provider name.
     /// Bounded LRU; evicted handles are closed via `PublisherHandle::drop`.
     publisher_cache: LruCache<String, PublisherHandle>,
-    /// Cached EvtFormatMessage results. Outer key is provider name (looked up
-    /// via `&str` — zero allocation on the hot path), inner LRU is bounded per provider.
-    format_cache: HashMap<String, LruCache<(u32, u64), Option<String>>>,
+    /// Cached EvtFormatMessage results for every publisher in ONE bounded LRU
+    /// keyed by `(publisher, flag, field value)`.
+    format_cache: metadata::FormatCache,
     /// Pre-registered counter for metadata cache hits.
     cache_hits_counter: Counter,
     /// Pre-registered counter for metadata cache misses.
@@ -1178,8 +1190,14 @@ impl EventLogSubscription {
             rate_limiter,
             shutdown_event,
             render_buffer: vec![0u8; 16384],
+            // Deliberately NOT pre-sized: capacity converges to the real
+            // high-water mark after a few growths and then stays there, which
+            // a quiet host never pays for.
+            event_buffer: Vec::new(),
             publisher_cache: LruCache::new(NonZeroUsize::new(PUBLISHER_CACHE_CAPACITY).unwrap()),
-            format_cache: HashMap::new(),
+            format_cache: metadata::FormatCache::new(
+                NonZeroUsize::new(FORMAT_CACHE_CAPACITY).unwrap(),
+            ),
             cache_hits_counter: counter!(CounterName::WindowsEventLogCacheHitsTotal),
             cache_misses_counter: counter!(CounterName::WindowsEventLogCacheMissesTotal),
             sid_resolver: SidResolver::new(),
@@ -1253,12 +1271,33 @@ impl EventLogSubscription {
         self.pull_events_inner(max_events, false)
     }
 
+    /// Give a pulled batch's container back for the next pull to reuse.
+    ///
+    /// The events themselves are gone by now (drained into the pipeline); this
+    /// hands back only the `Vec` and its capacity. Callers that skip this are
+    /// still CORRECT, just back to a fresh allocation per pull, so the run loop
+    /// calls it on every path that took a buffer, including the empty-batch
+    /// one, which is the common case on a quiet host.
+    pub fn recycle_event_buffer(&mut self, mut buffer: Vec<xml_parser::WindowsEvent>) {
+        buffer.clear();
+        // Keep whichever container has the larger capacity. They are the same
+        // one in practice; this just makes a double-recycle harmless instead of
+        // silently dropping the bigger allocation.
+        if buffer.capacity() >= self.event_buffer.capacity() {
+            self.event_buffer = buffer;
+        }
+    }
+
     fn pull_events_inner(
         &mut self,
         max_events: usize,
         update_records_for_empty_channels: bool,
     ) -> Result<Vec<xml_parser::WindowsEvent>, WindowsEventLogError> {
-        let mut all_events = Vec::with_capacity(max_events.min(1000));
+        // The recycled container (see `event_buffer`). Taking it leaves an
+        // empty `Vec` behind, which owns no allocation, so the invariant is
+        // exactly one buffer per subscription whether it is parked or on loan.
+        let mut all_events = std::mem::take(&mut self.event_buffer);
+        all_events.clear();
         let num_channels = self.channels.len().max(1);
         let per_channel_budget = (max_events / num_channels).max(1);
         let start = self.round_robin_index % num_channels;
@@ -2304,6 +2343,60 @@ mod tests {
             }
             WaitResult::Shutdown => panic!("Unexpected shutdown"),
         }
+    }
+
+    /// The batch container is ONE allocation per subscription, made once and
+    /// handed back and forth, not a fresh `Vec` per pull.
+    ///
+    /// Asserted on the pointer, because capacity alone would also be satisfied
+    /// by a new allocation of the same size, which is exactly what this
+    /// replaced. `max_events = 0` keeps the drain from running, so the
+    /// assertion is about the container and cannot be perturbed by whatever
+    /// the host's Application log happens to hold.
+    #[tokio::test]
+    async fn batch_buffer_is_recycled_across_pulls() {
+        let _seams = SeamSession::acquire();
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+        let mut subscription = EventLogSubscription::new(&config, checkpointer, false)
+            .await
+            .expect("Subscription creation should succeed");
+
+        let seeded: Vec<xml_parser::WindowsEvent> = Vec::with_capacity(64);
+        let seeded_ptr = seeded.as_ptr();
+        subscription.recycle_event_buffer(seeded);
+
+        let first = subscription
+            .pull_events(0)
+            .expect("pull must not error out");
+        assert_eq!(
+            first.as_ptr(),
+            seeded_ptr,
+            "a pull must hand out the parked container, not allocate a new one"
+        );
+        assert!(
+            first.capacity() >= 64,
+            "the parked container's capacity must survive the pull"
+        );
+        assert_eq!(
+            subscription.event_buffer.capacity(),
+            0,
+            "while the container is on loan the subscription must not hold a second one"
+        );
+
+        subscription.recycle_event_buffer(first);
+        let second = subscription
+            .pull_events(0)
+            .expect("pull must not error out");
+        assert_eq!(
+            second.as_ptr(),
+            seeded_ptr,
+            "the same allocation must survive an arbitrary number of pull cycles"
+        );
     }
 
     /// Test multiple concurrent pull subscriptions
