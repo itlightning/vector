@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use file_source_common::{
     FileFingerprint, FileSourceInternalEvents, Fingerprinter, ReadFrom,
     checkpointer::{Checkpointer, CheckpointsView},
+    status::{FileSourceStatus, FileState, FileStatus, StatusWriter, secs_ago},
 };
 use futures::{
     Future, Sink, SinkExt,
@@ -60,6 +61,15 @@ where
     pub remove_after: Option<Duration>,
     pub emitter: E,
     pub rotate_wait: Duration,
+    /// The include patterns this source was configured with, verbatim.
+    ///
+    /// Carried rather than asked of the `PathsProvider` because the provider trait
+    /// answers "which paths exist now", and the status file has to report what was
+    /// ASKED FOR even when that currently matches nothing.
+    pub include_patterns: Vec<String>,
+    /// Where to write the periodic status file, and how often.
+    pub status_path: PathBuf,
+    pub status_interval: Duration,
 }
 
 /// `FileServer` as Source
@@ -107,6 +117,12 @@ where
 
         let mut known_small_files = HashMap::new();
 
+        // Paths the last scan found but could not fingerprint, and which are not merely
+        // waiting for a first complete line (those land in `known_small_files`). Kept
+        // for the status file: a file the source cannot read is otherwise invisible to
+        // anything downstream, and looks exactly like an idle one.
+        let mut unreadable_paths: Vec<PathBuf> = Vec::new();
+
         let mut existing_files = Vec::new();
         for path in self.paths_provider.paths().into_iter() {
             if let Some(file_id) = self
@@ -115,6 +131,8 @@ where
                 .await
             {
                 existing_files.push((path, file_id));
+            } else if !known_small_files.contains_key(&path) {
+                unreadable_paths.push(path);
             }
         }
 
@@ -148,6 +166,18 @@ where
         self.emitter.emit_files_open(fp_map.len());
 
         let mut stats = TimingStats::default();
+
+        // The status file is written from THIS loop, deliberately, and not from a task of
+        // its own like the checkpoint writer below. Its freshness is evidence that the
+        // read loop ran: a writer on an independent task would keep stamping a fresh
+        // `as_of` while this loop was wedged, which is precisely the false-healthy signal
+        // the file exists to expose. A stalled read therefore stops refreshing it, and a
+        // consumer that notices should conclude it cannot judge this source.
+        let mut status_writer = StatusWriter::new(
+            self.status_path.clone(),
+            self.status_interval,
+            time::Instant::now(),
+        );
 
         // Spawn the checkpoint writer task
         let checkpoint_task_handle = vector_common::spawn_in_current_span(checkpoint_writer(
@@ -187,6 +217,9 @@ where
                 for (_file_id, watcher) in &mut fp_map {
                     watcher.set_file_findable(false); // assume not findable until found
                 }
+                // Rebuilt from scratch each scan: a file whose permissions were fixed
+                // must stop being reported as unreadable.
+                unreadable_paths.clear();
                 for path in self.paths_provider.paths().into_iter() {
                     if let Some(file_id) = self
                         .fingerprinter
@@ -236,6 +269,8 @@ where
                                 .await;
                             self.emitter.emit_files_open(fp_map.len());
                         }
+                    } else if !known_small_files.contains_key(&path) {
+                        unreadable_paths.push(path);
                     }
                 }
                 stats.record("discovery", start.elapsed());
@@ -430,6 +465,68 @@ where
                 }
             });
             self.emitter.emit_files_open(fp_map.len());
+
+            // Snapshot after the read pass, so positions are this iteration's.
+            let status_now = time::Instant::now();
+            if status_writer.is_due(status_now) {
+                let mut status = FileSourceStatus::new(
+                    Utc::now(),
+                    self.include_patterns.clone(),
+                    self.glob_minimum_cooldown,
+                    self.status_interval,
+                );
+
+                for (file_id, watcher) in &fp_map {
+                    // Re-stat here rather than reuse a size the read path already saw.
+                    // A size carried over from the last read reports position == size
+                    // for a file that grew but was NOT read, which is a wedged reader
+                    // reporting itself caught up.
+                    let size = fs::metadata(&watcher.path).await.ok().map(|m| m.len());
+                    let position = watcher.get_file_position();
+                    let state = match size {
+                        Some(size) if position < size => FileState::Reading,
+                        Some(_) => FileState::CaughtUp,
+                        // Watched, but no longer stattable: it vanished between the read
+                        // pass and here, or its permissions changed under us.
+                        None => FileState::Unreadable,
+                    };
+                    status.push(FileStatus {
+                        path: watcher.path.to_string_lossy().into_owned(),
+                        fingerprint: Some(*file_id),
+                        position: Some(position),
+                        size,
+                        last_read_secs_ago: Some(secs_ago(
+                            status_now,
+                            watcher.last_read_success().into_std(),
+                        )),
+                        state,
+                    });
+                }
+
+                for path in known_small_files.keys() {
+                    status.push(FileStatus {
+                        path: path.to_string_lossy().into_owned(),
+                        fingerprint: None,
+                        position: None,
+                        size: fs::metadata(path).await.ok().map(|m| m.len()),
+                        last_read_secs_ago: None,
+                        state: FileState::TooSmallToFingerprint,
+                    });
+                }
+
+                for path in &unreadable_paths {
+                    status.push(FileStatus {
+                        path: path.to_string_lossy().into_owned(),
+                        fingerprint: None,
+                        position: None,
+                        size: None,
+                        last_read_secs_ago: None,
+                        state: FileState::Unreadable,
+                    });
+                }
+
+                status_writer.write(&status, status_now).await;
+            }
 
             let start = time::Instant::now();
             let to_send = std::mem::take(&mut lines);

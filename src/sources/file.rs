@@ -20,6 +20,7 @@ use vector_lib::{
     },
     file_source_common::{
         Checkpointer, FileFingerprint, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
+        StatusWriter,
     },
     finalizer::OrderedFinalizer,
     lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path},
@@ -247,6 +248,25 @@ pub struct FileConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     pub rotate_wait: Duration,
+
+    /// How often the source rewrites its status file.
+    ///
+    /// The status file describes what the source discovered and where it has read to,
+    /// as facts, for anything that needs to reason about this source's progress without
+    /// re-deriving the checkpoint file's content fingerprints. It is rewritten whole on
+    /// this cadence from the source's own read loop, so its freshness is also evidence
+    /// that the loop is running.
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[serde(default = "default_status_interval", rename = "status_interval_secs")]
+    pub status_interval: Duration,
+
+    /// Where to write the status file.
+    ///
+    /// Defaults to `file_source_status.json` inside the source's data directory.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "/var/lib/vector/file_source_status.json"))]
+    pub status_path: Option<PathBuf>,
 }
 
 fn default_max_line_bytes() -> usize {
@@ -279,6 +299,10 @@ fn default_line_delimiter() -> String {
 
 const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
+}
+
+const fn default_status_interval() -> Duration {
+    Duration::from_secs(vector_lib::file_source_common::status::DEFAULT_STATUS_INTERVAL_SECS)
 }
 
 /// Configuration for how files should be identified.
@@ -387,6 +411,8 @@ impl Default for FileConfig {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            status_interval: default_status_interval(),
+            status_path: None,
         }
     }
 }
@@ -592,6 +618,15 @@ pub fn file_source(
 
     let checkpointer = Checkpointer::new(&data_dir);
     let strategy = config.fingerprint.clone().into();
+    let status_path = config
+        .status_path
+        .clone()
+        .unwrap_or_else(|| StatusWriter::default_path(&data_dir));
+    let include_patterns = config
+        .include
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
 
     let file_server = FileServer {
         paths_provider,
@@ -609,6 +644,9 @@ pub fn file_source(
         remove_after: config.remove_after_secs.map(Duration::from_secs),
         emitter,
         rotate_wait: config.rotate_wait,
+        include_patterns,
+        status_path,
+        status_interval: config.status_interval,
     };
 
     let event_metadata = EventMetadata {

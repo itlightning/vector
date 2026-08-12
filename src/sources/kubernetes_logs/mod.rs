@@ -31,7 +31,7 @@ use vector_lib::{
         file_server::{FileServer, Line, Shutdown as FileServerShutdown, calculate_ignore_before},
     },
     file_source_common::{
-        Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
+        Checkpointer, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig, StatusWriter,
     },
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
     lookup::{OwnedTargetPath, lookup_v2::OptionalTargetPath, owned_value_path, path},
@@ -820,6 +820,7 @@ impl Source {
         // TODO: maybe more of the parameters have to be configurable.
 
         let checkpointer = Checkpointer::new(&data_dir);
+        let data_dir_for_status = data_dir.clone();
         let file_server = FileServer {
             // Use our special paths provider.
             paths_provider,
@@ -874,6 +875,15 @@ impl Source {
             },
             // A handle to the current tokio runtime
             rotate_wait,
+            // The status file describes what this source discovered and where it has
+            // read to. The include patterns here are the pod-log directories the
+            // paths provider derives, so report the data dir's own glob rather than a
+            // user-authored pattern list this source does not have.
+            include_patterns: vec![data_dir_for_status.to_string_lossy().into_owned()],
+            status_path: StatusWriter::default_path(&data_dir_for_status),
+            status_interval: Duration::from_secs(
+                vector_lib::file_source_common::status::DEFAULT_STATUS_INTERVAL_SECS,
+            ),
         };
 
         let (file_source_tx, file_source_rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
