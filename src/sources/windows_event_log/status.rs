@@ -111,10 +111,29 @@ pub(super) struct ChannelStatus {
     /// behind channel caught up. See [`newest_record_estimate`] for what makes
     /// it an estimate and when it is withheld entirely.
     pub(super) newest_record_id: Option<u64>,
+    /// Whether the collector's base query selects a subset of events.
+    ///
+    /// Reported so a reader can withhold a lag figure it cannot compute:
+    /// [`Self::newest_record_id`] counts every record in the channel while
+    /// [`Self::last_record_id`] only advances on records the filter let
+    /// through. Health is untouched: a filtered subscription that reads
+    /// nothing is at the head of what it asked for.
+    ///
+    /// Additive: a reader that predates the field treats an absent key as
+    /// `false`, which is what an unfiltered collector meant.
+    #[serde(default)]
+    pub(super) query_filters: bool,
     /// Whether the stored bookmark marks a real position.
     pub(super) bookmark_positioned: bool,
     /// Consecutive failed rebuild attempts for this channel.
     pub(super) retry_attempt: u32,
+    /// Times a name was absent from the publisher table and the per-event
+    /// fallback ran. Internal diagnostics; not a health input.
+    ///
+    /// Additive: absent means zero, which is what a collector that never
+    /// counted misses meant.
+    #[serde(default)]
+    pub(super) name_table_misses: u64,
     /// Holes this source knows it created, newest last.
     pub(super) gaps: Vec<GapRecord>,
 }
@@ -525,8 +544,10 @@ mod tests {
                 last_drained_at: Some(rfc3339(ts(1_700_000_090))),
                 last_record_id: Some(123_456),
                 newest_record_id: Some(123_460),
+                query_filters: false,
                 bookmark_positioned: true,
                 retry_attempt: 0,
+                name_table_misses: 0,
                 gaps: vec![
                     gap_for_rung(
                         Rung::SkipRecord,
@@ -548,8 +569,10 @@ mod tests {
                 last_drained_at: None,
                 last_record_id: None,
                 newest_record_id: None,
+                query_filters: true,
                 bookmark_positioned: false,
                 retry_attempt: 3,
+                name_table_misses: 7,
                 gaps: Vec::new(),
             },
         );
@@ -577,6 +600,8 @@ mod tests {
         assert_eq!(defender["bookmark_positioned"], true);
         assert_eq!(defender["last_drained_at"], "2023-11-14T22:14:50.000Z");
         assert_eq!(defender["retry_attempt"], 0);
+        assert_eq!(defender["query_filters"], false);
+        assert_eq!(defender["name_table_misses"], 0);
         assert_eq!(defender["gaps"][0]["cause"], "skip_record");
         assert_eq!(defender["gaps"][0]["exact"], true);
         assert_eq!(defender["gaps"][0]["missing_records"], 1);
@@ -589,6 +614,47 @@ mod tests {
         assert!(security["last_drained_at"].is_null());
         assert!(security["newest_record_id"].is_null());
         assert_eq!(security["skipped_reason"], "access_denied");
+        assert_eq!(security["query_filters"], true);
+        assert_eq!(security["name_table_misses"], 7);
+    }
+
+    /// Additive fields must not invalidate a file a previous writer produced.
+    ///
+    /// `schema` stays 1: a bump would make every not-yet-upgraded reader drop
+    /// the whole channel map to unknown. Absent keys default, they do not
+    /// fail the parse.
+    #[test]
+    fn an_older_file_omitting_additive_fields_still_parses() {
+        let body = r#"{
+            "schema": 1,
+            "as_of": "2023-11-14T22:15:00.000Z",
+            "channels": {
+                "Security": {
+                    "subscribed": true,
+                    "skipped_reason": null,
+                    "rung": "bookmark",
+                    "last_event_at": null,
+                    "last_drained_at": "2023-11-14T22:14:50.000Z",
+                    "last_record_id": 10,
+                    "newest_record_id": 20,
+                    "bookmark_positioned": true,
+                    "retry_attempt": 0,
+                    "gaps": []
+                }
+            }
+        }"#;
+        let decoded: StatusSnapshot =
+            serde_json::from_str(body).expect("an absent additive field is not a schema change");
+        let security = &decoded.channels["Security"];
+        assert!(
+            !security.query_filters,
+            "unreported means unfiltered, which is what that writer meant"
+        );
+        assert_eq!(
+            security.name_table_misses, 0,
+            "unreported misses are zero, not a parse failure"
+        );
+        assert_eq!(security.last_record_id, Some(10));
     }
 
     /// The reader polls without locking, so it must never observe a partial
