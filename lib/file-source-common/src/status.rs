@@ -128,8 +128,12 @@ pub struct FileSourceStatus {
     pub include_patterns: Vec<String>,
 
     /// The source's own scan cooldown. A file created after the last scan cannot appear
-    /// here for up to this long, so a consumer sizes its "not discovered yet" grace from
-    /// this rather than from a number of its own invention.
+    /// here for up to this long.
+    ///
+    /// Reported because it is a true fact about this source that only this source knows,
+    /// and the snapshot is facts-only. NO CONSUMER SIZES ANYTHING FROM IT today, and this
+    /// doc used to claim one did; a grace attached to it is a decision for whoever
+    /// attaches it, not a promise made here.
     pub glob_minimum_cooldown_secs: u64,
 
     /// The cadence this file is rewritten on. A consumer sizes its staleness grace from
