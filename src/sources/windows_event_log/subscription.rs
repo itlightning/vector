@@ -60,11 +60,6 @@ pub(super) static DRAIN_STEP_HOOK: std::sync::Mutex<
     Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>,
 > = std::sync::Mutex::new(None);
 
-/// Maximum number of entries in the EvtFormatMessage result cache. One cache
-/// per source instance, shared by every publisher AND every channel that
-/// instance reads: the publisher name is in the key, so cross-channel sharing
-/// cannot transpose one publisher's task names onto another's.
-pub const FORMAT_CACHE_CAPACITY: usize = 10_000;
 /// Maximum number of cached publisher metadata handles.
 const PUBLISHER_CACHE_CAPACITY: usize = 256;
 
@@ -522,6 +517,10 @@ struct ChannelSubscription {
     /// The active query filters events, so record ids skip by construction and
     /// gap detection cannot mean anything on this channel.
     query_filters: bool,
+    /// Times a name was absent from the publisher table and the per-event
+    /// fallback ran. Internal diagnostics; serialized on the status file by
+    /// the stacked status patch.
+    name_table_misses: u64,
     /// Test-only handle accounting, per channel so parallel tests cannot
     /// perturb each other. `opens - closes` must return to its baseline after
     /// any number of rebuilds.
@@ -957,8 +956,7 @@ pub struct EventLogSubscription {
     /// Cached EvtOpenPublisherMetadata handles keyed by provider name.
     /// Bounded LRU; evicted handles are closed via `PublisherHandle::drop`.
     publisher_cache: LruCache<String, PublisherHandle>,
-    /// Cached EvtFormatMessage results for every publisher in ONE bounded LRU
-    /// keyed by `(publisher, flag, field value)`.
+    /// Cached publisher name tables keyed by `(casefolded publisher, locale)`.
     format_cache: super::format_cache::FormatCache,
     /// Pre-registered counter for metadata cache hits.
     cache_hits_counter: Counter,
@@ -1156,6 +1154,7 @@ impl EventLogSubscription {
                 last_event_at: resume_seed_time,
                 last_record_id_seen: None,
                 query_filters,
+                name_table_misses: 0,
                 #[cfg(test)]
                 subscription_opens: 0,
                 #[cfg(test)]
@@ -1222,9 +1221,7 @@ impl EventLogSubscription {
             // a quiet host never pays for.
             event_buffer: Vec::new(),
             publisher_cache: LruCache::new(NonZeroUsize::new(PUBLISHER_CACHE_CAPACITY).unwrap()),
-            format_cache: super::format_cache::FormatCache::new(
-                NonZeroUsize::new(FORMAT_CACHE_CAPACITY).unwrap(),
-            ),
+            format_cache: super::format_cache::FormatCache::new(),
             cache_hits_counter: counter!(CounterName::WindowsEventLogCacheHitsTotal),
             cache_misses_counter: counter!(CounterName::WindowsEventLogCacheMissesTotal),
             sid_resolver: SidResolver::new(),
@@ -1632,6 +1629,8 @@ impl EventLogSubscription {
                                 &xml,
                                 &system_fields,
                                 self.config.render_message,
+                                std::time::Instant::now(),
+                                self.refresh_interval,
                             );
 
                             if display.rendered_delivery && !channel_sub.rendered_delivery_seen {
@@ -1654,6 +1653,8 @@ impl EventLogSubscription {
                                 event.task_name = display.task_name;
                                 event.opcode_name = display.opcode_name;
                                 event.keyword_names = display.keyword_names;
+                                event.resolved_level = display.level_name;
+                                channel_sub.name_table_misses += u64::from(display.table_misses);
 
                                 // The ONLY reason an event that rendered is not
                                 // sent. There is no time

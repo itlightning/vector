@@ -152,7 +152,7 @@ impl EventLogParser {
 
         log_event.insert(
             event_path!("level"),
-            Value::Bytes(event.level_name().into()),
+            Value::Bytes(event.level_name().to_string().into()),
         );
 
         // Authoritative for consumers: the honesty suffix in the message text
@@ -571,6 +571,7 @@ mod tests {
             task_name: None,
             opcode_name: Some("Stop".to_string()),
             keyword_names: vec!["Classic".to_string()],
+            resolved_level: None,
             user_name: None,
             version: Some(1),
             qualifiers: Some(0),
@@ -665,6 +666,7 @@ mod tests {
             task_name: Some("Logon".to_string()),
             opcode_name: None,
             keyword_names: vec!["Audit Success".to_string()],
+            resolved_level: None,
             user_name: None,
             version: Some(2),
             qualifiers: None,

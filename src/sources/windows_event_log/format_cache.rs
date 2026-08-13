@@ -1,393 +1,790 @@
-//! Bounded LRU for `EvtFormatMessage` display-name results, with NO Win32 in it.
+//! Publisher display-name tables, with NO Win32 in this module.
 //!
 //! # Why this is its own module
 //!
-//! `EvtFormatMessage(metadata, event, .., EvtFormatMessageTask, ..)` resolves the
-//! task name from the EVENT HANDLE. The `(publisher, flag, value)` triple is only
-//! the cache key. So the cache is accurate exactly when the value it is keyed on
-//! is the value the handle carries, and WRONG in a specific, nasty way when it is
-//! not: the stored name is a real display name belonging to a different task, so
-//! the corruption is invisible in the data (every name is a name that exists) and
-//! it persists for every later event with that key.
+//! `EvtFormatMessage` with `EvtFormatMessageTask` (and opcode / keyword) reads
+//! the value off the EVENT HANDLE, not off any key we pass. A cache filled from
+//! that call and keyed on `(publisher, flag, value)` is asserting that
+//! resolution is a pure function of the key, which the API does not guarantee.
+//! A wrong entry stores a real display name belonging to a different task, so
+//! the corruption is invisible in the data and persists for every later event
+//! with that key. That is the 1.7.7 `task_name` defect.
 //!
-//! That property cannot be argued into safety, it has to be tested, and it cannot
-//! be tested while the lookup logic is welded to an FFI call that only runs on a
-//! live Windows host against a real publisher manifest. Hence this module: the
-//! lookup, insert and eviction logic is pure Rust over a caller-supplied
-//! resolver, so the tests below drive it with a resolver that MODELS the Win32
-//! contract (name comes from the handle, not the key) and can therefore
-//! construct the poisoning that production showed.
+//! The display name is determined by `(publisher identity, metadata version,
+//! locale, numeric value)`. Winlogbeat builds that function by enumerating the
+//! publisher's own static tables and formatting each message ID with a null
+//! event handle. This module is that map: lookup, miss policy, and refresh.
+//! Filling the tables is the caller's job (Win32 in production, a fixture in
+//! tests). The table is written ONLY from enumeration. A per-event
+//! `EvtFormatMessage` fallback may be used on a miss; its answer is returned
+//! and is never inserted.
 //!
 //! # The invariant
 //!
-//! For a fixed publisher and flag, a value must never resolve to the name of a
-//! different value. [`FormatCache::get_or_insert_with`] upholds it as long as the
-//! resolver it is handed answers for the same event the key was built from, which
-//! is why the resolver closure is constructed at the one call site that holds
-//! both (`super::metadata::resolve_event_metadata`).
-//!
-//! # Why the key is built in here
-//!
-//! The previous shape had the CALLER own a `(String, u32, u64)` and mutate it in
-//! place across the three lookups of an event, to spend one publisher-name
-//! allocation per event instead of three. That is the same allocation saving this
-//! module gets from its private probe scratch, except the mutable key no longer
-//! crosses a module boundary, cannot be held across a call, and cannot be
-//! inserted by accident.
+//! For a fixed publisher, locale, and field, a numeric value must never resolve
+//! to the name of a different value via the table. Fallback answers are
+//! one-shot and cannot poison a later lookup.
 
-use std::num::NonZeroUsize;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use lru::LruCache;
+/// Locale value passed to `EvtOpenPublisherMetadata`. Zero is the system /
+/// thread default, which is what this source uses everywhere.
+pub(super) const SYSTEM_DEFAULT_LOCALE: u32 = 0;
 
-/// Cache key for one `EvtFormatMessage` result: publisher name, message flag
-/// (task / opcode / keyword), and the raw field value.
+/// Names enumerated from one publisher's metadata for one locale.
 ///
-/// The publisher is part of the key rather than a level above it, which is what
-/// lets a SINGLE LRU serve every publisher. The previous shape was an unbounded
-/// `HashMap<String, LruCache<..>>`, so each distinct publisher preallocated its
-/// own 10k-entry hashbrown table (measured 272 KiB) on its first event and held
-/// it for the life of the process.
-type FormatCacheKey = (String, u32, u64);
+/// Display strings, not symbolic names: the caller resolves each message ID
+/// and falls back to the symbolic name only when the ID is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct PublisherNames {
+    pub(super) tasks: HashMap<u16, String>,
+    pub(super) opcodes: HashMap<u8, String>,
+    /// Keyword bit masks in enumeration order. An event's keyword field is a
+    /// mask; a table entry matches when `(event & bit) == bit` and `bit != 0`.
+    pub(super) keywords: Vec<(u64, String)>,
+    pub(super) levels: HashMap<u8, String>,
+}
 
-/// Outcome of one lookup: the display name (`None` is a cached negative, which
-/// is a real answer and must not re-enter the FFI) and whether it was already
-/// resident.
+/// Scalar field stored in a [`PublisherNames`] table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NameField {
+    Task,
+    Opcode,
+    Level,
+}
+
+/// Outcome of one scalar lookup.
 ///
-/// `hit` is returned rather than counted in here so the cache stays free of the
-/// metrics registry; the caller owns its counters.
+/// `hit` means the table served the name (including a present empty table
+/// returning `name: None` without fallback). `table_miss` means the value was
+/// absent after a fresh-enough table and the fallback ran. The two are never
+/// both true. Miss A (publisher unopenable) is `hit: false, table_miss: false`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Lookup {
     pub(super) name: Option<String>,
     pub(super) hit: bool,
+    pub(super) table_miss: bool,
 }
 
-/// Every publisher's `EvtFormatMessage` results in one bounded LRU, so cold
-/// publishers age out instead of each owning a table forever.
+/// Outcome of a keyword-mask lookup. Same hit / miss flags as [`Lookup`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeywordLookup {
+    pub(super) names: Vec<String>,
+    pub(super) hit: bool,
+    pub(super) table_miss: bool,
+}
+
 #[derive(Debug)]
+enum Entry {
+    Ready {
+        names: PublisherNames,
+        enumerated_at: Instant,
+    },
+    /// Publisher metadata could not be opened. Retried only after `refresh`.
+    Unopenable { at: Instant },
+}
+
+/// What [`FormatCache::prepare`] says the caller must do before a lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Prepare {
+    /// A fresh-enough table is resident.
+    Ready,
+    /// Absent or stale: caller must enumerate (or record unopenable).
+    NeedEnumerate,
+    /// Miss A, still inside the refresh window. Emit nothing; do not open.
+    Unopenable,
+}
+
+/// Map from `(casefolded publisher, locale)` to an enumerated name table.
+#[derive(Debug, Default)]
 pub(super) struct FormatCache {
-    entries: LruCache<FormatCacheKey, Option<String>>,
-    /// Scratch key for the allocation-free probe, owned by the cache and never
-    /// inserted. Reusing one `String` is what keeps a hit allocation-free;
-    /// keeping it private is what keeps the old caller-mutated-key hazard out
-    /// of reach. Its contents between calls are meaningless by construction.
-    probe: FormatCacheKey,
+    entries: HashMap<(String, u32), Entry>,
+}
+
+fn cache_key(publisher: &str, locale: u32) -> (String, u32) {
+    (publisher.to_ascii_lowercase(), locale)
+}
+
+fn stale(at: Instant, now: Instant, refresh: Duration) -> bool {
+    now.saturating_duration_since(at) >= refresh
 }
 
 impl FormatCache {
-    pub(super) fn new(capacity: NonZeroUsize) -> Self {
-        Self {
-            entries: LruCache::new(capacity),
-            probe: (String::new(), 0, 0),
-        }
+    pub(super) fn new() -> Self {
+        Self::default()
     }
 
-    /// Resolve `(publisher, flag, value)`, calling `resolve` only on a miss.
-    ///
-    /// `resolve` MUST answer for the same event the key was built from. That is
-    /// the whole contract: see the module docs.
-    pub(super) fn get_or_insert_with<F>(
-        &mut self,
-        publisher: &str,
-        flag: u32,
-        value: u64,
-        resolve: F,
-    ) -> Lookup
-    where
-        F: FnOnce() -> Option<String>,
-    {
-        // Reuse the scratch String's allocation rather than allocating a key per
-        // lookup: three lookups per event on a flooded channel is the hot path.
-        self.probe.0.clear();
-        self.probe.0.push_str(publisher);
-        self.probe.1 = flag;
-        self.probe.2 = value;
-
-        // `get`, not `peek`: with one shared LRU across every publisher,
-        // promotion is what keeps a hot publisher's entries resident while cold
-        // ones age out.
-        if let Some(cached) = self.entries.get(&self.probe) {
-            return Lookup {
-                name: cached.clone(),
-                hit: true,
-            };
-        }
-
-        let name = resolve();
-        self.entries.put(self.probe.clone(), name.clone());
-        Lookup { name, hit: false }
-    }
-
-    /// Resident entry count. Test and diagnostic use only.
+    /// Resident publisher entries. Test and diagnostic use only.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(super) fn prepare(
+        &self,
+        publisher: &str,
+        locale: u32,
+        now: Instant,
+        refresh: Duration,
+    ) -> Prepare {
+        match self.entries.get(&cache_key(publisher, locale)) {
+            Some(Entry::Ready { enumerated_at, .. }) if !stale(*enumerated_at, now, refresh) => {
+                Prepare::Ready
+            }
+            Some(Entry::Unopenable { at }) if !stale(*at, now, refresh) => Prepare::Unopenable,
+            _ => Prepare::NeedEnumerate,
+        }
+    }
+
+    pub(super) fn store_table(
+        &mut self,
+        publisher: &str,
+        locale: u32,
+        now: Instant,
+        names: PublisherNames,
+    ) {
+        self.entries.insert(
+            cache_key(publisher, locale),
+            Entry::Ready {
+                names,
+                enumerated_at: now,
+            },
+        );
+    }
+
+    pub(super) fn store_unopenable(&mut self, publisher: &str, locale: u32, now: Instant) {
+        self.entries
+            .insert(cache_key(publisher, locale), Entry::Unopenable { at: now });
+    }
+
+    pub(super) fn get_scalar(
+        &self,
+        publisher: &str,
+        locale: u32,
+        field: NameField,
+        value: u64,
+    ) -> Option<&str> {
+        match self.entries.get(&cache_key(publisher, locale)) {
+            Some(Entry::Ready { names, .. }) => Self::scalar_from_table(names, field, value),
+            _ => None,
+        }
+    }
+
+    pub(super) fn get_keywords(
+        &self,
+        publisher: &str,
+        locale: u32,
+        mask: u64,
+    ) -> Option<Vec<String>> {
+        match self.entries.get(&cache_key(publisher, locale)) {
+            Some(Entry::Ready { names, .. }) => Some(
+                names
+                    .keywords
+                    .iter()
+                    .filter(|(bit, _)| *bit != 0 && (mask & *bit) == *bit)
+                    .map(|(_, name)| name.clone())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn ensure_table<E>(
+        &mut self,
+        key: &(String, u32),
+        now: Instant,
+        refresh: Duration,
+        enumerate: E,
+    ) -> bool
+    where
+        E: FnOnce() -> Option<PublisherNames>,
+    {
+        match self.entries.get(key) {
+            Some(Entry::Ready { enumerated_at, .. }) if !stale(*enumerated_at, now, refresh) => {
+                return true;
+            }
+            Some(Entry::Unopenable { at }) if !stale(*at, now, refresh) => {
+                return false;
+            }
+            _ => {}
+        }
+
+        match enumerate() {
+            Some(names) => {
+                self.entries.insert(
+                    key.clone(),
+                    Entry::Ready {
+                        names,
+                        enumerated_at: now,
+                    },
+                );
+                true
+            }
+            None => {
+                self.entries
+                    .insert(key.clone(), Entry::Unopenable { at: now });
+                false
+            }
+        }
+    }
+
+    fn scalar_from_table<'a>(
+        names: &'a PublisherNames,
+        field: NameField,
+        value: u64,
+    ) -> Option<&'a str> {
+        match field {
+            NameField::Task => names.tasks.get(&(value as u16)).map(String::as_str),
+            NameField::Opcode => names.opcodes.get(&(value as u8)).map(String::as_str),
+            NameField::Level => names.levels.get(&(value as u8)).map(String::as_str),
+        }
+    }
+
+    /// Look up one scalar display name.
+    ///
+    /// `enumerate` runs when the table is absent or older than `refresh`.
+    /// `None` is miss A: cached until `refresh` elapses. `fallback` runs only
+    /// on miss B (table present, value absent) and its answer is never stored.
+    pub(super) fn lookup<E, F>(
+        &mut self,
+        publisher: &str,
+        locale: u32,
+        field: NameField,
+        value: u64,
+        now: Instant,
+        refresh: Duration,
+        enumerate: E,
+        fallback: F,
+    ) -> Lookup
+    where
+        E: FnOnce() -> Option<PublisherNames>,
+        F: FnOnce() -> Option<String>,
+    {
+        let key = cache_key(publisher, locale);
+        if !self.ensure_table(&key, now, refresh, enumerate) {
+            return Lookup {
+                name: None,
+                hit: false,
+                table_miss: false,
+            };
+        }
+
+        if let Some(Entry::Ready { names, .. }) = self.entries.get(&key) {
+            if let Some(name) = Self::scalar_from_table(names, field, value) {
+                return Lookup {
+                    name: Some(name.to_string()),
+                    hit: true,
+                    table_miss: false,
+                };
+            }
+        }
+
+        Lookup {
+            name: fallback(),
+            hit: false,
+            table_miss: true,
+        }
+    }
+
+    /// Look up keyword display names for an event's keyword mask.
+    ///
+    /// Matching bits come from the table in enumeration order. A mask with no
+    /// matching bits on a present table is miss B and runs `fallback`, which
+    /// returns the `EvtFormatMessageKeyword` semicolon-separated string.
+    pub(super) fn lookup_keywords<E, F>(
+        &mut self,
+        publisher: &str,
+        locale: u32,
+        mask: u64,
+        now: Instant,
+        refresh: Duration,
+        enumerate: E,
+        fallback: F,
+    ) -> KeywordLookup
+    where
+        E: FnOnce() -> Option<PublisherNames>,
+        F: FnOnce() -> Option<String>,
+    {
+        let key = cache_key(publisher, locale);
+        if !self.ensure_table(&key, now, refresh, enumerate) {
+            return KeywordLookup {
+                names: Vec::new(),
+                hit: false,
+                table_miss: false,
+            };
+        }
+
+        if let Some(Entry::Ready { names, .. }) = self.entries.get(&key) {
+            let matched: Vec<String> = names
+                .keywords
+                .iter()
+                .filter(|(bit, _)| *bit != 0 && (mask & *bit) == *bit)
+                .map(|(_, name)| name.clone())
+                .collect();
+            if !matched.is_empty() || mask == 0 {
+                return KeywordLookup {
+                    names: matched,
+                    hit: true,
+                    table_miss: false,
+                };
+            }
+        }
+
+        let names = fallback()
+            .map(|s| {
+                s.split(';')
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        KeywordLookup {
+            names,
+            hit: false,
+            table_miss: true,
+        }
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use proptest::prelude::*;
 
     use super::*;
 
-    const TASK: u32 = 3;
-    const OPCODE: u32 = 4;
-    const KEYWORD: u32 = 5;
+    const HOUR: Duration = Duration::from_secs(3600);
+    const SECURITY: &str = "Microsoft-Windows-Security-Auditing";
 
-    fn cap(n: usize) -> NonZeroUsize {
-        NonZeroUsize::new(n).unwrap()
+    fn security_names() -> PublisherNames {
+        let mut names = PublisherNames::default();
+        names.tasks.insert(13312, "Process Creation".into());
+        names.tasks.insert(13313, "Process Termination".into());
+        names
+            .tasks
+            .insert(13317, "Token Right Adjusted Events".into());
+        names.tasks.insert(12800, "File System".into());
+        names.opcodes.insert(0, "Info".into());
+        names.levels.insert(0, "Information".into());
+        names.levels.insert(2, "Error".into());
+        names.levels.insert(16, "Custom-16".into());
+        names
+            .keywords
+            .push((0x0020_0000_0000_0000, "Audit Success".into()));
+        names
+            .keywords
+            .push((0x8000_0000_0000_0000, "Classic".into()));
+        names
     }
 
-    /// The Win32 contract, modelled.
-    ///
-    /// `EvtFormatMessage` reads the field value off the EVENT, not off our key,
-    /// so this resolver is deliberately given the event's value SEPARATELY from
-    /// the key the cache is asked about. Handing it a value that disagrees with
-    /// the key is exactly the production defect, and the tests below do both.
-    struct Publisher {
-        /// value -> display name, per flag. A manifest, in other words.
-        names: HashMap<(u32, u64), &'static str>,
-        calls: AtomicUsize,
+    fn lookup_task(
+        cache: &mut FormatCache,
+        publisher: &str,
+        value: u16,
+        now: Instant,
+        refresh: Duration,
+        enumerate: impl FnOnce() -> Option<PublisherNames>,
+        fallback: impl FnOnce() -> Option<String>,
+    ) -> Lookup {
+        cache.lookup(
+            publisher,
+            SYSTEM_DEFAULT_LOCALE,
+            NameField::Task,
+            u64::from(value),
+            now,
+            refresh,
+            enumerate,
+            fallback,
+        )
     }
 
-    impl Publisher {
-        fn security() -> Self {
-            let mut names = HashMap::new();
-            // Real Microsoft-Windows-Security-Auditing task values; the first
-            // three are the ones the field report showed transposed.
-            names.insert((TASK, 13312), "Process Creation");
-            names.insert((TASK, 13313), "Process Termination");
-            names.insert((TASK, 13317), "Token Right Adjusted Events");
-            names.insert((TASK, 12800), "File System");
-            names.insert((OPCODE, 0), "Info");
-            Self {
-                names,
-                calls: AtomicUsize::new(0),
-            }
-        }
-
-        /// Resolve as the API does: from the event, ignoring any key.
-        fn format(&self, flag: u32, event_value: u64) -> Option<String> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.names
-                .get(&(flag, event_value))
-                .map(|s| (*s).to_string())
-        }
-
-        fn expected(&self, flag: u32, value: u64) -> Option<String> {
-            self.names.get(&(flag, value)).map(|s| (*s).to_string())
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    /// REGRESSION GATE for the `task_name` corruption.
-    ///
-    /// The production call shape: the key and the event agree, because both come
-    /// from the same event. Every value must keep its own name across a long
-    /// interleaved run, which is the invariant the field data violated.
+    /// RULE: a table row is the name of THAT value. Interleaving the Security
+    /// tasks that 1.7.7 transposed must never swap them.
     #[test]
     fn a_value_never_resolves_to_another_values_name() {
-        let publisher = Publisher::security();
-        let mut cache = FormatCache::new(cap(64));
-        let values = [13312u64, 13313, 13317, 12800];
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        let values = [13312u16, 13313, 13317, 12800];
+        let enumerations = AtomicUsize::new(0);
+        let fallbacks = AtomicUsize::new(0);
 
-        // Interleave the four tasks many times over. A cache that carried a
-        // name across keys would surface it within a few passes.
         for pass in 0..250 {
             let value = values[pass % values.len()];
-            let got = cache.get_or_insert_with(
-                "Microsoft-Windows-Security-Auditing",
-                TASK,
+            let got = lookup_task(
+                &mut cache,
+                SECURITY,
                 value,
-                || publisher.format(TASK, value),
+                t0,
+                HOUR,
+                || {
+                    enumerations.fetch_add(1, Ordering::SeqCst);
+                    Some(security_names())
+                },
+                || {
+                    fallbacks.fetch_add(1, Ordering::SeqCst);
+                    panic!("table hit must not fall back")
+                },
             );
+            let expected = security_names().tasks.get(&value).cloned();
             assert_eq!(
-                got.name,
-                publisher.expected(TASK, value),
+                got.name, expected,
                 "task {value} resolved to another task's name on pass {pass}"
             );
+            assert!(got.hit);
+            assert!(!got.table_miss);
         }
-
-        // Four distinct values, so four FFI calls total no matter the traffic.
-        assert_eq!(publisher.calls(), values.len());
+        assert_eq!(enumerations.load(Ordering::SeqCst), 1);
+        assert_eq!(fallbacks.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.len(), 1);
     }
 
-    /// Guard on the guard: if the resolver is answered from a DIFFERENT event
-    /// than the key was built from, the cache stores a real name under the wrong
-    /// value and every later event with that value inherits it.
-    ///
-    /// This is the defect, reproduced. It exists to prove the gate above can
-    /// actually see the failure rather than being green by construction, and to
-    /// state in executable form the one thing the call site must not do.
+    /// RULE: miss A (publisher unopenable) emits nothing, caches the negative,
+    /// and does not retry until refresh. otel-contrib caches this failure the
+    /// same way. There is no fallback: `EvtFormatMessage` needs the same handle.
     #[test]
-    fn mismatched_key_and_event_poisons_the_entry_permanently() {
-        let publisher = Publisher::security();
-        let mut cache = FormatCache::new(cap(64));
+    fn unopenable_publisher_is_cached_until_refresh() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        let enumerations = AtomicUsize::new(0);
+        let fallbacks = AtomicUsize::new(0);
 
-        // Key says 13317; the event handed to the resolver is 13313.
-        let poisoned =
-            cache.get_or_insert_with("Microsoft-Windows-Security-Auditing", TASK, 13317, || {
-                publisher.format(TASK, 13313)
-            });
-        assert_eq!(poisoned.name.as_deref(), Some("Process Termination"));
-
-        // The entry is now wrong for everyone. A correctly-paired lookup does
-        // not repair it: it never reaches the resolver at all.
-        let later =
-            cache.get_or_insert_with("Microsoft-Windows-Security-Auditing", TASK, 13317, || {
-                publisher.format(TASK, 13317)
-            });
-        assert!(later.hit);
-        assert_eq!(
-            later.name.as_deref(),
-            Some("Process Termination"),
-            "a poisoned entry is permanent, which is why the pairing is the \
-             call site's responsibility and is asserted there"
+        let first = lookup_task(
+            &mut cache,
+            "Missing-Provider",
+            1,
+            t0,
+            HOUR,
+            || {
+                enumerations.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            || {
+                fallbacks.fetch_add(1, Ordering::SeqCst);
+                Some("must-not-run".into())
+            },
         );
-        assert_eq!(publisher.calls(), 1);
+        assert!(first.name.is_none());
+        assert!(!first.hit);
+        assert!(!first.table_miss);
+
+        let second = lookup_task(
+            &mut cache,
+            "Missing-Provider",
+            1,
+            t0 + Duration::from_secs(1),
+            HOUR,
+            || panic!("negative must not re-enumerate before refresh"),
+            || panic!("miss A must not fall back"),
+        );
+        assert!(second.name.is_none());
+        assert_eq!(enumerations.load(Ordering::SeqCst), 1);
+        assert_eq!(fallbacks.load(Ordering::SeqCst), 0);
+
+        let after = lookup_task(
+            &mut cache,
+            "Missing-Provider",
+            13312,
+            t0 + HOUR,
+            HOUR,
+            || {
+                enumerations.fetch_add(1, Ordering::SeqCst);
+                Some(security_names())
+            },
+            || panic!("re-enumerated table must serve the value"),
+        );
+        assert_eq!(after.name.as_deref(), Some("Process Creation"));
+        assert!(after.hit);
+        assert_eq!(enumerations.load(Ordering::SeqCst), 2);
     }
 
-    /// Flags partition the namespace: task 5 and keyword 5 are different rows.
+    /// RULE: miss B uses the fallback answer and NEVER writes it into the table.
+    /// A later lookup of the same value still misses the table.
     #[test]
-    fn flags_do_not_collide_on_equal_values() {
-        let mut cache = FormatCache::new(cap(64));
-        let same_value = 5u64;
-        let task = cache.get_or_insert_with("P", TASK, same_value, || Some("task-name".into()));
-        let opcode =
-            cache.get_or_insert_with("P", OPCODE, same_value, || Some("opcode-name".into()));
-        let keyword =
-            cache.get_or_insert_with("P", KEYWORD, same_value, || Some("keyword-name".into()));
-        assert_eq!(task.name.as_deref(), Some("task-name"));
-        assert_eq!(opcode.name.as_deref(), Some("opcode-name"));
-        assert_eq!(keyword.name.as_deref(), Some("keyword-name"));
+    fn fallback_answer_is_not_inserted_into_the_table() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        let fallbacks = AtomicUsize::new(0);
+        let names = security_names();
+
+        let first = lookup_task(
+            &mut cache,
+            SECURITY,
+            9999,
+            t0,
+            HOUR,
+            || Some(names.clone()),
+            || {
+                fallbacks.fetch_add(1, Ordering::SeqCst);
+                Some("from-event-handle".into())
+            },
+        );
+        assert_eq!(first.name.as_deref(), Some("from-event-handle"));
+        assert!(!first.hit);
+        assert!(first.table_miss);
+
+        let second = lookup_task(
+            &mut cache,
+            SECURITY,
+            9999,
+            t0 + Duration::from_secs(1),
+            HOUR,
+            || panic!("fresh table must not re-enumerate"),
+            || {
+                fallbacks.fetch_add(1, Ordering::SeqCst);
+                Some("from-event-handle-again".into())
+            },
+        );
+        assert_eq!(second.name.as_deref(), Some("from-event-handle-again"));
+        assert!(second.table_miss);
+        assert_eq!(fallbacks.load(Ordering::SeqCst), 2);
+
+        let known = lookup_task(
+            &mut cache,
+            SECURITY,
+            13312,
+            t0 + Duration::from_secs(2),
+            HOUR,
+            || panic!("fresh table must not re-enumerate"),
+            || panic!("known table row must not fall back"),
+        );
+        assert_eq!(known.name.as_deref(), Some("Process Creation"));
+        assert!(known.hit);
+    }
+
+    /// Guard on the guard: if a fallback were inserted, the second lookup of
+    /// 9999 would be a hit with the fallback string and this test would fail.
+    /// Restoring an insert-on-fallback makes this red; that is the proof the
+    /// miss-B rule is observable.
+    #[test]
+    fn inserting_a_fallback_would_make_the_next_lookup_a_hit() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        _ = lookup_task(
+            &mut cache,
+            SECURITY,
+            9999,
+            t0,
+            HOUR,
+            || Some(security_names()),
+            || Some("poison".into()),
+        );
+        let later = lookup_task(
+            &mut cache,
+            SECURITY,
+            9999,
+            t0,
+            HOUR,
+            || panic!("must not re-enumerate"),
+            || Some("still-missing".into()),
+        );
+        assert!(
+            later.table_miss,
+            "a fallback must not become a table row; if this is a hit the \
+             insert-on-fallback defect is back"
+        );
+        assert_eq!(later.name.as_deref(), Some("still-missing"));
+    }
+
+    /// RULE: a stale table that still misses after re-enumeration falls back
+    /// once; a stale table that gains the value on re-enumeration serves it
+    /// without fallback.
+    #[test]
+    fn stale_miss_re_enumerates_once_before_fallback() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        let enumerations = AtomicUsize::new(0);
+
+        _ = lookup_task(
+            &mut cache,
+            SECURITY,
+            13312,
+            t0,
+            HOUR,
+            || {
+                enumerations.fetch_add(1, Ordering::SeqCst);
+                Some(security_names())
+            },
+            || panic!("present row"),
+        );
+
+        let mut grown = security_names();
+        grown.tasks.insert(42, "Grown".into());
+        let later = lookup_task(
+            &mut cache,
+            SECURITY,
+            42,
+            t0 + HOUR,
+            HOUR,
+            || {
+                enumerations.fetch_add(1, Ordering::SeqCst);
+                Some(grown.clone())
+            },
+            || panic!("re-enumerated table contains 42"),
+        );
+        assert_eq!(later.name.as_deref(), Some("Grown"));
+        assert!(later.hit);
+        assert_eq!(enumerations.load(Ordering::SeqCst), 2);
+
+        let still_absent = lookup_task(
+            &mut cache,
+            SECURITY,
+            7,
+            t0 + HOUR + Duration::from_secs(1),
+            HOUR,
+            || panic!("table is fresh after the re-enumeration"),
+            || Some("fallback-7".into()),
+        );
+        assert_eq!(still_absent.name.as_deref(), Some("fallback-7"));
+        assert!(still_absent.table_miss);
+    }
+
+    /// Publishers and locales partition the map. Casefolding means two
+    /// spellings of one publisher share a table.
+    #[test]
+    fn publisher_and_locale_partition_the_map_and_names_are_casefolded() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+
+        let a = lookup_task(
+            &mut cache,
+            "Publisher-A",
+            1,
+            t0,
+            HOUR,
+            || {
+                let mut n = PublisherNames::default();
+                n.tasks.insert(1, "A".into());
+                Some(n)
+            },
+            || panic!("present"),
+        );
+        let b = lookup_task(
+            &mut cache,
+            "Publisher-B",
+            1,
+            t0,
+            HOUR,
+            || {
+                let mut n = PublisherNames::default();
+                n.tasks.insert(1, "B".into());
+                Some(n)
+            },
+            || panic!("present"),
+        );
+        assert_eq!(a.name.as_deref(), Some("A"));
+        assert_eq!(b.name.as_deref(), Some("B"));
+
+        let folded = lookup_task(
+            &mut cache,
+            "publisher-a",
+            1,
+            t0,
+            HOUR,
+            || panic!("casefolded publisher must share the table"),
+            || panic!("present"),
+        );
+        assert_eq!(folded.name.as_deref(), Some("A"));
+        assert!(folded.hit);
+
+        let other_locale = cache.lookup(
+            "Publisher-A",
+            0x0409,
+            NameField::Task,
+            1,
+            t0,
+            HOUR,
+            || {
+                let mut n = PublisherNames::default();
+                n.tasks.insert(1, "en-US".into());
+                Some(n)
+            },
+            || panic!("present"),
+        );
+        assert_eq!(other_locale.name.as_deref(), Some("en-US"));
         assert_eq!(cache.len(), 3);
     }
 
-    /// Publishers partition it too: task values are manifest-local, so one table
-    /// serving every publisher is only sound because the name is in the key.
+    /// Custom levels at 16+ come from the table; a missing level is miss B
+    /// (the caller applies the hardcoded English fallback).
     #[test]
-    fn publishers_do_not_collide_on_equal_task_values() {
-        let mut cache = FormatCache::new(cap(64));
-        let a = cache.get_or_insert_with("Publisher-A", TASK, 13312, || Some("A task".into()));
-        let b = cache.get_or_insert_with("Publisher-B", TASK, 13312, || Some("B task".into()));
-        assert_eq!(a.name.as_deref(), Some("A task"));
-        assert_eq!(b.name.as_deref(), Some("B task"));
-        let a_again = cache.get_or_insert_with("Publisher-A", TASK, 13312, || {
-            panic!("resident entry must not re-enter the resolver")
-        });
-        assert!(a_again.hit);
-        assert_eq!(a_again.name.as_deref(), Some("A task"));
+    fn custom_levels_come_from_the_table() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        let custom = cache.lookup(
+            SECURITY,
+            SYSTEM_DEFAULT_LOCALE,
+            NameField::Level,
+            16,
+            t0,
+            HOUR,
+            || Some(security_names()),
+            || panic!("16 is in the table"),
+        );
+        assert_eq!(custom.name.as_deref(), Some("Custom-16"));
+        assert!(custom.hit);
+
+        let missing = cache.lookup(
+            SECURITY,
+            SYSTEM_DEFAULT_LOCALE,
+            NameField::Level,
+            99,
+            t0,
+            HOUR,
+            || panic!("fresh"),
+            || None,
+        );
+        assert!(missing.name.is_none());
+        assert!(missing.table_miss);
     }
 
-    /// A resolved `None` is an answer, not a gap. Publishers with no task table
-    /// are common, and re-asking the API per event for them is what a flooded
-    /// channel cannot afford.
     #[test]
-    fn a_negative_result_is_cached_and_not_re_resolved() {
-        let mut cache = FormatCache::new(cap(64));
-        let first = cache.get_or_insert_with("P", TASK, 99, || None);
-        assert!(first.name.is_none());
-        assert!(!first.hit);
-        let second = cache.get_or_insert_with("P", TASK, 99, || panic!("negative must be cached"));
-        assert!(second.name.is_none());
-        assert!(second.hit);
+    fn keyword_bits_match_in_enumeration_order() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        let mask = 0x8020_0000_0000_0000;
+        let got = cache.lookup_keywords(
+            SECURITY,
+            SYSTEM_DEFAULT_LOCALE,
+            mask,
+            t0,
+            HOUR,
+            || Some(security_names()),
+            || panic!("bits are in the table"),
+        );
+        assert_eq!(
+            got.names,
+            vec!["Audit Success".to_string(), "Classic".to_string()]
+        );
+        assert!(got.hit);
+        assert!(!got.table_miss);
     }
 
-    /// Eviction must lose entries, never rewrite them. An evicted key that comes
-    /// back is re-resolved from the API and gets its own name again.
     #[test]
-    fn eviction_re_resolves_rather_than_returning_a_neighbours_name() {
-        let publisher = Publisher::security();
-        let mut cache = FormatCache::new(cap(2));
-        let values = [13312u64, 13313, 13317];
+    fn keyword_miss_falls_back_and_does_not_insert() {
+        let mut cache = FormatCache::new();
+        let t0 = Instant::now();
+        let got = cache.lookup_keywords(
+            SECURITY,
+            SYSTEM_DEFAULT_LOCALE,
+            0x0001,
+            t0,
+            HOUR,
+            || Some(security_names()),
+            || Some("Alpha; Beta".into()),
+        );
+        assert_eq!(got.names, vec!["Alpha".to_string(), "Beta".to_string()]);
+        assert!(got.table_miss);
 
-        // Capacity 2 against 3 hot values: every lookup evicts.
-        for pass in 0..90 {
-            let value = values[pass % values.len()];
-            let got = cache.get_or_insert_with(
-                "Microsoft-Windows-Security-Auditing",
-                TASK,
-                value,
-                || publisher.format(TASK, value),
-            );
-            assert_eq!(
-                got.name,
-                publisher.expected(TASK, value),
-                "eviction handed task {value} the wrong name on pass {pass}"
-            );
-        }
-        assert_eq!(cache.len(), 2);
-        // Thrashing, as expected, and the point: it is SLOW, never wrong.
-        assert_eq!(publisher.calls(), 90);
-    }
-
-    /// The scratch key must never become an entry. If it ever did, a later probe
-    /// mutating it would corrupt the map's hashing, which is the failure the
-    /// caller-owned key made reachable.
-    #[test]
-    fn the_probe_key_is_never_the_stored_key() {
-        let mut cache = FormatCache::new(cap(8));
-        _ = cache.get_or_insert_with("Publisher-A", TASK, 1, || Some("one".into()));
-        // A probe for a different, absent key mutates the scratch in place.
-        _ = cache.get_or_insert_with("Publisher-BBBBBBBBBBBBBBBB", KEYWORD, u64::MAX, || None);
-        // If the stored key had aliased the scratch, this lookup would miss.
-        let again = cache.get_or_insert_with("Publisher-A", TASK, 1, || {
-            panic!("stored key must not alias the probe scratch")
-        });
-        assert!(again.hit);
-        assert_eq!(again.name.as_deref(), Some("one"));
-    }
-
-    proptest! {
-        /// Over arbitrary traffic and an arbitrary capacity, the cache must
-        /// behave exactly like the manifest it is caching: every answer equals
-        /// what the resolver would have said for that key, hit or miss.
-        ///
-        /// This is the general statement of the field defect. It covers key
-        /// shapes the hand-written cases do not (empty publisher names, shared
-        /// prefixes, `u64::MAX` values, capacity 1) because those are precisely
-        /// where a key-construction bug hides.
-        #[test]
-        fn cached_answers_always_equal_the_uncached_ones(
-            capacity in 1usize..32,
-            traffic in prop::collection::vec(
-                (
-                    prop::sample::select(vec![
-                        String::new(),
-                        "P".to_string(),
-                        "PP".to_string(),
-                        "Microsoft-Windows-Security-Auditing".to_string(),
-                    ]),
-                    prop::sample::select(vec![TASK, OPCODE, KEYWORD]),
-                    prop::sample::select(vec![0u64, 1, 13312, 13313, 13317, u64::MAX]),
-                ),
-                1..400,
-            ),
-        ) {
-            // Truth: the name a resolver would produce for this exact key.
-            let truth = |publisher: &str, flag: u32, value: u64| -> Option<String> {
-                if value == 0 {
-                    None
-                } else {
-                    Some(format!("{publisher}/{flag}/{value}"))
-                }
-            };
-
-            let mut cache = FormatCache::new(cap(capacity));
-            for (publisher, flag, value) in traffic {
-                let got = cache.get_or_insert_with(&publisher, flag, value, || {
-                    truth(&publisher, flag, value)
-                });
-                prop_assert_eq!(got.name, truth(&publisher, flag, value));
-            }
-            prop_assert!(cache.len() <= capacity);
-        }
+        let again = cache.lookup_keywords(
+            SECURITY,
+            SYSTEM_DEFAULT_LOCALE,
+            0x0001,
+            t0,
+            HOUR,
+            || panic!("fresh"),
+            || Some("Alpha; Beta".into()),
+        );
+        assert!(again.table_miss);
     }
 }

@@ -15,8 +15,8 @@ cfg_if::cfg_if! {
         mod bookmark;
         mod checkpoint;
         pub mod error;
-        /// The display-name cache, pure Rust and free of Win32, so its accuracy
-        /// invariant (a task value never resolves to another task's name) is
+        /// Publisher display-name tables, pure Rust and free of Win32, so the
+        /// fill-vs-lookup invariant (tables come only from enumeration) is
         /// testable without a live publisher manifest. See the module docs.
         mod format_cache;
         mod metadata;

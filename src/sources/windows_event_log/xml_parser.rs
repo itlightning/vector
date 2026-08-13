@@ -108,6 +108,9 @@ pub struct WindowsEvent {
     pub task_name: Option<String>,
     pub opcode_name: Option<String>,
     pub keyword_names: Vec<String>,
+    /// Publisher-table (or hardcoded fallback) level display string. `None`
+    /// means the hardcoded English match in [`fallback_level_name`].
+    pub resolved_level: Option<String>,
     /// Resolved account name from user_id SID (e.g. "NT AUTHORITY\SYSTEM").
     pub user_name: Option<String>,
     pub version: Option<u8>,
@@ -121,19 +124,30 @@ pub struct WindowsEvent {
 impl WindowsEvent {
     /// Returns the human-readable level name for this event.
     ///
-    /// Level 0 maps to "Information" per standard convention. Windows uses
-    /// Level=0 for "LogAlways" and for all Security audit events. Mapping it to
-    /// "Information" prevents SOC analysts from seeing "Unknown" on every logon event.
-    pub const fn level_name(&self) -> &'static str {
-        match self.level {
-            0 => "Information",
-            1 => "Critical",
-            2 => "Error",
-            3 => "Warning",
-            4 => "Information",
-            5 => "Verbose",
-            _ => "Unknown",
-        }
+    /// A publisher-table string wins when present (locale-resolved, and the
+    /// only way to name custom levels at 16+). Otherwise the hardcoded English
+    /// match. Level 0 maps to "Information": Windows uses Level=0 for
+    /// "LogAlways" and for all Security audit events.
+    pub fn level_name(&self) -> &str {
+        self.resolved_level
+            .as_deref()
+            .unwrap_or_else(|| fallback_level_name(self.level))
+    }
+}
+
+/// Hardcoded English names for the Windows-owned levels 0-5.
+///
+/// Miss fallback when the publisher table has no row for this value. Custom
+/// levels at 16+ cannot be known here and return "Unknown".
+pub(super) const fn fallback_level_name(level: u8) -> &'static str {
+    match level {
+        0 => "Information",
+        1 => "Critical",
+        2 => "Error",
+        3 => "Warning",
+        4 => "Information",
+        5 => "Verbose",
+        _ => "Unknown",
     }
 }
 
@@ -473,6 +487,7 @@ pub fn build_event(
         task_name: None,
         opcode_name: None,
         keyword_names: Vec::new(),
+        resolved_level: None,
         user_name: None,
         version: system_fields.version,
         qualifiers: system_fields.qualifiers,
@@ -873,6 +888,7 @@ mod tests {
             task_name: None,
             opcode_name: None,
             keyword_names: Vec::new(),
+            resolved_level: None,
             user_name: None,
             version: Some(1),
             qualifiers: Some(0),
@@ -909,6 +925,7 @@ mod tests {
             task_name: None,
             opcode_name: None,
             keyword_names: Vec::new(),
+            resolved_level: None,
             user_name: None,
             version: Some(2),
             qualifiers: Some(0),
