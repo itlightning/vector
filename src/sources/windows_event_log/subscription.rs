@@ -541,8 +541,7 @@ struct ChannelSubscription {
     /// gap detection cannot mean anything on this channel.
     query_filters: bool,
     /// Times a name was absent from the publisher table and the per-event
-    /// fallback ran. Internal diagnostics; serialized on the status file by
-    /// the stacked status patch.
+    /// fallback ran. Internal diagnostics, copied onto the status file.
     name_table_misses: u64,
     /// Records read and then dropped by a filter decision: an event-id filter
     /// (`only_event_ids`, `ignore_event_ids`), the age cap, a record with no
@@ -1049,8 +1048,10 @@ impl ChannelSubscription {
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             last_record_id: self.resume.last_record_id,
             newest_record_id: newest_record_estimate(stats, self.resume.last_record_id),
+            query_filters: self.query_filters,
             bookmark_positioned: self.bookmark_positioned,
             retry_attempt: self.backoff.attempt(),
+            name_table_misses: self.name_table_misses,
             gaps: self.gaps.iter().cloned().collect(),
         }
     }
