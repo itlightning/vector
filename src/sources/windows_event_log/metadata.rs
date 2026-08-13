@@ -6,6 +6,7 @@ use windows::Win32::System::EventLog::{
 };
 use windows::core::HSTRING;
 
+use super::format_cache::FormatCache;
 use super::rendering_info;
 use super::subscription::PublisherHandle;
 use super::win32_errors::{RenderDisposition, classify_render, win32_code};
@@ -70,20 +71,6 @@ fn note_publisher_path_entry() {
     #[cfg(test)]
     seam::PUBLISHER_PATH_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
-
-/// Cache key for one `EvtFormatMessage` result: publisher name, message flag
-/// (task / opcode / keyword), and the raw field value.
-///
-/// The publisher is part of the key rather than a level above it, which is what
-/// lets a SINGLE LRU serve every publisher. The previous shape was an unbounded
-/// `HashMap<String, LruCache<..>>`, so each distinct publisher preallocated its
-/// own 10k-entry hashbrown table (measured 272 KiB) on its first event and held
-/// it for the life of the process.
-pub(super) type FormatCacheKey = (String, u32, u64);
-
-/// Every publisher's `EvtFormatMessage` results in one bounded LRU, so cold
-/// publishers age out instead of each owning a table forever.
-pub(super) type FormatCache = LruCache<FormatCacheKey, Option<String>>;
 
 /// Display fields for one event: task/opcode/keyword names plus the rendered
 /// message, together with how they were obtained.
@@ -204,11 +191,12 @@ pub fn resolve_event_metadata(
     let opcode_flag = EvtFormatMessageOpcode.0;
     let keyword_flag = EvtFormatMessageKeyword.0;
 
-    // One key, built once and reused for all three lookups. The publisher name
-    // is now part of the key, and these three calls always carry the SAME
-    // publisher, so building a key per lookup would cost three identical
-    // `String` allocations per event instead of one.
-    let mut key: FormatCacheKey = (provider_name.to_string(), 0, 0);
+    // The three lookups below are the ONLY place a cache key and an event handle
+    // meet. Each resolver closure captures THIS event's handle and is keyed on
+    // THIS event's parsed field value, so the key can never describe one event
+    // while the handle belongs to another: that pairing is the cache's whole
+    // correctness condition (`super::format_cache`), and it is enforced here by
+    // construction rather than by convention.
 
     let task_name = cached_format(
         format_cache,
@@ -216,7 +204,7 @@ pub fn resolve_event_metadata(
         cache_misses_counter,
         metadata_handle,
         event_handle,
-        &mut key,
+        provider_name,
         task_flag,
         task,
     );
@@ -226,7 +214,7 @@ pub fn resolve_event_metadata(
         cache_misses_counter,
         metadata_handle,
         event_handle,
-        &mut key,
+        provider_name,
         opcode_flag,
         opcode,
     );
@@ -236,7 +224,7 @@ pub fn resolve_event_metadata(
         cache_misses_counter,
         metadata_handle,
         event_handle,
-        &mut key,
+        provider_name,
         keyword_flag,
         keywords,
     );
@@ -272,12 +260,12 @@ fn get_or_open_publisher(
     raw
 }
 
-/// Single-LRU lookup keyed by `(publisher, flag, field_value)`.
+/// One cached `EvtFormatMessage` display-name lookup.
 ///
-/// `key` is owned by the CALLER and mutated in place: the caller builds the
-/// publisher `String` once per event and this sets the flag and value fields
-/// for each of the three lookups. The hit path therefore allocates nothing, and
-/// only a miss clones the key to insert it.
+/// This is the FFI half: it owns the Win32 call and the counters, and hands the
+/// cache a resolver bound to `event_handle`. The lookup, insert and eviction
+/// logic lives in [`super::format_cache`] with no Windows in it, so the accuracy
+/// invariant is testable off a live host rather than argued.
 #[allow(clippy::too_many_arguments)]
 fn cached_format(
     cache: &mut FormatCache,
@@ -285,25 +273,19 @@ fn cached_format(
     cache_misses_counter: &Counter,
     metadata_handle: EVT_HANDLE,
     event_handle: EVT_HANDLE,
-    key: &mut FormatCacheKey,
+    publisher: &str,
     flag: u32,
     field_value: u64,
 ) -> Option<String> {
-    key.1 = flag;
-    key.2 = field_value;
-
-    // `get`, not `peek`: with one shared LRU across every publisher, promotion
-    // is what keeps a hot publisher's entries resident while cold ones age out.
-    if let Some(cached) = cache.get(key) {
+    let lookup = cache.get_or_insert_with(publisher, flag, field_value, || {
+        format_metadata_field(metadata_handle, event_handle, flag)
+    });
+    if lookup.hit {
         cache_hits_counter.increment(1);
-        return cached.clone();
+    } else {
+        cache_misses_counter.increment(1);
     }
-
-    // Slow path: call API and populate cache
-    cache_misses_counter.increment(1);
-    let result = format_metadata_field(metadata_handle, event_handle, flag);
-    cache.put(key.clone(), result.clone());
-    result
+    lookup.name
 }
 
 fn format_metadata_field(

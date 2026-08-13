@@ -61,7 +61,9 @@ pub(super) static DRAIN_STEP_HOOK: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 /// Maximum number of entries in the EvtFormatMessage result cache. One cache
-/// for the whole process, shared by every publisher.
+/// per source instance, shared by every publisher AND every channel that
+/// instance reads: the publisher name is in the key, so cross-channel sharing
+/// cannot transpose one publisher's task names onto another's.
 pub const FORMAT_CACHE_CAPACITY: usize = 10_000;
 /// Maximum number of cached publisher metadata handles.
 const PUBLISHER_CACHE_CAPACITY: usize = 256;
@@ -957,7 +959,7 @@ pub struct EventLogSubscription {
     publisher_cache: LruCache<String, PublisherHandle>,
     /// Cached EvtFormatMessage results for every publisher in ONE bounded LRU
     /// keyed by `(publisher, flag, field value)`.
-    format_cache: metadata::FormatCache,
+    format_cache: super::format_cache::FormatCache,
     /// Pre-registered counter for metadata cache hits.
     cache_hits_counter: Counter,
     /// Pre-registered counter for metadata cache misses.
@@ -1220,7 +1222,7 @@ impl EventLogSubscription {
             // a quiet host never pays for.
             event_buffer: Vec::new(),
             publisher_cache: LruCache::new(NonZeroUsize::new(PUBLISHER_CACHE_CAPACITY).unwrap()),
-            format_cache: metadata::FormatCache::new(
+            format_cache: super::format_cache::FormatCache::new(
                 NonZeroUsize::new(FORMAT_CACHE_CAPACITY).unwrap(),
             ),
             cache_hits_counter: counter!(CounterName::WindowsEventLogCacheHitsTotal),
