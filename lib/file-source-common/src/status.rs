@@ -255,8 +255,21 @@ impl StatusWriter {
         }
     }
 
-    /// Serialize to the temporary file, flush it, then rename over the stable one, so a
-    /// reader never observes a partial file. Same shape the checkpointer uses.
+    /// Serialize to the temporary file, then rename over the stable one, so a reader
+    /// never observes a partial file.
+    ///
+    /// No `fsync`. The rename is what gives torn-read safety: `std::fs::rename` is one
+    /// replace-existing rename operation on every platform we ship (`FileRenameInfoEx`,
+    /// falling back to `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, on Windows;
+    /// `rename(2)` elsewhere), so a concurrent reader opens either the whole previous
+    /// snapshot or the whole new one, whether or not the bytes have reached the platter.
+    /// The Windows caveat is failure, not tearing: a reader holding the stable path open
+    /// without `FILE_SHARE_DELETE` makes the rename fail, which is the pre-existing
+    /// warn-once-and-retry path.
+    /// Flushing would buy crash durability alone, for a snapshot that is rewritten every
+    /// interval and whose torn remains read as unparseable, which every consumer already
+    /// treats as "no facts from this file". The checkpoint file DOES flush and keeps
+    /// doing so: losing it costs re-read or skipped data, not one interval of reporting.
     async fn write_inner(&self, status: &FileSourceStatus) -> Result<(), io::Error> {
         let tmp_path = self.tmp_path.clone();
         let bytes = serde_json::to_vec(status)?;
@@ -265,7 +278,7 @@ impl StatusWriter {
             use std::io::Write as _;
             let mut f = std::io::BufWriter::new(std::fs::File::create(tmp_path)?);
             f.write_all(&bytes)?;
-            f.into_inner()?.sync_all()?;
+            f.into_inner()?;
             Ok(())
         })
         .await
