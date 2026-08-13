@@ -86,6 +86,7 @@ fn create_test_event() -> WindowsEvent {
         task_name: None,
         opcode_name: None,
         keyword_names: Vec::new(),
+        resolved_level: None,
         user_name: None,
         version: Some(1),
         qualifiers: Some(0),

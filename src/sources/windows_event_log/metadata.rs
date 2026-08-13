@@ -1,16 +1,30 @@
+use std::mem::size_of;
+use std::time::{Duration, Instant};
+
 use lru::LruCache;
 use metrics::Counter;
 use windows::Win32::System::EventLog::{
-    EVT_HANDLE, EvtFormatMessage, EvtFormatMessageEvent, EvtFormatMessageKeyword,
-    EvtFormatMessageOpcode, EvtFormatMessageTask, EvtOpenPublisherMetadata,
+    EVT_HANDLE, EVT_PUBLISHER_METADATA_PROPERTY_ID, EVT_VARIANT, EvtClose, EvtFormatMessage,
+    EvtFormatMessageEvent, EvtFormatMessageId, EvtFormatMessageKeyword, EvtFormatMessageOpcode,
+    EvtFormatMessageTask, EvtGetObjectArrayProperty, EvtGetObjectArraySize,
+    EvtGetPublisherMetadataProperty, EvtOpenPublisherMetadata,
+    EvtPublisherMetadataKeywordMessageID, EvtPublisherMetadataKeywordName,
+    EvtPublisherMetadataKeywordValue, EvtPublisherMetadataKeywords,
+    EvtPublisherMetadataLevelMessageID, EvtPublisherMetadataLevelName,
+    EvtPublisherMetadataLevelValue, EvtPublisherMetadataLevels,
+    EvtPublisherMetadataOpcodeMessageID, EvtPublisherMetadataOpcodeName,
+    EvtPublisherMetadataOpcodeValue, EvtPublisherMetadataOpcodes,
+    EvtPublisherMetadataTaskMessageID, EvtPublisherMetadataTaskName, EvtPublisherMetadataTaskValue,
+    EvtPublisherMetadataTasks, EvtVarTypeEvtHandle, EvtVarTypeString, EvtVarTypeUInt32,
+    EvtVarTypeUInt64,
 };
 use windows::core::HSTRING;
 
-use super::format_cache::FormatCache;
+use super::format_cache::{FormatCache, NameField, PublisherNames, SYSTEM_DEFAULT_LOCALE};
 use super::rendering_info;
 use super::subscription::PublisherHandle;
 use super::win32_errors::{RenderDisposition, classify_render, win32_code};
-use super::xml_parser::SystemFields;
+use super::xml_parser::{SystemFields, fallback_level_name};
 
 /// Test-only accounting for the render path.
 ///
@@ -79,12 +93,17 @@ pub(super) struct EventDisplay {
     pub(super) task_name: Option<String>,
     pub(super) opcode_name: Option<String>,
     pub(super) keyword_names: Vec<String>,
+    /// Table-resolved level display string. `None` keeps the hardcoded English
+    /// match on the event.
+    pub(super) level_name: Option<String>,
     pub(super) rendered_message: Option<String>,
     /// True when the event XML carried `<RenderingInfo>`, meaning it was
     /// delivered as rendered text (Windows Event Forwarding). Two consequences:
     /// `EvtFormatMessage` was not called for this event, and this channel's
     /// record IDs are not trustworthy for gap detection.
     pub(super) rendered_delivery: bool,
+    /// Count of scalar/keyword lookups that missed the table and ran fallback.
+    pub(super) table_misses: u32,
 }
 
 /// Resolve an event's display fields.
@@ -107,14 +126,18 @@ pub(super) fn resolve_event_display(
     xml: &str,
     system_fields: &SystemFields,
     render_message: bool,
+    now: Instant,
+    refresh: Duration,
 ) -> EventDisplay {
     if let Some(info) = rendering_info::parse(xml) {
         return EventDisplay {
             task_name: info.task_name,
             opcode_name: info.opcode_name,
             keyword_names: info.keyword_names,
+            level_name: None,
             rendered_message: if render_message { info.message } else { None },
             rendered_delivery: true,
+            table_misses: 0,
         };
     }
 
@@ -125,16 +148,19 @@ pub(super) fn resolve_event_display(
 
     note_publisher_path_entry();
 
-    let (task_name, opcode_name, keyword_names) = resolve_event_metadata(
+    let resolved = resolve_event_metadata(
         publisher_cache,
         format_cache,
         cache_hits_counter,
         cache_misses_counter,
         event_handle,
         provider_name,
-        system_fields.task as u64,
-        system_fields.opcode as u64,
+        system_fields.task,
+        system_fields.opcode,
         system_fields.keywords,
+        system_fields.level,
+        now,
+        refresh,
     );
 
     let rendered_message = if render_message {
@@ -144,11 +170,13 @@ pub(super) fn resolve_event_display(
     };
 
     EventDisplay {
-        task_name,
-        opcode_name,
-        keyword_names,
+        task_name: resolved.task_name,
+        opcode_name: resolved.opcode_name,
+        keyword_names: resolved.keyword_names,
+        level_name: resolved.level_name,
         rendered_message,
         rendered_delivery: false,
+        table_misses: resolved.table_misses,
     }
 }
 
@@ -166,92 +194,196 @@ fn render_result_usable(result: &windows::core::Result<()>) -> bool {
     }
 }
 
-/// Resolves task, opcode, and keyword names from provider metadata via EvtFormatMessage.
+struct ResolvedNames {
+    task_name: Option<String>,
+    opcode_name: Option<String>,
+    keyword_names: Vec<String>,
+    level_name: Option<String>,
+    table_misses: u32,
+}
+
+/// Resolves task, opcode, keyword, and level names from the publisher table.
 #[allow(clippy::too_many_arguments)]
-pub fn resolve_event_metadata(
+fn resolve_event_metadata(
     publisher_cache: &mut LruCache<String, PublisherHandle>,
     format_cache: &mut FormatCache,
     cache_hits_counter: &Counter,
     cache_misses_counter: &Counter,
     event_handle: EVT_HANDLE,
     provider_name: &str,
-    task: u64,
-    opcode: u64,
+    task: u16,
+    opcode: u8,
     keywords: u64,
-) -> (Option<String>, Option<String>, Vec<String>) {
-    let raw_handle = get_or_open_publisher(publisher_cache, provider_name);
+    level: u8,
+    now: Instant,
+    refresh: Duration,
+) -> ResolvedNames {
+    use super::format_cache::Prepare;
 
-    if raw_handle == 0 {
-        return (None, None, Vec::new());
+    match format_cache.prepare(provider_name, SYSTEM_DEFAULT_LOCALE, now, refresh) {
+        Prepare::Unopenable => {
+            return ResolvedNames {
+                task_name: None,
+                opcode_name: None,
+                keyword_names: Vec::new(),
+                level_name: Some(fallback_level_name(level).to_string()),
+                table_misses: 0,
+            };
+        }
+        Prepare::NeedEnumerate => {
+            let raw = get_or_open_publisher(publisher_cache, provider_name, true);
+            if raw == 0 {
+                format_cache.store_unopenable(provider_name, SYSTEM_DEFAULT_LOCALE, now);
+                return ResolvedNames {
+                    task_name: None,
+                    opcode_name: None,
+                    keyword_names: Vec::new(),
+                    level_name: Some(fallback_level_name(level).to_string()),
+                    table_misses: 0,
+                };
+            }
+            format_cache.store_table(
+                provider_name,
+                SYSTEM_DEFAULT_LOCALE,
+                now,
+                enumerate_publisher_names(EVT_HANDLE(raw)),
+            );
+        }
+        Prepare::Ready => {}
     }
 
-    let metadata_handle = EVT_HANDLE(raw_handle);
+    let metadata = publisher_handle(publisher_cache, provider_name);
 
-    let task_flag = EvtFormatMessageTask.0;
-    let opcode_flag = EvtFormatMessageOpcode.0;
-    let keyword_flag = EvtFormatMessageKeyword.0;
-
-    // The three lookups below are the ONLY place a cache key and an event handle
-    // meet. Each resolver closure captures THIS event's handle and is keyed on
-    // THIS event's parsed field value, so the key can never describe one event
-    // while the handle belongs to another: that pairing is the cache's whole
-    // correctness condition (`super::format_cache`), and it is enforced here by
-    // construction rather than by convention.
-
-    let task_name = cached_format(
-        format_cache,
-        cache_hits_counter,
-        cache_misses_counter,
-        metadata_handle,
-        event_handle,
+    let (task_name, task_miss) = match format_cache.get_scalar(
         provider_name,
-        task_flag,
-        task,
-    );
-    let opcode_name = cached_format(
-        format_cache,
-        cache_hits_counter,
-        cache_misses_counter,
-        metadata_handle,
-        event_handle,
-        provider_name,
-        opcode_flag,
-        opcode,
-    );
-    let keyword_str = cached_format(
-        format_cache,
-        cache_hits_counter,
-        cache_misses_counter,
-        metadata_handle,
-        event_handle,
-        provider_name,
-        keyword_flag,
-        keywords,
-    );
+        SYSTEM_DEFAULT_LOCALE,
+        NameField::Task,
+        u64::from(task),
+    ) {
+        Some(name) => {
+            cache_hits_counter.increment(1);
+            (Some(name.to_string()), false)
+        }
+        None => {
+            cache_misses_counter.increment(1);
+            (
+                format_metadata_field(metadata, event_handle, EvtFormatMessageTask.0),
+                true,
+            )
+        }
+    };
 
-    let keyword_names = keyword_str
-        .map(|s| {
-            s.split(';')
-                .map(|k| k.trim().to_string())
-                .filter(|k| !k.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let (opcode_name, opcode_miss) = match format_cache.get_scalar(
+        provider_name,
+        SYSTEM_DEFAULT_LOCALE,
+        NameField::Opcode,
+        u64::from(opcode),
+    ) {
+        Some(name) => {
+            cache_hits_counter.increment(1);
+            (Some(name.to_string()), false)
+        }
+        None => {
+            cache_misses_counter.increment(1);
+            (
+                format_metadata_field(metadata, event_handle, EvtFormatMessageOpcode.0),
+                true,
+            )
+        }
+    };
 
-    (task_name, opcode_name, keyword_names)
+    let (keyword_names, keyword_miss) =
+        match format_cache.get_keywords(provider_name, SYSTEM_DEFAULT_LOCALE, keywords) {
+            Some(names) if !names.is_empty() || keywords == 0 => {
+                cache_hits_counter.increment(1);
+                (names, false)
+            }
+            _ => {
+                cache_misses_counter.increment(1);
+                let names =
+                    format_metadata_field(metadata, event_handle, EvtFormatMessageKeyword.0)
+                        .map(|s| {
+                            s.split(';')
+                                .map(|k| k.trim().to_string())
+                                .filter(|k| !k.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                (names, true)
+            }
+        };
+
+    let (level_name, level_miss) = match format_cache.get_scalar(
+        provider_name,
+        SYSTEM_DEFAULT_LOCALE,
+        NameField::Level,
+        u64::from(level),
+    ) {
+        Some(name) => {
+            cache_hits_counter.increment(1);
+            (Some(name.to_string()), false)
+        }
+        None => {
+            // Levels 0-5 live in winmeta and are often absent from the
+            // publisher table. Hardcoded English is the miss fallback, not a
+            // diagnostic miss. Custom levels at 16+ that miss ARE a miss.
+            let fallback = fallback_level_name(level);
+            let miss = fallback == "Unknown";
+            if miss {
+                cache_misses_counter.increment(1);
+            }
+            (Some(fallback.to_string()), miss)
+        }
+    };
+
+    let mut table_misses = 0u32;
+    if task_miss {
+        table_misses += 1;
+    }
+    if opcode_miss {
+        table_misses += 1;
+    }
+    if keyword_miss {
+        table_misses += 1;
+    }
+    if level_miss {
+        table_misses += 1;
+    }
+
+    ResolvedNames {
+        task_name,
+        opcode_name,
+        keyword_names,
+        level_name,
+        table_misses,
+    }
+}
+
+fn publisher_handle(
+    cache: &mut LruCache<String, PublisherHandle>,
+    provider_name: &str,
+) -> EVT_HANDLE {
+    EVT_HANDLE(get_or_open_publisher(cache, provider_name, false))
 }
 
 fn get_or_open_publisher(
     cache: &mut LruCache<String, PublisherHandle>,
     provider_name: &str,
+    retry_failed: bool,
 ) -> isize {
     if let Some(handle) = cache.get(provider_name) {
-        return handle.0;
+        if handle.0 != 0 || !retry_failed {
+            return handle.0;
+        }
+        cache.pop(provider_name);
     }
 
     let provider_hstring = HSTRING::from(provider_name);
+    // Locale 0 is the thread/system default, matching prior behavior and the
+    // locked product choice: forwarded events keep origin `<Locale>` in XML
+    // and we ignore it.
     let raw = unsafe {
-        EvtOpenPublisherMetadata(None, &provider_hstring, None, 0, 0)
+        EvtOpenPublisherMetadata(None, &provider_hstring, None, SYSTEM_DEFAULT_LOCALE, 0)
             .map(|h| h.0)
             .unwrap_or(0)
     };
@@ -260,32 +392,223 @@ fn get_or_open_publisher(
     raw
 }
 
-/// One cached `EvtFormatMessage` display-name lookup.
+/// Walk the publisher's task / opcode / keyword / level tables.
 ///
-/// This is the FFI half: it owns the Win32 call and the counters, and hands the
-/// cache a resolver bound to `event_handle`. The lookup, insert and eviction
-/// logic lives in [`super::format_cache`] with no Windows in it, so the accuracy
-/// invariant is testable off a live host rather than argued.
-#[allow(clippy::too_many_arguments)]
-fn cached_format(
-    cache: &mut FormatCache,
-    cache_hits_counter: &Counter,
-    cache_misses_counter: &Counter,
-    metadata_handle: EVT_HANDLE,
-    event_handle: EVT_HANDLE,
-    publisher: &str,
-    flag: u32,
-    field_value: u64,
-) -> Option<String> {
-    let lookup = cache.get_or_insert_with(publisher, flag, field_value, || {
-        format_metadata_field(metadata_handle, event_handle, flag)
+/// Display strings come from the message ID (`EvtFormatMessageId`, null event
+/// handle). The symbolic name is used only when the ID is `-1`, matching
+/// Winlogbeat. The table is filled only from this walk.
+fn enumerate_publisher_names(handle: EVT_HANDLE) -> PublisherNames {
+    let mut names = PublisherNames::default();
+    fill_tasks(handle, &mut names);
+    fill_opcodes(handle, &mut names);
+    fill_keywords(handle, &mut names);
+    fill_levels(handle, &mut names);
+    names
+}
+
+fn fill_tasks(handle: EVT_HANDLE, names: &mut PublisherNames) {
+    walk_metadata_array(handle, EvtPublisherMetadataTasks, |array, index| {
+        let message_id = variant_u32(&array_property(
+            array,
+            EvtPublisherMetadataTaskMessageID,
+            index,
+        ));
+        let symbolic = variant_string(&array_property(array, EvtPublisherMetadataTaskName, index));
+        let value =
+            variant_u32(&array_property(array, EvtPublisherMetadataTaskValue, index)) as u16;
+        if let Some(display) = display_or_symbolic(handle, message_id, symbolic) {
+            names.tasks.insert(value, display);
+        }
     });
-    if lookup.hit {
-        cache_hits_counter.increment(1);
-    } else {
-        cache_misses_counter.increment(1);
+}
+
+fn fill_opcodes(handle: EVT_HANDLE, names: &mut PublisherNames) {
+    walk_metadata_array(handle, EvtPublisherMetadataOpcodes, |array, index| {
+        let message_id = variant_u32(&array_property(
+            array,
+            EvtPublisherMetadataOpcodeMessageID,
+            index,
+        ));
+        let symbolic = variant_string(&array_property(
+            array,
+            EvtPublisherMetadataOpcodeName,
+            index,
+        ));
+        // High word is the opcode; low word is the task it is scoped to
+        // (zero means global). The event XML opcode is the high word.
+        let value_mask = variant_u32(&array_property(
+            array,
+            EvtPublisherMetadataOpcodeValue,
+            index,
+        ));
+        let opcode = ((value_mask >> 16) & 0xFFFF) as u8;
+        if let Some(display) = display_or_symbolic(handle, message_id, symbolic) {
+            names.opcodes.insert(opcode, display);
+        }
+    });
+}
+
+fn fill_keywords(handle: EVT_HANDLE, names: &mut PublisherNames) {
+    walk_metadata_array(handle, EvtPublisherMetadataKeywords, |array, index| {
+        let message_id = variant_u32(&array_property(
+            array,
+            EvtPublisherMetadataKeywordMessageID,
+            index,
+        ));
+        let symbolic = variant_string(&array_property(
+            array,
+            EvtPublisherMetadataKeywordName,
+            index,
+        ));
+        let bit = variant_u64(&array_property(
+            array,
+            EvtPublisherMetadataKeywordValue,
+            index,
+        ));
+        if let Some(display) = display_or_symbolic(handle, message_id, symbolic) {
+            names.keywords.push((bit, display));
+        }
+    });
+}
+
+fn fill_levels(handle: EVT_HANDLE, names: &mut PublisherNames) {
+    walk_metadata_array(handle, EvtPublisherMetadataLevels, |array, index| {
+        let message_id = variant_u32(&array_property(
+            array,
+            EvtPublisherMetadataLevelMessageID,
+            index,
+        ));
+        let symbolic = variant_string(&array_property(array, EvtPublisherMetadataLevelName, index));
+        let value = variant_u32(&array_property(
+            array,
+            EvtPublisherMetadataLevelValue,
+            index,
+        )) as u8;
+        if let Some(display) = display_or_symbolic(handle, message_id, symbolic) {
+            names.levels.insert(value, display);
+        }
+    });
+}
+
+/// Message ID `-1` (0xFFFFFFFF) means the entry has no message; use the
+/// symbolic name. Any other ID is formatted with a null event handle.
+fn display_or_symbolic(
+    publisher: EVT_HANDLE,
+    message_id: u32,
+    symbolic: Option<String>,
+) -> Option<String> {
+    if message_id != u32::MAX {
+        if let Some(message) = format_message_id(publisher, message_id) {
+            return Some(message);
+        }
     }
-    lookup.name
+    symbolic.filter(|s| !s.is_empty())
+}
+
+fn walk_metadata_array<F>(
+    publisher: EVT_HANDLE,
+    property: EVT_PUBLISHER_METADATA_PROPERTY_ID,
+    mut visit: F,
+) where
+    F: FnMut(EVT_HANDLE, u32),
+{
+    let Some(variant) = publisher_property(publisher, property) else {
+        return;
+    };
+    if variant.Type != EvtVarTypeEvtHandle.0 as u32 {
+        return;
+    }
+    let array = unsafe { variant.Anonymous.EvtHandleVal };
+    if array.0 == 0 {
+        return;
+    }
+    let mut len = 0u32;
+    if unsafe { EvtGetObjectArraySize(array.0, &mut len) }.is_err() {
+        unsafe {
+            _ = EvtClose(array);
+        }
+        return;
+    }
+    for index in 0..len {
+        visit(array, index);
+    }
+    unsafe {
+        _ = EvtClose(array);
+    }
+}
+
+fn publisher_property(
+    handle: EVT_HANDLE,
+    property: EVT_PUBLISHER_METADATA_PROPERTY_ID,
+) -> Option<EVT_VARIANT> {
+    sized_variant(|size, buf, used| unsafe {
+        EvtGetPublisherMetadataProperty(handle, property, 0, size, buf, used)
+    })
+}
+
+fn array_property(
+    array: EVT_HANDLE,
+    property: EVT_PUBLISHER_METADATA_PROPERTY_ID,
+    index: u32,
+) -> Option<EVT_VARIANT> {
+    sized_variant(|size, buf, used| unsafe {
+        EvtGetObjectArrayProperty(array.0, property.0 as u32, index, 0, size, buf, used)
+    })
+}
+
+fn sized_variant<F>(mut get: F) -> Option<EVT_VARIANT>
+where
+    F: FnMut(u32, Option<*mut EVT_VARIANT>, *mut u32) -> windows::core::Result<()>,
+{
+    let mut used = 0u32;
+    _ = get(0, None, &mut used);
+    if used == 0 {
+        return None;
+    }
+    let count = ((used as usize) / size_of::<EVT_VARIANT>()).max(1);
+    let mut buf = vec![EVT_VARIANT::default(); count];
+    let size = (buf.len() * size_of::<EVT_VARIANT>()) as u32;
+    get(size, Some(buf.as_mut_ptr()), &mut used).ok()?;
+    buf.into_iter().next()
+}
+
+fn variant_string(variant: &Option<EVT_VARIANT>) -> Option<String> {
+    let variant = variant.as_ref()?;
+    if variant.Type != EvtVarTypeString.0 as u32 {
+        return None;
+    }
+    let ptr = unsafe { variant.Anonymous.StringVal };
+    unsafe { ptr.to_string().ok() }
+}
+
+fn variant_u32(variant: &Option<EVT_VARIANT>) -> u32 {
+    let Some(variant) = variant else {
+        return 0;
+    };
+    if variant.Type != EvtVarTypeUInt32.0 as u32 {
+        return 0;
+    }
+    unsafe { variant.Anonymous.UInt32Val }
+}
+
+fn variant_u64(variant: &Option<EVT_VARIANT>) -> u64 {
+    let Some(variant) = variant else {
+        return 0;
+    };
+    if variant.Type != EvtVarTypeUInt64.0 as u32 {
+        return 0;
+    }
+    unsafe { variant.Anonymous.UInt64Val }
+}
+
+fn format_message_id(metadata_handle: EVT_HANDLE, message_id: u32) -> Option<String> {
+    format_message(
+        metadata_handle,
+        EVT_HANDLE(0),
+        message_id,
+        EvtFormatMessageId.0,
+        4096,
+    )
 }
 
 fn format_metadata_field(
@@ -293,13 +616,26 @@ fn format_metadata_field(
     event_handle: EVT_HANDLE,
     flags: u32,
 ) -> Option<String> {
+    if metadata_handle.0 == 0 || event_handle.0 == 0 {
+        return None;
+    }
+    format_message(metadata_handle, event_handle, 0, flags, 4096)
+}
+
+fn format_message(
+    metadata_handle: EVT_HANDLE,
+    event_handle: EVT_HANDLE,
+    message_id: u32,
+    flags: u32,
+    max_chars: u32,
+) -> Option<String> {
     let mut buffer_used: u32 = 0;
     note_format_message_call();
     _ = unsafe {
         EvtFormatMessage(
             metadata_handle,
             event_handle,
-            0,
+            message_id,
             None,
             flags,
             None,
@@ -307,7 +643,7 @@ fn format_metadata_field(
         )
     };
 
-    if buffer_used == 0 || buffer_used > 4096 {
+    if buffer_used == 0 || buffer_used > max_chars {
         return None;
     }
 
@@ -318,7 +654,7 @@ fn format_metadata_field(
         EvtFormatMessage(
             metadata_handle,
             event_handle,
-            0,
+            message_id,
             None,
             flags,
             Some(&mut buffer),
@@ -326,7 +662,6 @@ fn format_metadata_field(
         )
     };
 
-    // Partial renders keep their buffer; only a genuine failure discards it.
     if !render_result_usable(&result) {
         return None;
     }
@@ -342,7 +677,7 @@ pub fn format_event_message(
     event_handle: EVT_HANDLE,
     provider_name: &str,
 ) -> Option<String> {
-    let raw_handle = get_or_open_publisher(publisher_cache, provider_name);
+    let raw_handle = get_or_open_publisher(publisher_cache, provider_name, false);
 
     if raw_handle == 0 {
         return None;
@@ -398,6 +733,7 @@ pub fn format_event_message(
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::sources::windows_event_log::xml_parser::parse_system_section;
@@ -407,7 +743,7 @@ mod tests {
 
     fn empty_caches() -> (LruCache<String, PublisherHandle>, FormatCache) {
         let size = NonZeroUsize::new(8).expect("nonzero");
-        (LruCache::new(size), FormatCache::new(size))
+        (LruCache::new(size), FormatCache::new())
     }
 
     /// MERGE GATE for the `<RenderingInfo>` crash guard.
@@ -448,6 +784,8 @@ mod tests {
             FORWARDED_FIXTURE,
             &system_fields,
             true,
+            Instant::now(),
+            Duration::from_secs(86_400),
         );
 
         assert_eq!(
@@ -509,6 +847,8 @@ mod tests {
             FORWARDED_FIXTURE,
             &system_fields,
             false,
+            Instant::now(),
+            Duration::from_secs(86_400),
         );
 
         assert_eq!(seam::format_message_calls(&seams), 0);
