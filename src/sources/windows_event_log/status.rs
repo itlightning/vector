@@ -278,7 +278,10 @@ pub(super) fn write_atomic(path: &Path, snapshot: &StatusSnapshot) -> std::io::R
     {
         let mut file = fs::File::create(&temp)?;
         file.write_all(&encoded)?;
-        file.sync_all()?;
+        // No `sync_all`. The reader is the agent on this host, and a rename
+        // in one directory is already atomic for it (previous complete file
+        // or new complete file). Fsync would only protect a snapshot that is
+        // rewritten every interval.
     }
 
     match fs::rename(&temp, path) {
