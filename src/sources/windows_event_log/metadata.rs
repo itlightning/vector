@@ -491,18 +491,20 @@ fn fill_levels(handle: EVT_HANDLE, names: &mut PublisherNames) {
 }
 
 /// Message ID `-1` (0xFFFFFFFF) means the entry has no message; use the
-/// symbolic name. Any other ID is formatted with a null event handle.
+/// symbolic name. Any other ID is formatted with a null event handle. A
+/// present ID that failed to format is omitted, never replaced by the
+/// symbolic name.
 fn display_or_symbolic(
     publisher: EVT_HANDLE,
     message_id: u32,
     symbolic: Option<String>,
 ) -> Option<String> {
-    if message_id != u32::MAX {
-        if let Some(message) = format_message_id(publisher, message_id) {
-            return Some(message);
-        }
-    }
-    symbolic.filter(|s| !s.is_empty())
+    let formatted = if message_id != u32::MAX {
+        format_message_id(publisher, message_id)
+    } else {
+        None
+    };
+    super::format_cache::choose_table_display(message_id, formatted, symbolic)
 }
 
 fn walk_metadata_array<F>(

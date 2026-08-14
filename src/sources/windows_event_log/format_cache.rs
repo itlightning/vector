@@ -32,6 +32,24 @@ use std::time::{Duration, Instant};
 /// thread default, which is what this source uses everywhere.
 pub(super) const SYSTEM_DEFAULT_LOCALE: u32 = 0;
 
+/// Pick the table display string for one publisher-metadata row.
+///
+/// `message_id == u32::MAX` (`-1`) means the entry has no message; the
+/// symbolic name is then the display string. Any other ID is the formatted
+/// message. A present ID that failed to format is omitted, never replaced
+/// by the symbolic name: that would store TaskName/OpcodeName for a row
+/// that had a message-file string.
+pub(super) fn choose_table_display(
+    message_id: u32,
+    formatted: Option<String>,
+    symbolic: Option<String>,
+) -> Option<String> {
+    if message_id != u32::MAX {
+        return formatted.filter(|s| !s.is_empty());
+    }
+    symbolic.filter(|s| !s.is_empty())
+}
+
 /// Names enumerated from one publisher's metadata for one locale.
 ///
 /// Display strings, not symbolic names: the caller resolves each message ID
@@ -786,5 +804,37 @@ mod tests {
             || Some("Alpha; Beta".into()),
         );
         assert!(again.table_miss);
+    }
+
+    /// A present message ID that failed to format must not become the
+    /// symbolic name. That is how TaskName would leak into the table.
+    #[test]
+    fn a_failed_format_of_a_real_message_id_is_omitted_not_symbolic() {
+        assert_eq!(
+            choose_table_display(42, None, Some("TaskName".into())),
+            None
+        );
+        assert_eq!(
+            choose_table_display(42, Some("Formatted".into()), Some("TaskName".into())).as_deref(),
+            Some("Formatted")
+        );
+        assert_eq!(
+            choose_table_display(u32::MAX, None, Some("TaskName".into())).as_deref(),
+            Some("TaskName")
+        );
+        assert_eq!(
+            choose_table_display(u32::MAX, Some("ignored".into()), Some("TaskName".into()))
+                .as_deref(),
+            Some("TaskName"),
+            "when the ID is absent the formatted argument is not consulted"
+        );
+        assert_eq!(
+            choose_table_display(u32::MAX, None, Some(String::new())),
+            None
+        );
+        assert_eq!(
+            choose_table_display(7, Some(String::new()), Some("X".into())),
+            None
+        );
     }
 }
