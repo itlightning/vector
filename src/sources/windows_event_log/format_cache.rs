@@ -72,12 +72,13 @@ pub(super) enum NameField {
     Level,
 }
 
-/// Outcome of one scalar lookup.
+/// Outcome of one scalar lookup. Test-only: the ship path uses [`FormatCache::get_scalar`].
 ///
 /// `hit` means the table served the name (including a present empty table
 /// returning `name: None` without fallback). `table_miss` means the value was
 /// absent after a fresh-enough table and the fallback ran. The two are never
 /// both true. Miss A (publisher unopenable) is `hit: false, table_miss: false`.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Lookup {
     pub(super) name: Option<String>,
@@ -86,6 +87,8 @@ pub(super) struct Lookup {
 }
 
 /// Outcome of a keyword-mask lookup. Same hit / miss flags as [`Lookup`].
+/// Test-only: the ship path uses [`FormatCache::get_keywords`].
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct KeywordLookup {
     pub(super) names: Vec<String>,
@@ -208,6 +211,7 @@ impl FormatCache {
         }
     }
 
+    #[cfg(test)]
     fn ensure_table<E>(
         &mut self,
         key: &(String, u32),
@@ -264,6 +268,10 @@ impl FormatCache {
     /// `enumerate` runs when the table is absent or older than `refresh`.
     /// `None` is miss A: cached until `refresh` elapses. `fallback` runs only
     /// on miss B (table present, value absent) and its answer is never stored.
+    ///
+    /// Test-only. Production uses [`Self::prepare`] plus [`Self::get_scalar`]
+    /// so the Win32 caller never holds two `&mut` maps in one closure.
+    #[cfg(test)]
     pub(super) fn lookup<E, F>(
         &mut self,
         publisher: &str,
@@ -310,6 +318,8 @@ impl FormatCache {
     /// Matching bits come from the table in enumeration order. A mask with no
     /// matching bits on a present table is miss B and runs `fallback`, which
     /// returns the `EvtFormatMessageKeyword` semicolon-separated string.
+    /// Test-only. Production uses [`Self::prepare`] plus [`Self::get_keywords`].
+    #[cfg(test)]
     pub(super) fn lookup_keywords<E, F>(
         &mut self,
         publisher: &str,
