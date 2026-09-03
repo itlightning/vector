@@ -22,7 +22,7 @@ impl SidResolver {
     /// The lookup runs OUTSIDE the map lock. `LookupAccountSidW` can reach a
     /// domain controller, and holding a process-global lock across that would
     /// stall every source in the process on one slow name resolution.
-    pub fn resolve(&mut self, sid_string: &str) -> Option<String> {
+    pub fn resolve(&self, sid_string: &str) -> Option<String> {
         if let Some(cached) = super::shared_cache::sid_lookup(sid_string) {
             return cached;
         }
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_sid_resolver_caches_results() {
-        let mut resolver = SidResolver::new();
+        let resolver = SidResolver::new();
         // Well-known SID: S-1-5-18 = NT AUTHORITY\SYSTEM
         let first = resolver.resolve("S-1-5-18");
         let second = resolver.resolve("S-1-5-18");
@@ -119,14 +119,14 @@ mod tests {
 
     #[test]
     fn test_invalid_sid_returns_none() {
-        let mut resolver = SidResolver::new();
+        let resolver = SidResolver::new();
         assert!(resolver.resolve("not-a-sid").is_none());
         assert!(resolver.resolve("").is_none());
     }
 
     #[test]
     fn test_well_known_sids() {
-        let mut resolver = SidResolver::new();
+        let resolver = SidResolver::new();
 
         // S-1-5-18 = SYSTEM
         if let Some(name) = resolver.resolve("S-1-5-18") {

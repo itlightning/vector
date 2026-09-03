@@ -147,10 +147,11 @@ fn stale(at: Instant, now: Instant, refresh: Duration) -> bool {
 }
 
 impl FormatCache {
-    /// Capacity for a cache whose only caller is a test.
+    /// A cache sized like the process-global one, for a test that wants the
+    /// real capacity rather than a number that can drift away from it.
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::with_capacity(512)
+        Self::with_capacity(super::shared_cache::FORMAT_CACHE_CAPACITY)
     }
 
     pub(super) fn with_capacity(capacity: usize) -> Self {
@@ -281,11 +282,7 @@ impl FormatCache {
         }
     }
 
-    fn scalar_from_table(
-        names: &PublisherNames,
-        field: NameField,
-        value: u64,
-    ) -> Option<&str> {
+    fn scalar_from_table(names: &PublisherNames, field: NameField, value: u64) -> Option<&str> {
         match field {
             NameField::Task => names.tasks.get(&(value as u16)).map(String::as_str),
             NameField::Opcode => names.opcodes.get(&(value as u8)).map(String::as_str),

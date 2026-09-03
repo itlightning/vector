@@ -2482,7 +2482,8 @@ mod tests {
         assert_eq!(
             subscription.event_buffer.as_ptr(),
             keepable_ptr,
-            "an outsized container is dropped rather than parked, so the one              already held is what survives"
+            "an outsized container is dropped rather than parked, so the one \
+             already held is what survives"
         );
         assert_eq!(
             subscription.event_buffer.capacity(),
@@ -3653,8 +3654,9 @@ mod tests {
 
         assert_eq!(
             request_log.sizes().first().copied(),
-            Some(MIN_PER_CHANNEL_BUDGET.min(7)),
-            "a divided budget below the floor is lifted to it, capped by what              the whole pull is still allowed to take"
+            Some(7),
+            "the floor lifts a 2-per-channel share to 8, and the pull's own \
+             remaining allowance of 7 caps the first request"
         );
     }
 
