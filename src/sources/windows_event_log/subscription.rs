@@ -1,9 +1,4 @@
-use std::{
-    num::{NonZeroU32, NonZeroUsize},
-    sync::Arc,
-};
-
-use lru::LruCache;
+use std::{num::NonZeroU32, sync::Arc};
 
 use governor::{
     Quota, RateLimiter,
@@ -60,8 +55,8 @@ pub(super) static DRAIN_STEP_HOOK: std::sync::Mutex<
     Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>,
 > = std::sync::Mutex::new(None);
 
-/// Maximum number of cached publisher metadata handles.
-const PUBLISHER_CACHE_CAPACITY: usize = 256;
+/// Smallest per-channel drain budget, however many channels share a source.
+const MIN_PER_CHANNEL_BUDGET: usize = 8;
 
 /// RAII wrapper for EvtOpenPublisherMetadata handles.
 /// Calls EvtClose on drop to prevent handle leaks when evicted from LRU cache.
@@ -953,16 +948,12 @@ pub struct EventLogSubscription {
     /// cross-thread free of a ~300 KB block thousands of times over, which the
     /// allocator does not promptly return.
     event_buffer: Vec<xml_parser::WindowsEvent>,
-    /// Cached EvtOpenPublisherMetadata handles keyed by provider name.
-    /// Bounded LRU; evicted handles are closed via `PublisherHandle::drop`.
-    publisher_cache: LruCache<String, PublisherHandle>,
-    /// Cached publisher name tables keyed by `(casefolded publisher, locale)`.
-    format_cache: super::format_cache::FormatCache,
     /// Pre-registered counter for metadata cache hits.
     cache_hits_counter: Counter,
     /// Pre-registered counter for metadata cache misses.
     cache_misses_counter: Counter,
-    /// SID-to-username resolver with LRU cache.
+    /// SID-to-username resolver. The cache behind it is process-global (see
+    /// `shared_cache`); this handle carries no state of its own.
     sid_resolver: SidResolver,
     /// Reusable UTF-16 decode buffer to avoid per-event allocations.
     decode_buffer: Vec<u16>,
@@ -1220,8 +1211,6 @@ impl EventLogSubscription {
             // high-water mark after a few growths and then stays there, which
             // a quiet host never pays for.
             event_buffer: Vec::new(),
-            publisher_cache: LruCache::new(NonZeroUsize::new(PUBLISHER_CACHE_CAPACITY).unwrap()),
-            format_cache: super::format_cache::FormatCache::new(),
             cache_hits_counter: counter!(CounterName::WindowsEventLogCacheHitsTotal),
             cache_misses_counter: counter!(CounterName::WindowsEventLogCacheMissesTotal),
             sid_resolver: SidResolver::new(),
@@ -1304,12 +1293,29 @@ impl EventLogSubscription {
     /// one, which is the common case on a quiet host.
     pub fn recycle_event_buffer(&mut self, mut buffer: Vec<xml_parser::WindowsEvent>) {
         buffer.clear();
+        // A `WindowsEvent` spine is a few hundred bytes, so a container sized by
+        // one unusually large drain is worth megabytes held for the life of the
+        // process. Recycling is an optimization for the STEADY state, and past a
+        // few batches' worth this container has stopped being that: drop it and
+        // let the next pull allocate what it actually needs.
+        if buffer.capacity() > self.recycle_capacity_limit() {
+            return;
+        }
         // Keep whichever container has the larger capacity. They are the same
         // one in practice; this just makes a double-recycle harmless instead of
         // silently dropping the bigger allocation.
         if buffer.capacity() >= self.event_buffer.capacity() {
             self.event_buffer = buffer;
         }
+    }
+
+    /// The largest recycled container worth keeping between pulls.
+    ///
+    /// Four batches' worth: enough headroom that the steady state never churns
+    /// the allocation, small enough that a one-off spike cannot pin a spine that
+    /// no later pull will fill.
+    fn recycle_capacity_limit(&self) -> usize {
+        (self.config.batch_size as usize).saturating_mul(4).max(1)
     }
 
     fn pull_events_inner(
@@ -1323,7 +1329,14 @@ impl EventLogSubscription {
         let mut all_events = std::mem::take(&mut self.event_buffer);
         all_events.clear();
         let num_channels = self.channels.len().max(1);
-        let per_channel_budget = (max_events / num_channels).max(1);
+        // A floor as well as a share. With many channels on one source an even
+        // split lands at a handful of events each, which is enough throughput
+        // (a channel that exhausts its budget re-arms its own signal, so the
+        // next wait returns at once rather than after `event_timeout_ms`) but
+        // spends a syscall per handful. The floor buys back the syscalls; the
+        // rotating start keeps the split fair across pulls rather than within
+        // one.
+        let per_channel_budget = (max_events / num_channels).max(MIN_PER_CHANNEL_BUDGET);
         let start = self.round_robin_index % num_channels;
         self.round_robin_index = self.round_robin_index.wrapping_add(1);
 
@@ -1621,8 +1634,6 @@ impl EventLogSubscription {
                             // against an unreachable publisher rather than
                             // returning an error.
                             let display = metadata::resolve_event_display(
-                                &mut self.publisher_cache,
-                                &mut self.format_cache,
                                 &self.cache_hits_counter,
                                 &self.cache_misses_counter,
                                 event_handle,
@@ -2433,6 +2444,50 @@ mod tests {
             second.as_ptr(),
             seeded_ptr,
             "the same allocation must survive an arbitrary number of pull cycles"
+        );
+    }
+
+    /// A container sized by one outsized drain is dropped, not parked forever.
+    ///
+    /// Recycling is an optimization for the steady state. A `WindowsEvent` spine
+    /// is a few hundred bytes, so a container left at the high-water mark of a
+    /// one-off burst is megabytes held for the life of the process, per source,
+    /// that no later pull will ever fill.
+    #[tokio::test]
+    async fn an_outsized_batch_container_is_not_parked_between_pulls() {
+        let _seams = SeamSession::acquire();
+        let config = WindowsEventLogConfig {
+            channels: vec!["Application".to_string()],
+            event_timeout_ms: 500,
+            batch_size: 100,
+            ..Default::default()
+        };
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+        let mut subscription = EventLogSubscription::new(&config, checkpointer, false)
+            .await
+            .expect("Subscription creation should succeed");
+
+        // Four batches' worth is kept; anything past it is not.
+        let keepable: Vec<xml_parser::WindowsEvent> = Vec::with_capacity(400);
+        let keepable_ptr = keepable.as_ptr();
+        subscription.recycle_event_buffer(keepable);
+        assert_eq!(
+            subscription.event_buffer.capacity(),
+            400,
+            "a container within the limit is parked for reuse"
+        );
+
+        let outsized: Vec<xml_parser::WindowsEvent> = Vec::with_capacity(4_001);
+        subscription.recycle_event_buffer(outsized);
+        assert_eq!(
+            subscription.event_buffer.as_ptr(),
+            keepable_ptr,
+            "an outsized container is dropped rather than parked, so the one              already held is what survives"
+        );
+        assert_eq!(
+            subscription.event_buffer.capacity(),
+            400,
+            "and the parked capacity does not grow to the outsized one"
         );
     }
 
@@ -3564,12 +3619,42 @@ mod tests {
 
         let request_log = RequestLog::install(&_seams);
         let _guard = ScriptGuard::install(&_seams, &[(259, 0); 3]);
+        _ = subscription.pull_events(60);
+
+        assert_eq!(
+            request_log.sizes().first().copied(),
+            Some(20),
+            "60 events across 3 channels is 20 per channel, not 60 and not 180"
+        );
+    }
+
+    /// The share has a FLOOR as well as a divisor.
+    ///
+    /// Dividing alone lands at a couple of events each once a source carries
+    /// tens of channels, which spends one `EvtNext` per couple of events. The
+    /// floor buys those syscalls back. It costs nothing in fairness because the
+    /// starting channel rotates every call, so a budget that does not stretch to
+    /// every channel in one pull still reaches them all across pulls.
+    #[tokio::test]
+    async fn a_small_budget_spread_thin_still_asks_for_a_worthwhile_batch() {
+        let _seams = SeamSession::acquire();
+        let mut config = application_config();
+        config.channels = vec![
+            "Application".to_string(),
+            "System".to_string(),
+            "Setup".to_string(),
+        ];
+        let mut subscription = subscription_from(&config).await;
+
+        let request_log = RequestLog::install(&_seams);
+        let _guard = ScriptGuard::install(&_seams, &[(259, 0); 3]);
+        // Seven across three would divide to two.
         _ = subscription.pull_events(7);
 
         assert_eq!(
             request_log.sizes().first().copied(),
-            Some(2),
-            "7 events across 3 channels is 2 per channel, not 7 and not 21"
+            Some(MIN_PER_CHANNEL_BUDGET.min(7)),
+            "a divided budget below the floor is lifted to it, capped by what              the whole pull is still allowed to take"
         );
     }
 
