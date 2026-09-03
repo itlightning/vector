@@ -26,7 +26,10 @@
 //! one-shot and cannot poison a later lookup.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
+
+use lru::LruCache;
 
 /// Locale value passed to `EvtOpenPublisherMetadata`. Zero is the system /
 /// thread default, which is what this source uses everywhere.
@@ -118,9 +121,21 @@ pub(super) enum Prepare {
 }
 
 /// Map from `(casefolded publisher, locale)` to an enumerated name table.
-#[derive(Debug, Default)]
+///
+/// BOUNDED. A rich provider's table is hundreds of display strings, and the key
+/// space is "every publisher this host has ever emitted an event from", which
+/// grows for the life of the process. Unbounded, that shape reads as a slow leak
+/// over a long soak, which is indistinguishable from a real one on a graph.
 pub(super) struct FormatCache {
-    entries: HashMap<(String, u32), Entry>,
+    entries: LruCache<(String, u32), Entry>,
+}
+
+impl std::fmt::Debug for FormatCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormatCache")
+            .field("entries", &self.entries.len())
+            .finish()
+    }
 }
 
 fn cache_key(publisher: &str, locale: u32) -> (String, u32) {
@@ -132,8 +147,18 @@ fn stale(at: Instant, now: Instant, refresh: Duration) -> bool {
 }
 
 impl FormatCache {
+    /// Capacity for a cache whose only caller is a test.
+    #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::default()
+        Self::with_capacity(512)
+    }
+
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: LruCache::new(
+                NonZeroUsize::new(capacity).expect("format cache capacity is not zero"),
+            ),
+        }
     }
 
     /// Resident publisher entries. Test and diagnostic use only.
@@ -143,7 +168,7 @@ impl FormatCache {
     }
 
     pub(super) fn prepare(
-        &self,
+        &mut self,
         publisher: &str,
         locale: u32,
         now: Instant,
@@ -165,7 +190,7 @@ impl FormatCache {
         now: Instant,
         names: PublisherNames,
     ) {
-        self.entries.insert(
+        self.entries.put(
             cache_key(publisher, locale),
             Entry::Ready {
                 names,
@@ -176,24 +201,30 @@ impl FormatCache {
 
     pub(super) fn store_unopenable(&mut self, publisher: &str, locale: u32, now: Instant) {
         self.entries
-            .insert(cache_key(publisher, locale), Entry::Unopenable { at: now });
+            .put(cache_key(publisher, locale), Entry::Unopenable { at: now });
     }
 
+    /// One scalar display name, OWNED.
+    ///
+    /// Owned rather than borrowed because the only caller reads this through a
+    /// process-global lock, and a borrow cannot outlive the guard.
     pub(super) fn get_scalar(
-        &self,
+        &mut self,
         publisher: &str,
         locale: u32,
         field: NameField,
         value: u64,
-    ) -> Option<&str> {
+    ) -> Option<String> {
         match self.entries.get(&cache_key(publisher, locale)) {
-            Some(Entry::Ready { names, .. }) => Self::scalar_from_table(names, field, value),
+            Some(Entry::Ready { names, .. }) => {
+                Self::scalar_from_table(names, field, value).map(str::to_owned)
+            }
             _ => None,
         }
     }
 
     pub(super) fn get_keywords(
-        &self,
+        &mut self,
         publisher: &str,
         locale: u32,
         mask: u64,
@@ -234,7 +265,7 @@ impl FormatCache {
 
         match enumerate() {
             Some(names) => {
-                self.entries.insert(
+                self.entries.put(
                     key.clone(),
                     Entry::Ready {
                         names,
@@ -244,18 +275,17 @@ impl FormatCache {
                 true
             }
             None => {
-                self.entries
-                    .insert(key.clone(), Entry::Unopenable { at: now });
+                self.entries.put(key.clone(), Entry::Unopenable { at: now });
                 false
             }
         }
     }
 
-    fn scalar_from_table<'a>(
-        names: &'a PublisherNames,
+    fn scalar_from_table(
+        names: &PublisherNames,
         field: NameField,
         value: u64,
-    ) -> Option<&'a str> {
+    ) -> Option<&str> {
         match field {
             NameField::Task => names.tasks.get(&(value as u16)).map(String::as_str),
             NameField::Opcode => names.opcodes.get(&(value as u8)).map(String::as_str),

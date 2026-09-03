@@ -1,28 +1,25 @@
 use std::mem::size_of;
 use std::time::{Duration, Instant};
 
-use lru::LruCache;
 use metrics::Counter;
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EVT_PUBLISHER_METADATA_PROPERTY_ID, EVT_VARIANT, EvtClose, EvtFormatMessage,
     EvtFormatMessageEvent, EvtFormatMessageId, EvtFormatMessageKeyword, EvtFormatMessageOpcode,
     EvtFormatMessageTask, EvtGetObjectArrayProperty, EvtGetObjectArraySize,
-    EvtGetPublisherMetadataProperty, EvtOpenPublisherMetadata,
-    EvtPublisherMetadataKeywordMessageID, EvtPublisherMetadataKeywordName,
-    EvtPublisherMetadataKeywordValue, EvtPublisherMetadataKeywords,
-    EvtPublisherMetadataLevelMessageID, EvtPublisherMetadataLevelName,
-    EvtPublisherMetadataLevelValue, EvtPublisherMetadataLevels,
+    EvtGetPublisherMetadataProperty, EvtPublisherMetadataKeywordMessageID,
+    EvtPublisherMetadataKeywordName, EvtPublisherMetadataKeywordValue,
+    EvtPublisherMetadataKeywords, EvtPublisherMetadataLevelMessageID,
+    EvtPublisherMetadataLevelName, EvtPublisherMetadataLevelValue, EvtPublisherMetadataLevels,
     EvtPublisherMetadataOpcodeMessageID, EvtPublisherMetadataOpcodeName,
     EvtPublisherMetadataOpcodeValue, EvtPublisherMetadataOpcodes,
     EvtPublisherMetadataTaskMessageID, EvtPublisherMetadataTaskName, EvtPublisherMetadataTaskValue,
     EvtPublisherMetadataTasks, EvtVarTypeEvtHandle, EvtVarTypeString, EvtVarTypeUInt32,
     EvtVarTypeUInt64,
 };
-use windows::core::HSTRING;
 
-use super::format_cache::{FormatCache, NameField, PublisherNames, SYSTEM_DEFAULT_LOCALE};
+use super::format_cache::{NameField, PublisherNames, SYSTEM_DEFAULT_LOCALE};
 use super::rendering_info;
-use super::subscription::PublisherHandle;
+use super::shared_cache;
 use super::win32_errors::{RenderDisposition, classify_render, win32_code};
 use super::xml_parser::{SystemFields, fallback_level_name};
 
@@ -118,8 +115,6 @@ pub(super) struct EventDisplay {
 // precedent for wide internal helpers.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_event_display(
-    publisher_cache: &mut LruCache<String, PublisherHandle>,
-    format_cache: &mut FormatCache,
     cache_hits_counter: &Counter,
     cache_misses_counter: &Counter,
     event_handle: EVT_HANDLE,
@@ -149,8 +144,6 @@ pub(super) fn resolve_event_display(
     note_publisher_path_entry();
 
     let resolved = resolve_event_metadata(
-        publisher_cache,
-        format_cache,
         cache_hits_counter,
         cache_misses_counter,
         event_handle,
@@ -164,7 +157,7 @@ pub(super) fn resolve_event_display(
     );
 
     let rendered_message = if render_message {
-        format_event_message(publisher_cache, event_handle, provider_name)
+        format_event_message(event_handle, provider_name)
     } else {
         None
     };
@@ -205,8 +198,6 @@ struct ResolvedNames {
 /// Resolves task, opcode, keyword, and level names from the publisher table.
 #[allow(clippy::too_many_arguments)]
 fn resolve_event_metadata(
-    publisher_cache: &mut LruCache<String, PublisherHandle>,
-    format_cache: &mut FormatCache,
     cache_hits_counter: &Counter,
     cache_misses_counter: &Counter,
     event_handle: EVT_HANDLE,
@@ -220,7 +211,14 @@ fn resolve_event_metadata(
 ) -> ResolvedNames {
     use super::format_cache::Prepare;
 
-    match format_cache.prepare(provider_name, SYSTEM_DEFAULT_LOCALE, now, refresh) {
+    // The publisher's shared entry, taken once. The map lock is released inside
+    // this call; the ENTRY lock below is what serializes every wevtapi call made
+    // against this publisher's handle, and it is the only entry lock this
+    // function ever holds.
+    let entry = shared_cache::publisher_entry(provider_name);
+    let mut publisher = entry.lock();
+
+    match shared_cache::format_prepare(provider_name, SYSTEM_DEFAULT_LOCALE, now, refresh) {
         Prepare::Unopenable => {
             return ResolvedNames {
                 task_name: None,
@@ -231,9 +229,9 @@ fn resolve_event_metadata(
             };
         }
         Prepare::NeedEnumerate => {
-            let raw = get_or_open_publisher(publisher_cache, provider_name, true);
+            let raw = publisher.raw(provider_name, true);
             if raw == 0 {
-                format_cache.store_unopenable(provider_name, SYSTEM_DEFAULT_LOCALE, now);
+                shared_cache::format_store_unopenable(provider_name, SYSTEM_DEFAULT_LOCALE, now);
                 return ResolvedNames {
                     task_name: None,
                     opcode_name: None,
@@ -242,7 +240,7 @@ fn resolve_event_metadata(
                     table_misses: 0,
                 };
             }
-            format_cache.store_table(
+            shared_cache::format_store_table(
                 provider_name,
                 SYSTEM_DEFAULT_LOCALE,
                 now,
@@ -252,9 +250,9 @@ fn resolve_event_metadata(
         Prepare::Ready => {}
     }
 
-    let metadata = publisher_handle(publisher_cache, provider_name);
+    let metadata = publisher.opened();
 
-    let (task_name, task_miss) = match format_cache.get_scalar(
+    let (task_name, task_miss) = match shared_cache::format_scalar(
         provider_name,
         SYSTEM_DEFAULT_LOCALE,
         NameField::Task,
@@ -262,7 +260,7 @@ fn resolve_event_metadata(
     ) {
         Some(name) => {
             cache_hits_counter.increment(1);
-            (Some(name.to_string()), false)
+            (Some(name), false)
         }
         None => {
             cache_misses_counter.increment(1);
@@ -273,7 +271,7 @@ fn resolve_event_metadata(
         }
     };
 
-    let (opcode_name, opcode_miss) = match format_cache.get_scalar(
+    let (opcode_name, opcode_miss) = match shared_cache::format_scalar(
         provider_name,
         SYSTEM_DEFAULT_LOCALE,
         NameField::Opcode,
@@ -281,7 +279,7 @@ fn resolve_event_metadata(
     ) {
         Some(name) => {
             cache_hits_counter.increment(1);
-            (Some(name.to_string()), false)
+            (Some(name), false)
         }
         None => {
             cache_misses_counter.increment(1);
@@ -293,7 +291,7 @@ fn resolve_event_metadata(
     };
 
     let (keyword_names, keyword_miss) =
-        match format_cache.get_keywords(provider_name, SYSTEM_DEFAULT_LOCALE, keywords) {
+        match shared_cache::format_keywords(provider_name, SYSTEM_DEFAULT_LOCALE, keywords) {
             Some(names) if !names.is_empty() || keywords == 0 => {
                 cache_hits_counter.increment(1);
                 (names, false)
@@ -313,7 +311,7 @@ fn resolve_event_metadata(
             }
         };
 
-    let (level_name, level_miss) = match format_cache.get_scalar(
+    let (level_name, level_miss) = match shared_cache::format_scalar(
         provider_name,
         SYSTEM_DEFAULT_LOCALE,
         NameField::Level,
@@ -321,7 +319,7 @@ fn resolve_event_metadata(
     ) {
         Some(name) => {
             cache_hits_counter.increment(1);
-            (Some(name.to_string()), false)
+            (Some(name), false)
         }
         None => {
             // Levels 0-5 live in winmeta and are often absent from the
@@ -357,39 +355,6 @@ fn resolve_event_metadata(
         level_name,
         table_misses,
     }
-}
-
-fn publisher_handle(
-    cache: &mut LruCache<String, PublisherHandle>,
-    provider_name: &str,
-) -> EVT_HANDLE {
-    EVT_HANDLE(get_or_open_publisher(cache, provider_name, false))
-}
-
-fn get_or_open_publisher(
-    cache: &mut LruCache<String, PublisherHandle>,
-    provider_name: &str,
-    retry_failed: bool,
-) -> isize {
-    if let Some(handle) = cache.get(provider_name) {
-        if handle.0 != 0 || !retry_failed {
-            return handle.0;
-        }
-        cache.pop(provider_name);
-    }
-
-    let provider_hstring = HSTRING::from(provider_name);
-    // Locale 0 is the thread/system default, matching prior behavior and the
-    // locked product choice: forwarded events keep origin `<Locale>` in XML
-    // and we ignore it.
-    let raw = unsafe {
-        EvtOpenPublisherMetadata(None, &provider_hstring, None, SYSTEM_DEFAULT_LOCALE, 0)
-            .map(|h| h.0)
-            .unwrap_or(0)
-    };
-
-    cache.put(provider_name.to_string(), PublisherHandle(raw));
-    raw
 }
 
 /// Walk the publisher's task / opcode / keyword / level tables.
@@ -674,12 +639,14 @@ fn format_message(
 }
 
 /// Renders a human-readable event message using the Windows EvtFormatMessage API.
-pub fn format_event_message(
-    publisher_cache: &mut LruCache<String, PublisherHandle>,
-    event_handle: EVT_HANDLE,
-    provider_name: &str,
-) -> Option<String> {
-    let raw_handle = get_or_open_publisher(publisher_cache, provider_name, false);
+///
+/// Takes the shared publisher entry's lock for the duration: `EvtFormatMessage`
+/// runs against a metadata handle, and a handle is not documented as safe for
+/// concurrent use. This is an entry lock, and it is the only one held here.
+pub fn format_event_message(event_handle: EVT_HANDLE, provider_name: &str) -> Option<String> {
+    let entry = shared_cache::publisher_entry(provider_name);
+    let mut publisher = entry.lock();
+    let raw_handle = publisher.raw(provider_name, false);
 
     if raw_handle == 0 {
         return None;
@@ -734,7 +701,6 @@ pub fn format_event_message(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -742,11 +708,6 @@ mod tests {
 
     const FORWARDED_FIXTURE: &str = include_str!("testdata/forwarded_rendering_info.xml");
     const LOCAL_FIXTURE: &str = include_str!("testdata/local_no_rendering_info.xml");
-
-    fn empty_caches() -> (LruCache<String, PublisherHandle>, FormatCache) {
-        let size = NonZeroUsize::new(8).expect("nonzero");
-        (LruCache::new(size), FormatCache::new())
-    }
 
     /// MERGE GATE for the `<RenderingInfo>` crash guard.
     ///
@@ -765,7 +726,6 @@ mod tests {
         // that test and hands these counters over reset.
         let seams = super::super::test_seams::SeamSession::acquire();
 
-        let (mut publisher_cache, mut format_cache) = empty_caches();
         // Inert doubles. These are required arguments that this test never
         // reads, so a registered counter would only add a global side effect.
         let hits = Counter::noop();
@@ -778,8 +738,6 @@ mod tests {
         );
 
         let display = resolve_event_display(
-            &mut publisher_cache,
-            &mut format_cache,
             &hits,
             &misses,
             EVT_HANDLE(0),
@@ -833,7 +791,6 @@ mod tests {
     fn rendering_info_respects_render_message_disabled() {
         let seams = super::super::test_seams::SeamSession::acquire();
 
-        let (mut publisher_cache, mut format_cache) = empty_caches();
         // Inert doubles. These are required arguments that this test never
         // reads, so a registered counter would only add a global side effect.
         let hits = Counter::noop();
@@ -841,8 +798,6 @@ mod tests {
         let system_fields = parse_system_section(FORWARDED_FIXTURE);
 
         let display = resolve_event_display(
-            &mut publisher_cache,
-            &mut format_cache,
             &hits,
             &misses,
             EVT_HANDLE(0),

@@ -24,6 +24,9 @@ cfg_if::cfg_if! {
         mod recovery;
         mod render;
         mod rendering_info;
+        /// Process-global bounded caches for publisher metadata, name tables
+        /// and SIDs, with the lock discipline that keeps them safe to share.
+        mod shared_cache;
         mod sid_resolver;
         mod subscription;
         /// Invariants of the pure decision layer over randomly generated

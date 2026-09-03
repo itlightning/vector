@@ -116,6 +116,7 @@ pub(super) fn render_event_xml(
                 render_buffer.resize(SHRINK_THRESHOLD, 0);
                 render_buffer.shrink_to_fit();
             }
+            shrink_decode_buffer(decode_buffer);
 
             return Ok(rewrite_xml(result));
         }
@@ -131,8 +132,27 @@ pub(super) fn render_event_xml(
         render_buffer.resize(SHRINK_THRESHOLD, 0);
         render_buffer.shrink_to_fit();
     }
+    shrink_decode_buffer(decode_buffer);
 
     Ok(rewrite_xml(result))
+}
+
+/// Decoded UTF-16 scratch, in `u16` elements, at rest and at its shrink point.
+///
+/// The decode buffer only ever grows: it is resized to whatever the largest
+/// event needed and never handed back. One 2 MB event therefore pins 4 MB of
+/// scratch per source for the life of the process. The threshold is four times
+/// the render buffer's, because this buffer holds the same event decoded rather
+/// than a separate working set, and the reset size matches its initial one.
+const DECODE_BUFFER_AT_REST: usize = 8 * 1024;
+const DECODE_SHRINK_THRESHOLD: usize = 128 * 1024;
+
+/// Return the decode scratch to its resting size after an outsized event.
+fn shrink_decode_buffer(decode_buffer: &mut Vec<u16>) {
+    if decode_buffer.len() > DECODE_SHRINK_THRESHOLD {
+        decode_buffer.resize(DECODE_BUFFER_AT_REST, 0);
+        decode_buffer.shrink_to_fit();
+    }
 }
 
 /// Update the channel record count gauge using EvtGetLogInfo.
