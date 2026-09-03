@@ -25,16 +25,23 @@
 //!
 //! Two lock levels, and the order between them is the whole safety argument:
 //!
-//! 1. **The map lock** (an `RwLock` per cache) is held ONLY to look an entry up
+//! 1. **The map lock** (a `Mutex` per cache) is held ONLY to look an entry up
 //!    or insert one. It is never held across a wevtapi call, and never held
 //!    while another lock is taken. Callers clone the entry's `Arc` out and drop
 //!    the guard before doing any work with it.
+//!
+//!    A `Mutex` and not an `RwLock` because there is no shared-read path to
+//!    have: `LruCache::get` reorders for recency, so it needs `&mut` even to
+//!    answer a hit, and every accessor here would take the write side anyway.
+//!    An `RwLock` would advertise a concurrency this cache cannot deliver.
 //! 2. **The entry lock** (a `Mutex` on the publisher entry) is held across the
 //!    wevtapi calls that use that publisher's handle, because a metadata handle
 //!    is not documented as safe for concurrent use.
 //!
-//! **No caller ever holds two entry locks at once.** Only the publisher cache
-//! has an entry lock at all. The format and SID caches need none, because no
+//! **No caller holds two entry locks at once**, and in debug builds that is
+//! checked rather than asserted in prose: [`enter_entry_lock`] keeps a
+//! per-thread depth and panics on the second. Only the publisher cache has an
+//! entry lock at all. The format and SID caches need none, because no
 //! wevtapi call happens under their map locks: the caller asks the format cache
 //! what to do, RELEASES, enumerates under the publisher entry lock, then comes
 //! back to store the result.
@@ -57,7 +64,7 @@
 //! That is a correctness property, not a memory one.
 
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use lru::LruCache;
 use windows::Win32::System::EventLog::{EVT_HANDLE, EvtOpenPublisherMetadata};
@@ -78,7 +85,7 @@ const PUBLISHER_CACHE_CAPACITY: usize = 128;
 ///
 /// A rich provider's table is hundreds of strings, and this is the cache that
 /// used to have no bound at all.
-const FORMAT_CACHE_CAPACITY: usize = 512;
+pub(super) const FORMAT_CACHE_CAPACITY: usize = 512;
 
 /// Resolved SID-to-account names, process-wide.
 ///
@@ -108,15 +115,51 @@ impl PublisherEntry {
     /// every call that names this publisher and drop it before touching any
     /// other entry.
     pub(super) fn lock(&self) -> PublisherGuard<'_> {
+        enter_entry_lock();
         PublisherGuard {
             handle: self.handle.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
 }
 
+// How many entry locks this thread is holding.
+//
+// Debug builds only, and it exists to make the one-entry-lock rule a CHECK
+// rather than a claim in a header: nesting two of them is the shape that could
+// deadlock against a second thread taking them the other way round, and it is
+// exactly the mistake a later edit would make silently.
+#[cfg(debug_assertions)]
+thread_local! {
+    static ENTRY_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn enter_entry_lock() {
+    #[cfg(debug_assertions)]
+    ENTRY_LOCK_DEPTH.with(|depth| {
+        assert_eq!(
+            depth.get(),
+            0,
+            "a second publisher entry lock was taken while one was already held; \
+             two entry locks at once is the one ordering that can deadlock here"
+        );
+        depth.set(1);
+    });
+}
+
+fn leave_entry_lock() {
+    #[cfg(debug_assertions)]
+    ENTRY_LOCK_DEPTH.with(|depth| depth.set(0));
+}
+
 /// Exclusive use of one publisher's metadata handle.
 pub(super) struct PublisherGuard<'a> {
     handle: MutexGuard<'a, Option<PublisherHandle>>,
+}
+
+impl Drop for PublisherGuard<'_> {
+    fn drop(&mut self) {
+        leave_entry_lock();
+    }
 }
 
 impl PublisherGuard<'_> {
@@ -151,10 +194,10 @@ impl PublisherGuard<'_> {
     }
 }
 
-fn publisher_cache() -> &'static RwLock<LruCache<String, Arc<PublisherEntry>>> {
-    static CACHE: OnceLock<RwLock<LruCache<String, Arc<PublisherEntry>>>> = OnceLock::new();
+fn publisher_cache() -> &'static Mutex<LruCache<String, Arc<PublisherEntry>>> {
+    static CACHE: OnceLock<Mutex<LruCache<String, Arc<PublisherEntry>>>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        RwLock::new(LruCache::new(
+        Mutex::new(LruCache::new(
             NonZeroUsize::new(PUBLISHER_CACHE_CAPACITY).expect("capacity is not zero"),
         ))
     })
@@ -165,7 +208,7 @@ fn publisher_cache() -> &'static RwLock<LruCache<String, Arc<PublisherEntry>>> {
 /// The map lock is released before this returns, so the caller does its wevtapi
 /// work under the entry lock alone.
 pub(super) fn publisher_entry(provider_name: &str) -> Arc<PublisherEntry> {
-    let mut map = publisher_cache().write().unwrap_or_else(|e| e.into_inner());
+    let mut map = publisher_cache().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get(provider_name) {
         return Arc::clone(existing);
     }
@@ -181,9 +224,9 @@ pub(super) fn publisher_entry(provider_name: &str) -> Arc<PublisherEntry> {
 /// releases, enumerates under the PUBLISHER entry lock, and comes back to store.
 /// Every method below is a short map-only critical section, which is exactly the
 /// discipline the shared caches were ruled to keep.
-fn format_cache() -> &'static RwLock<FormatCache> {
-    static CACHE: OnceLock<RwLock<FormatCache>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(FormatCache::with_capacity(FORMAT_CACHE_CAPACITY)))
+fn format_cache() -> &'static Mutex<FormatCache> {
+    static CACHE: OnceLock<Mutex<FormatCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(FormatCache::with_capacity(FORMAT_CACHE_CAPACITY)))
 }
 
 /// What the caller must do before looking this publisher's names up.
@@ -194,7 +237,7 @@ pub(super) fn format_prepare(
     refresh: std::time::Duration,
 ) -> Prepare {
     format_cache()
-        .write()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .prepare(publisher, locale, now, refresh)
 }
@@ -207,7 +250,7 @@ pub(super) fn format_store_table(
     names: PublisherNames,
 ) {
     format_cache()
-        .write()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .store_table(publisher, locale, now, names);
 }
@@ -215,7 +258,7 @@ pub(super) fn format_store_table(
 /// Record that this publisher has no readable metadata.
 pub(super) fn format_store_unopenable(publisher: &str, locale: u32, now: std::time::Instant) {
     format_cache()
-        .write()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .store_unopenable(publisher, locale, now);
 }
@@ -228,7 +271,7 @@ pub(super) fn format_scalar(
     value: u64,
 ) -> Option<String> {
     format_cache()
-        .write()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_scalar(publisher, locale, field, value)
 }
@@ -236,15 +279,15 @@ pub(super) fn format_scalar(
 /// The keyword names for a mask.
 pub(super) fn format_keywords(publisher: &str, locale: u32, mask: u64) -> Option<Vec<String>> {
     format_cache()
-        .write()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_keywords(publisher, locale, mask)
 }
 
-fn sid_cache() -> &'static RwLock<LruCache<String, Option<String>>> {
-    static CACHE: OnceLock<RwLock<LruCache<String, Option<String>>>> = OnceLock::new();
+fn sid_cache() -> &'static Mutex<LruCache<String, Option<String>>> {
+    static CACHE: OnceLock<Mutex<LruCache<String, Option<String>>>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        RwLock::new(LruCache::new(
+        Mutex::new(LruCache::new(
             NonZeroUsize::new(SID_CACHE_CAPACITY).expect("capacity is not zero"),
         ))
     })
@@ -256,13 +299,13 @@ fn sid_cache() -> &'static RwLock<LruCache<String, Option<String>>> {
 /// that does not resolve is remembered as unresolvable rather than re-queried on
 /// every event carrying it.
 pub(super) fn sid_lookup(sid: &str) -> Option<Option<String>> {
-    let mut map = sid_cache().write().unwrap_or_else(|e| e.into_inner());
+    let mut map = sid_cache().lock().unwrap_or_else(|e| e.into_inner());
     map.get(sid).cloned()
 }
 
 /// Remember the outcome of resolving `sid`.
 pub(super) fn sid_store(sid: &str, name: Option<String>) {
-    let mut map = sid_cache().write().unwrap_or_else(|e| e.into_inner());
+    let mut map = sid_cache().lock().unwrap_or_else(|e| e.into_inner());
     map.put(sid.to_string(), name);
 }
 
@@ -270,7 +313,7 @@ pub(super) fn sid_store(sid: &str, name: Option<String>) {
 #[cfg(test)]
 pub(super) fn publisher_len() -> usize {
     publisher_cache()
-        .read()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .len()
 }
@@ -279,7 +322,7 @@ pub(super) fn publisher_len() -> usize {
 #[cfg(test)]
 pub(super) fn format_len() -> usize {
     format_cache()
-        .read()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .len()
 }
@@ -289,13 +332,13 @@ pub(super) fn format_len() -> usize {
 #[cfg(test)]
 pub(super) fn clear_all() {
     publisher_cache()
-        .write()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    *format_cache().write().unwrap_or_else(|e| e.into_inner()) =
+    *format_cache().lock().unwrap_or_else(|e| e.into_inner()) =
         FormatCache::with_capacity(FORMAT_CACHE_CAPACITY);
     sid_cache()
-        .write()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
 }
@@ -445,6 +488,27 @@ mod tests {
         for handle in handles {
             handle.join().expect("formatter thread panicked");
         }
+    }
+
+    /// The one-entry-lock rule is CHECKED, not just written down.
+    ///
+    /// Without this the debug assertion could be deleted, or never fire because
+    /// the depth was tracked wrongly, and the header would still claim the
+    /// property. Debug-only because that is where the counter lives; a release
+    /// build pays nothing for it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "two entry locks at once")]
+    fn holding_two_entry_locks_trips_the_debug_check() {
+        let _seams = SeamSession::acquire();
+        clear_all();
+
+        let first = publisher_entry("Provider-A");
+        let second = publisher_entry("Provider-B");
+        let _held = first.lock();
+        // Nesting a second entry lock is the one ordering that could deadlock
+        // against a thread taking them the other way round.
+        let _nested = second.lock();
     }
 
     /// An entry evicted while a caller holds it stays valid for that caller.

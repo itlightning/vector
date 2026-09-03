@@ -137,13 +137,18 @@ pub(super) fn render_event_xml(
     Ok(rewrite_xml(result))
 }
 
-/// Decoded UTF-16 scratch, in `u16` elements, at rest and at its shrink point.
+/// Decoded UTF-16 scratch: its resting size, and the size past which an outsized
+/// event has to give the memory back.
 ///
-/// The decode buffer only ever grows: it is resized to whatever the largest
-/// event needed and never handed back. One 2 MB event therefore pins 4 MB of
-/// scratch per source for the life of the process. The threshold is four times
-/// the render buffer's, because this buffer holds the same event decoded rather
-/// than a separate working set, and the reset size matches its initial one.
+/// The buffer only ever grows. It is resized to whatever the largest event so
+/// far needed and never handed back, so one 2 MB event pins 4 MB of scratch per
+/// source for the life of the process. That is the cost being removed.
+///
+/// Both numbers are RULED, not derived: rest at 16 KiB, shrink above 256 KiB.
+/// They are written in `u16` elements because that is what this buffer holds, so
+/// 8 K elements is the 16 KiB rest and 128 K elements is the 256 KiB ceiling.
+/// The ratio to the render buffer's own 64 KiB threshold is a consequence of
+/// those two numbers, not a reason for them.
 const DECODE_BUFFER_AT_REST: usize = 8 * 1024;
 const DECODE_SHRINK_THRESHOLD: usize = 128 * 1024;
 
