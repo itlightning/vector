@@ -231,14 +231,16 @@ fn validate_no_environment_reports_condition_errors() {
 
 #[test]
 fn validate_reports_the_same_vrl_diagnostic_with_and_without_no_environment() {
+    // Single quoted so a Windows data directory is not read as escape sequences: a
+    // double quoted YAML scalar would turn the backslashes into an unparseable config,
+    // and this test grades the diagnostic, not the exit code a load failure also returns.
     const CONFIG: &str = indoc! {r#"
-        data_dir: "${VECTOR_DATA_DIR}"
+        data_dir: '${VECTOR_DATA_DIR}'
 
         sources:
           in:
-            type: demo_logs
-            format: shuffle
-            lines: ["log"]
+            type: file
+            include: ['${VECTOR_DATA_DIR}/absent.log']
 
         transforms:
           broken:
