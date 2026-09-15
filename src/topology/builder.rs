@@ -563,22 +563,26 @@ impl<'a> Builder<'a> {
             // We may not have any definitions if all the inputs are from metrics sources.
             .unwrap_or_else(Definition::any);
 
+        // The outputs a transform declares for these inputs. Resolving them can be as expensive as
+        // compiling a VRL program, and the node built below needs the same list, so it is computed
+        // once here and handed on. The only context fields any `outputs` implementation reads are
+        // the three set here.
+        let outputs = transform.inner.outputs(
+            &TransformContext {
+                enrichment_tables: enrichment_tables.clone(),
+                metrics_storage: METRICS_STORAGE.clone(),
+                schema: self.config.schema,
+                ..Default::default()
+            },
+            &input_definitions,
+        );
+
         // Create a map of the outputs to the list of possible definitions from those outputs.
-        let schema_definitions = transform
-            .inner
-            .outputs(
-                &TransformContext {
-                    enrichment_tables: enrichment_tables.clone(),
-                    metrics_storage: METRICS_STORAGE.clone(),
-                    schema: self.config.schema,
-                    ..Default::default()
-                },
-                &input_definitions,
-            )
-            .into_iter()
+        let schema_definitions = outputs
+            .iter()
             .map(|output| {
                 let definitions = output.schema_definitions(self.config.schema.enabled);
-                (output.port, definitions)
+                (output.port.clone(), definitions)
             })
             .collect::<HashMap<_, _>>();
 
@@ -607,7 +611,7 @@ impl<'a> Builder<'a> {
             },
         };
 
-        let node = TransformNode::from_parts(key.clone(), &context, transform, &input_definitions);
+        let node = TransformNode::from_parts(key.clone(), &context, transform, outputs);
 
         let transform = match transform
             .inner
@@ -1268,18 +1272,20 @@ struct TransformNode {
 }
 
 impl TransformNode {
+    /// `outputs` is the transform's declared outputs for the inputs it is being built against;
+    /// the caller has already resolved them and they are not recomputed here.
     pub fn from_parts(
         key: ComponentKey,
         context: &TransformContext,
         transform: &TransformOuter<OutputId>,
-        schema_definition: &[(OutputId, Definition)],
+        outputs: Vec<TransformOutput>,
     ) -> Self {
         Self {
             key,
             typetag: transform.inner.get_component_name(),
             inputs: transform.inputs.clone(),
             input_details: transform.inner.input(),
-            outputs: transform.inner.outputs(context, schema_definition),
+            outputs,
             enable_concurrency: transform.inner.enable_concurrency(),
             cpu_ns: context.cpu_ns.clone(),
         }
@@ -1430,5 +1436,37 @@ impl Runner {
         }
 
         Ok(TaskOutput::Transform)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vector_lib::config::DataType;
+
+    use super::*;
+    use crate::test_util::mock::transforms::BasicTransformConfig;
+
+    #[test]
+    fn transform_node_keeps_the_outputs_it_is_given() {
+        // The caller resolves a transform's outputs once and hands them over. A node that resolved
+        // them again would replace this list with what the transform computes, which for this
+        // transform is one unported output carrying the definitions it was built against.
+        let transform = TransformOuter::new(
+            vec![OutputId::from("in")],
+            BasicTransformConfig::new("suffix".to_string(), 1.0),
+        );
+        let resolved = vec![
+            TransformOutput::new(DataType::all_bits(), HashMap::new()).with_port("first"),
+            TransformOutput::new(DataType::all_bits(), HashMap::new()).with_port("second"),
+        ];
+
+        let node = TransformNode::from_parts(
+            ComponentKey::from("transform"),
+            &TransformContext::default(),
+            &transform,
+            resolved.clone(),
+        );
+
+        assert_eq!(resolved, node.outputs);
     }
 }
