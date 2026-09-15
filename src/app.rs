@@ -69,8 +69,7 @@ impl ApplicationConfig {
     ) -> Result<Self, ExitCode> {
         let config_paths = opts.config_paths_with_formats();
 
-        let graceful_shutdown_duration = (!opts.no_graceful_shutdown_limit)
-            .then(|| Duration::from_secs(u64::from(opts.graceful_shutdown_limit_secs)));
+        let graceful_shutdown_duration = opts.graceful_shutdown_duration();
 
         let watcher_conf = if opts.watch_config {
             Some(watcher_config(

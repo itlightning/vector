@@ -3,6 +3,7 @@
 use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
+    time::Duration,
 };
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
@@ -307,6 +308,13 @@ pub struct RootOpts {
 }
 
 impl RootOpts {
+    /// How long graceful shutdown may take before Vector forces it, or `None` when the limit
+    /// is disabled and shutdown may take as long as it takes.
+    pub fn graceful_shutdown_duration(&self) -> Option<Duration> {
+        (!self.no_graceful_shutdown_limit)
+            .then(|| Duration::from_secs(u64::from(self.graceful_shutdown_limit_secs)))
+    }
+
     /// Return a list of config paths with the associated formats.
     pub fn config_paths_with_formats(&self) -> Vec<config::ConfigPath> {
         config::merge_path_lists(vec![
