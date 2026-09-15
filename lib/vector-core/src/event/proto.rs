@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock},
+};
 
 use chrono::TimeZone;
 use ordered_float::NotNan;
@@ -689,6 +692,7 @@ impl From<Metadata> for EventMetadata {
                 secrets: secrets.unwrap_or_default(),
                 finalizers: EventFinalizers::default(),
                 source_id,
+                source_id_value: OnceLock::new(),
                 source_type: source_type.map(Into::into),
                 upstream_id,
                 schema_definition: default_schema_definition(),
