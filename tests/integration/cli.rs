@@ -230,6 +230,56 @@ fn validate_no_environment_reports_condition_errors() {
 }
 
 #[test]
+fn validate_reports_the_same_vrl_diagnostic_with_and_without_no_environment() {
+    const CONFIG: &str = indoc! {r#"
+        data_dir: "${VECTOR_DATA_DIR}"
+
+        sources:
+          in:
+            type: demo_logs
+            format: shuffle
+            lines: ["log"]
+
+        transforms:
+          broken:
+            inputs: ["in"]
+            type: remap
+            source: ".foo = to_int(.bar)"
+
+        sinks:
+          out:
+            inputs: ["broken"]
+            type: blackhole
+    "#};
+
+    // A program is compiled by the transform phase under `--no-environment` and by the component
+    // phase otherwise. Only one of the two runs, and both report the same diagnostic; the section
+    // heading above it differs.
+    let without = validate_output_with_args(CONFIG, &["--no-environment"]);
+    let with = validate_output_with_args(CONFIG, &[]);
+
+    assert_eq!(Some(exitcode::CONFIG), without.status.code());
+    assert_eq!(Some(exitcode::CONFIG), with.status.code());
+
+    let without = String::from_utf8(without.stdout).unwrap();
+    let with = String::from_utf8(with.stdout).unwrap();
+
+    let diagnostics = |output: &str| {
+        output
+            .lines()
+            .filter(|line| line.contains("error[") || line.contains(r#"Transform "broken""#))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    assert!(
+        !diagnostics(&without).is_empty(),
+        "no diagnostic reported: {without}"
+    );
+    assert_eq!(diagnostics(&without), diagnostics(&with));
+}
+
+#[test]
 fn validate_no_environment_skips_aws_ec2_metadata_environment_check() {
     assert_eq!(
         validate_with_args(
