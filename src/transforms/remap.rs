@@ -49,6 +49,12 @@ use crate::{
 
 const DROPPED: &str = "dropped";
 
+/// Name of the VRL function that attaches a semantic meaning to a path
+/// (`vector_vrl_functions::set_semantic_meaning`). Program text is searched for it to decide
+/// whether a compilation can tell us anything we would keep. A match in a comment or a string only
+/// costs a compilation that would have happened anyway.
+const SET_SEMANTIC_MEANING: &str = "set_semantic_meaning";
+
 /// Everything a compiled program depends on, so two compilations sharing a key produce the same
 /// program: the two context values the compiler can store inside the program (the enrichment table
 /// registry and the metrics storage), the initial type state (derived from the merged schema
@@ -236,15 +242,13 @@ pub struct RemapConfig {
 }
 
 impl RemapConfig {
-    fn compile_vrl_program(
-        &self,
-        enrichment_tables: TableRegistry,
-        metrics_storage: MetricsStorage,
-        merged_schema_definition: schema::Definition,
-    ) -> Result<CacheValue> {
-        let source = match (&self.source, &self.file, &self.files) {
-            (Some(source), None, None) => source.to_owned(),
-            (None, Some(path), None) => Self::read_file(path)?,
+    /// The program text, read from `source`, `file` or `files`.
+    ///
+    /// Exactly one of the three must be set; anything else is a configuration error.
+    fn program_source(&self) -> Result<String> {
+        match (&self.source, &self.file, &self.files) {
+            (Some(source), None, None) => Ok(source.to_owned()),
+            (None, Some(path), None) => Self::read_file(path),
             (None, None, Some(paths)) => {
                 let mut combined_source = String::new();
                 for path in paths {
@@ -252,10 +256,19 @@ impl RemapConfig {
                     combined_source.push_str(&content);
                     combined_source.push('\n');
                 }
-                combined_source
+                Ok(combined_source)
             }
-            _ => return Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
-        };
+            _ => Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
+        }
+    }
+
+    fn compile_vrl_program(
+        &self,
+        enrichment_tables: TableRegistry,
+        metrics_storage: MetricsStorage,
+        merged_schema_definition: schema::Definition,
+    ) -> Result<CacheValue> {
+        let source = self.program_source()?;
 
         // Reading `file`/`files` happens before the lookup because the text is part of the key.
         // The read is negligible next to a compilation, which is what the memo is protecting.
@@ -387,14 +400,38 @@ impl TransformConfig for RemapConfig {
         // We need to compile the VRL program in order to know the schema definition output of this
         // transform. We ignore any compilation errors, as those are caught by the transform build
         // step.
-        let compiled = self
-            .compile_vrl_program(
+        //
+        // With schema support disabled the caller keeps only the log namespaces and the semantic
+        // meanings of what is returned here (`TransformOutput::schema_definitions`), and the
+        // computed kinds are replaced by the namespace default. A program that sets no meaning
+        // therefore has nothing to contribute that a compilation could reveal, so it is not
+        // compiled and the input meanings are carried through against a permissive kind. A program
+        // that does call `set_semantic_meaning` is still compiled, because its meaning list is the
+        // one part of the result that survives.
+        let compiles_meanings = context.schema.enabled
+            || self
+                .program_source()
+                .map(|source| source.contains(SET_SEMANTIC_MEANING))
+                .unwrap_or(true);
+
+        let compiled = if compiles_meanings {
+            self.compile_vrl_program(
                 context.enrichment_tables.clone(),
                 context.metrics_storage.clone(),
                 merged_definition,
             )
-            .map(|(program, _, meaning_list)| (program.final_type_info().state, meaning_list.0))
-            .map_err(|_| ());
+            .map(|(program, _, meaning_list)| {
+                let state = program.final_type_info().state;
+                (
+                    state.external.target_kind().clone(),
+                    state.external.metadata_kind().clone(),
+                    meaning_list.0,
+                )
+            })
+            .map_err(|_| ())
+        } else {
+            Ok((Kind::any(), Kind::any(), BTreeMap::new()))
+        };
 
         let mut dropped_definitions = HashMap::new();
         let mut default_definitions = HashMap::new();
@@ -402,10 +439,10 @@ impl TransformConfig for RemapConfig {
         for (output_id, input_definition) in input_definitions {
             let default_definition = compiled
                 .clone()
-                .map(|(state, meaning)| {
+                .map(|(event_kind, metadata_kind, meaning)| {
                     let mut new_type_def = Definition::new(
-                        state.external.target_kind().clone(),
-                        state.external.metadata_kind().clone(),
+                        event_kind,
+                        metadata_kind,
                         input_definition.log_namespaces().clone(),
                     );
 
@@ -789,6 +826,91 @@ mod tests {
         transforms::{OutputBuffer, test::create_topology},
     };
 
+    /// Context for the definition tests below, which assert on the definitions a compilation
+    /// produces. Those are only kept when schema support is on.
+    fn schema_enabled_context() -> TransformContext {
+        TransformContext {
+            schema: crate::config::schema::Options {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Whether the compilation memo holds a program compiled from this exact text. The memo is
+    /// process wide and other tests compile their own programs into it, so the tests below use
+    /// program text of their own rather than counting entries.
+    fn memo_holds(source: &str) -> bool {
+        program_cache()
+            .lock()
+            .expect("Data poisoned")
+            .iter()
+            .any(|entry| entry.key.3 == source)
+    }
+
+    #[test]
+    fn outputs_skips_compilation_when_definitions_are_discarded() {
+        let source = r#".skip_probe_field = "potato""#;
+        let config = RemapConfig {
+            source: Some(source.to_string()),
+            ..Default::default()
+        };
+        let input = schema::Definition::default_legacy_namespace();
+
+        // Schema support off and no meaning set: nothing a compilation could produce is kept.
+        let outputs = config.outputs(&Default::default(), &[("in".into(), input.clone())]);
+        assert!(!memo_holds(source));
+        assert_eq!(1, outputs.len());
+
+        // Schema support on: the definitions are kept, so the program is compiled.
+        let outputs = config.outputs(&schema_enabled_context(), &[("in".into(), input.clone())]);
+        assert!(memo_holds(source));
+        assert_eq!(
+            Kind::bytes(),
+            outputs[0].schema_definitions(true)[&"in".into()]
+                .event_kind()
+                .at_path(&owned_value_path!("skip_probe_field"))
+        );
+
+        // A program that sets a meaning is compiled either way: its meaning list survives.
+        let meaning_source = r#".meaning_probe_field = "potato"; set_semantic_meaning(.meaning_probe_field, "spud")"#;
+        let with_meaning = RemapConfig {
+            source: Some(meaning_source.to_string()),
+            ..Default::default()
+        };
+        let outputs = with_meaning.outputs(&Default::default(), &[("in".into(), input)]);
+        assert!(memo_holds(meaning_source));
+        assert!(
+            outputs[0].schema_definitions(false)[&"in".into()]
+                .meaning_path("spud")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn outputs_keeps_input_meanings_without_compiling() {
+        // A pass-through program below a component that set a meaning. Skipping the compilation
+        // must carry that meaning through, not fall back to the compile-failure definition.
+        let source = ".passthrough_probe_field = .thing";
+        let config = RemapConfig {
+            source: Some(source.to_string()),
+            ..Default::default()
+        };
+        let input = schema::Definition::default_legacy_namespace().with_event_field(
+            &owned_value_path!("thing"),
+            Kind::bytes(),
+            Some("spud"),
+        );
+
+        let outputs = config.outputs(&Default::default(), &[("in".into(), input.clone())]);
+
+        assert!(!memo_holds(source));
+        let definition = &outputs[0].schema_definitions(false)[&"in".into()];
+        assert_eq!(input.meaning_path("spud"), definition.meaning_path("spud"));
+        assert!(!definition.event_kind().is_never());
+    }
+
     fn test_default_schema_definition() -> schema::Definition {
         schema::Definition::empty_legacy_namespace().with_event_field(
             &owned_value_path!("a default field"),
@@ -926,7 +1048,7 @@ mod tests {
         assert_eq!(get_field_string(&result, "."), "root string");
 
         let mut outputs = conf.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(OutputId::dummy(), initial_definition)],
         );
 
@@ -1612,7 +1734,7 @@ mod tests {
 
         assert_eq!(
             conf.outputs(
-                &Default::default(),
+                &schema_enabled_context(),
                 &[(
                     "test".into(),
                     schema::Definition::new_with_default_metadata(
@@ -1773,7 +1895,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[("in".into(), schema::Definition::default_legacy_namespace())],
         );
 
@@ -1795,7 +1917,7 @@ mod tests {
         );
 
         let outputs2 = transform2.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in1".into(),
                 outputs1[0].schema_definitions(true)[&"in".into()].clone(),
@@ -1842,7 +1964,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -1876,7 +1998,7 @@ mod tests {
         );
 
         let outputs2 = transform2.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in1".into(),
                 outputs1[0].schema_definitions(true)[&"in".into()].clone(),
@@ -1919,7 +2041,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -1959,7 +2081,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -1987,7 +2109,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -2027,7 +2149,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -2088,7 +2210,7 @@ mod tests {
         assert_eq!(result.as_log().get(event_path!()), Some(&Value::Null));
 
         let outputs1 = conf.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
