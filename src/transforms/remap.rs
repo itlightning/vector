@@ -115,11 +115,12 @@ fn regex_cache_slot() -> &'static Mutex<Option<RegexCache>> {
 
 /// The regex cache for the build cycle in flight, created if this is its first compilation.
 fn regex_cache_handle() -> RegexCache {
-    regex_cache_slot()
-        .lock()
-        .expect("Data poisoned")
-        .get_or_insert_with(RegexCache::default)
-        .clone()
+    Arc::clone(
+        regex_cache_slot()
+            .lock()
+            .expect("Data poisoned")
+            .get_or_insert_with(RegexCache::default),
+    )
 }
 
 /// Drops every memoized program and the interned regex literals. Called by the topology builder
