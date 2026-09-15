@@ -1062,6 +1062,98 @@ mod tests {
         assert_eq!(actual_schema_def, expected_schema);
     }
 
+    /// The source component id is readable at `%vector.source_id` under the legacy log
+    /// namespace, where the metadata value map holds no `vector` key at all.
+    #[test]
+    fn remap_reads_source_id_legacy_namespace() {
+        let event = {
+            let mut event = LogEvent::from("hello");
+            event
+                .metadata_mut()
+                .set_source_id(Arc::new(ComponentKey::from("src_win_eventlog_apps")));
+            Event::from(event)
+        };
+
+        let conf = RemapConfig {
+            source: Some(".sid = string!(%vector.source_id)".to_string()),
+            ..Default::default()
+        };
+        let mut tform = remap(conf).unwrap();
+        let result = transform_one(&mut tform, event).unwrap();
+
+        assert_eq!(get_field_string(&result, ".sid"), "src_win_eventlog_apps");
+        // Reading the id must not reclassify the event: the namespace is decided by the
+        // presence of a `vector` key in the metadata value map.
+        assert_eq!(result.as_log().namespace(), LogNamespace::Legacy);
+    }
+
+    /// The same path under the Vector log namespace, where the metadata value map does hold a
+    /// `vector` key and the source id is still not one of its entries.
+    #[test]
+    fn remap_reads_source_id_vector_namespace() {
+        let event = {
+            let mut metadata = EventMetadata::default();
+            metadata
+                .value_mut()
+                .insert(&owned_value_path!("vector"), BTreeMap::new());
+            metadata.set_source_id(Arc::new(ComponentKey::from("src_win_eventlog_apps")));
+
+            let mut event = LogEvent::new_with_metadata(metadata);
+            event.insert(event_path!("message"), "hello");
+            Event::from(event)
+        };
+
+        let conf = RemapConfig {
+            source: Some(".sid = string!(%vector.source_id)".to_string()),
+            ..Default::default()
+        };
+        let mut tform = remap(conf).unwrap();
+        let result = transform_one(&mut tform, event).unwrap();
+
+        assert_eq!(get_field_string(&result, ".sid"), "src_win_eventlog_apps");
+        assert_eq!(result.as_log().namespace(), LogNamespace::Vector);
+    }
+
+    /// An event that never passed through a source reads the path as null.
+    #[test]
+    fn remap_reads_missing_source_id_as_null() {
+        let event = Event::from(LogEvent::from("hello"));
+
+        let conf = RemapConfig {
+            source: Some(".sid = %vector.source_id".to_string()),
+            ..Default::default()
+        };
+        let mut tform = remap(conf).unwrap();
+        let result = transform_one(&mut tform, event).unwrap();
+
+        assert_eq!(result.as_log().get(event_path!("sid")), Some(&Value::Null));
+    }
+
+    /// Writing the source id is refused at compile time, the same way writing the source type is.
+    #[test]
+    fn remap_cannot_write_source_id() {
+        let compile_error = |path: &str| {
+            let conf = RemapConfig {
+                source: Some(format!(r#"{path} = "nope""#)),
+                ..Default::default()
+            };
+            remap(conf).unwrap_err().to_string()
+        };
+
+        let source_id_error = compile_error("%vector.source_id");
+        assert!(
+            source_id_error.contains("read-only"),
+            "expected a read-only diagnostic, got: {source_id_error}"
+        );
+        // The two diagnostics differ only in the path, and in the length of the run of
+        // carets under it, which the comparison drops.
+        let without_carets = |text: String| text.replace('^', "");
+        assert_eq!(
+            without_carets(source_id_error.replace("source_id", "source_type")),
+            without_carets(compile_error("%vector.source_type"))
+        );
+    }
+
     #[test]
     fn check_remap_adds() {
         let event = {
