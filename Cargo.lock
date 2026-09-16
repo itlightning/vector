@@ -6947,6 +6947,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimalloc-pprof"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71dc9f58355ea3d31ad23ff4d447d6549d8ba9e803d0d9cd616db5af98ae6751"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13049,6 +13058,7 @@ dependencies = [
  "md-5 0.10.6",
  "metrics",
  "metrics-tracing-context",
+ "mimalloc-pprof",
  "mlua",
  "mock_instant",
  "mongodb",
@@ -13592,7 +13602,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 [[package]]
 name = "vrl"
 version = "0.33.1"
-source = "git+https://github.com/vectordotdev/vrl.git?branch=main#33fec9bddb7e75db90187f686ac3a69063882ced"
+source = "git+https://github.com/itlightning/vrl.git?rev=b675acea035ea76363c7689f59baee312f45979d#b675acea035ea76363c7689f59baee312f45979d"
 dependencies = [
  "aes 0.9.1",
  "aes-siv",

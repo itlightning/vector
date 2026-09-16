@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use file_source_common::{
     FileFingerprint, FileSourceInternalEvents, Fingerprinter, ReadFrom,
     checkpointer::{Checkpointer, CheckpointsView},
+    status::{FileSourceStatus, FileState, FileStatus, StatusWriter, secs_ago},
 };
 use futures::{
     Future, Sink, SinkExt,
@@ -27,6 +28,7 @@ use tokio::{
 use tracing::{debug, error, info, trace};
 
 use crate::{
+    encoding::{FileEncodingMode, FileEncodingState},
     file_watcher::{FileWatcher, RawLineResult},
     paths_provider::PathsProvider,
 };
@@ -51,6 +53,7 @@ where
     pub ignore_before: Option<DateTime<Utc>>,
     pub max_line_bytes: usize,
     pub line_delimiter: Bytes,
+    pub encoding_mode: FileEncodingMode,
     pub data_dir: PathBuf,
     pub glob_minimum_cooldown: Duration,
     pub fingerprinter: Fingerprinter,
@@ -58,6 +61,15 @@ where
     pub remove_after: Option<Duration>,
     pub emitter: E,
     pub rotate_wait: Duration,
+    /// The include patterns this source was configured with, verbatim.
+    ///
+    /// Carried rather than asked of the `PathsProvider` because the provider trait
+    /// answers "which paths exist now", and the status file has to report what was
+    /// ASKED FOR even when that currently matches nothing.
+    pub include_patterns: Vec<String>,
+    /// Where to write the periodic status file, and how often.
+    pub status_path: PathBuf,
+    pub status_interval: Duration,
 }
 
 /// `FileServer` as Source
@@ -105,6 +117,12 @@ where
 
         let mut known_small_files = HashMap::new();
 
+        // Paths the last scan found but could not fingerprint, and which are not merely
+        // waiting for a first complete line (those land in `known_small_files`). Kept
+        // for the status file: a file the source cannot read is otherwise invisible to
+        // anything downstream, and looks exactly like an idle one.
+        let mut unreadable_paths: Vec<PathBuf> = Vec::new();
+
         let mut existing_files = Vec::new();
         for path in self.paths_provider.paths().into_iter() {
             if let Some(file_id) = self
@@ -113,6 +131,8 @@ where
                 .await
             {
                 existing_files.push((path, file_id));
+            } else if !known_small_files.contains_key(&path) {
+                unreadable_paths.push(path);
             }
         }
 
@@ -146,6 +166,18 @@ where
         self.emitter.emit_files_open(fp_map.len());
 
         let mut stats = TimingStats::default();
+
+        // The status file is written from THIS loop, deliberately, and not from a task of
+        // its own like the checkpoint writer below. Its freshness is evidence that the
+        // read loop ran: a writer on an independent task would keep stamping a fresh
+        // `as_of` while this loop was wedged, which is precisely the false-healthy signal
+        // the file exists to expose. A stalled read therefore stops refreshing it, and a
+        // consumer that notices should conclude it cannot judge this source.
+        let mut status_writer = StatusWriter::new(
+            self.status_path.clone(),
+            self.status_interval,
+            time::Instant::now(),
+        );
 
         // Spawn the checkpoint writer task
         let checkpoint_task_handle = vector_common::spawn_in_current_span(checkpoint_writer(
@@ -185,6 +217,9 @@ where
                 for (_file_id, watcher) in &mut fp_map {
                     watcher.set_file_findable(false); // assume not findable until found
                 }
+                // Rebuilt from scratch each scan: a file whose permissions were fixed
+                // must stop being reported as unreadable.
+                unreadable_paths.clear();
                 for path in self.paths_provider.paths().into_iter() {
                     if let Some(file_id) = self
                         .fingerprinter
@@ -234,6 +269,8 @@ where
                                 .await;
                             self.emitter.emit_files_open(fp_map.len());
                         }
+                    } else if !known_small_files.contains_key(&path) {
+                        unreadable_paths.push(path);
                     }
                 }
                 stats.record("discovery", start.elapsed());
@@ -284,11 +321,53 @@ where
             let mut maxed_out_reading_single_file = false;
             for (&file_id, watcher) in &mut fp_map {
                 if !watcher.should_read() {
+                    // Rejected skips read_line; still honor remove_after. Pending
+                    // deletion is not allowed here: this branch runs without a
+                    // detection attempt (read-attempt throttle), so it would race
+                    // the idle force-decide and could delete data the next peek
+                    // would have shipped.
+                    Self::maybe_remove_pending_or_rejected(
+                        watcher,
+                        self.remove_after,
+                        false,
+                        &self.emitter,
+                    )
+                    .await;
                     continue;
                 }
 
                 let start = time::Instant::now();
                 let mut bytes_read: usize = 0;
+
+                // Reap parity invariant: a file that never leaves Pending (or is
+                // Rejected) never reaches the regular read path, so every branch
+                // that skips reading must still run the remove_after check.
+                // Otherwise enabling auto-detection would change which files get
+                // cleaned up compared to a fixed charset.
+                match watcher.ensure_encoding_ready(&self.emitter).await {
+                    Ok(false) => {
+                        // A detection attempt just ran: a successful post-idle
+                        // peek always exits Pending, so a still-Pending file here
+                        // is unreadable or inode-mismatched. Pending deletion is
+                        // safe only on this path.
+                        Self::maybe_remove_pending_or_rejected(
+                            watcher,
+                            self.remove_after,
+                            true,
+                            &self.emitter,
+                        )
+                        .await;
+                        stats.record("reading", start.elapsed());
+                        continue;
+                    }
+                    Err(error) => {
+                        self.emitter.emit_file_watch_error(&watcher.path, error);
+                        stats.record("reading", start.elapsed());
+                        continue;
+                    }
+                    Ok(true) => {}
+                }
+
                 while let Ok(RawLineResult {
                     raw_line: Some(line),
                     discarded_for_size_and_truncated,
@@ -318,6 +397,7 @@ where
                         file_id,
                         start_offset: line.offset,
                         end_offset: watcher.get_file_position(),
+                        encoding: watcher.line_encoding_name(),
                     });
 
                     if bytes_read > self.max_read_bytes {
@@ -334,14 +414,26 @@ where
                     if let Some(grace_period) = self.remove_after
                         && watcher.last_read_success().elapsed() >= grace_period
                     {
-                        // Try to remove
                         match remove_file(&watcher.path).await {
                             Ok(()) => {
                                 self.emitter.emit_file_deleted(&watcher.path);
                                 watcher.set_dead();
                             }
+                            // An already-missing file counts as removed under
+                            // auto-detection, where a vanished path is also how
+                            // never-decided watchers get reaped. Fixed mode keeps
+                            // the long-standing retry-with-error behavior so
+                            // enabling nothing changes nothing.
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::NotFound
+                                    && matches!(
+                                        self.encoding_mode,
+                                        FileEncodingMode::Auto { .. }
+                                    ) =>
+                            {
+                                watcher.set_dead();
+                            }
                             Err(error) => {
-                                // We will try again after some time.
                                 self.emitter.emit_file_delete_error(&watcher.path, error);
                             }
                         }
@@ -373,6 +465,68 @@ where
                 }
             });
             self.emitter.emit_files_open(fp_map.len());
+
+            // Snapshot after the read pass, so positions are this iteration's.
+            let status_now = time::Instant::now();
+            if status_writer.is_due(status_now) {
+                let mut status = FileSourceStatus::new(
+                    Utc::now(),
+                    self.include_patterns.clone(),
+                    self.glob_minimum_cooldown,
+                    self.status_interval,
+                );
+
+                for (file_id, watcher) in &fp_map {
+                    // Re-stat here rather than reuse a size the read path already saw.
+                    // A size carried over from the last read reports position == size
+                    // for a file that grew but was NOT read, which is a wedged reader
+                    // reporting itself caught up.
+                    let size = fs::metadata(&watcher.path).await.ok().map(|m| m.len());
+                    let position = watcher.get_file_position();
+                    let state = match size {
+                        Some(size) if position < size => FileState::Reading,
+                        Some(_) => FileState::CaughtUp,
+                        // Watched, but no longer stattable: it vanished between the read
+                        // pass and here, or its permissions changed under us.
+                        None => FileState::Unreadable,
+                    };
+                    status.push(FileStatus {
+                        path: watcher.path.to_string_lossy().into_owned(),
+                        fingerprint: Some(*file_id),
+                        position: Some(position),
+                        size,
+                        last_read_secs_ago: Some(secs_ago(
+                            status_now,
+                            watcher.last_read_success().into_std(),
+                        )),
+                        state,
+                    });
+                }
+
+                for path in known_small_files.keys() {
+                    status.push(FileStatus {
+                        path: path.to_string_lossy().into_owned(),
+                        fingerprint: None,
+                        position: None,
+                        size: fs::metadata(path).await.ok().map(|m| m.len()),
+                        last_read_secs_ago: None,
+                        state: FileState::TooSmallToFingerprint,
+                    });
+                }
+
+                for path in &unreadable_paths {
+                    status.push(FileStatus {
+                        path: path.to_string_lossy().into_owned(),
+                        fingerprint: None,
+                        position: None,
+                        size: None,
+                        last_read_secs_ago: None,
+                        state: FileState::Unreadable,
+                    });
+                }
+
+                status_writer.write(&status, status_now).await;
+            }
 
             let start = time::Instant::now();
             let to_send = std::mem::take(&mut lines);
@@ -432,6 +586,76 @@ where
         }
     }
 
+    /// `allow_pending` must be true only when a detection attempt ran in the
+    /// same server pass; callers without one may delete Rejected files only.
+    async fn maybe_remove_pending_or_rejected(
+        watcher: &mut FileWatcher,
+        remove_after: Option<Duration>,
+        allow_pending: bool,
+        emitter: &E,
+    ) {
+        let Some(grace_period) = remove_after else {
+            return;
+        };
+        if !matches!(
+            watcher.encoding_state(),
+            FileEncodingState::Pending | FileEncodingState::Rejected
+        ) {
+            return;
+        }
+        if matches!(watcher.encoding_state(), FileEncodingState::Pending) {
+            // Deleting an undecided file must follow a detection attempt in the
+            // same pass; without one (the throttled skip-read branch) deletion
+            // would race the idle force-decide, whose peeks can be ~10s apart,
+            // and destroy data the very next peek would have shipped.
+            if !allow_pending {
+                return;
+            }
+            // A Pending file has not yet had its idle-timeout force-decide
+            // chance; removing it now would destroy data a fixed charset would
+            // have shipped. Once the idle decision runs, the normal grace
+            // period applies.
+            if !watcher.pending_idle_elapsed() {
+                return;
+            }
+        }
+        // `last_read_success` is seeded from the file's mtime, which can predate
+        // watching by more than the grace period. Anchoring the grace on watch
+        // start guarantees a Pending file gets its idle-timeout force-decide (and
+        // a chance to ship its content) before it can be deleted.
+        let grace_basis = cmp::max(watcher.watch_start(), watcher.last_read_success());
+        if grace_basis.elapsed() < grace_period {
+            return;
+        }
+        // After a rename rotation this watcher's path can point at a different
+        // file. Deleting by path would destroy that file's data, so only delete
+        // when the path still resolves to the watched inode.
+        match watcher.path_matches_watched_inode().await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone: nothing to remove.
+                watcher.set_dead();
+                return;
+            }
+            // Could not verify (permissions etc.); retry on a later pass.
+            Err(_) => return,
+        }
+        // Unavoidable window between the inode check above and this remove: a
+        // rotation in that gap still deletes the successor (no portable
+        // delete-by-handle).
+        match remove_file(&watcher.path).await {
+            Ok(()) => {
+                emitter.emit_file_deleted(&watcher.path);
+                watcher.set_dead();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                watcher.set_dead();
+            }
+            Err(error) => emitter.emit_file_delete_error(&watcher.path, error),
+        }
+    }
+
     async fn watch_new_file(
         &self,
         path: PathBuf,
@@ -472,6 +696,7 @@ where
             self.ignore_before,
             self.max_line_bytes,
             self.line_delimiter.clone(),
+            &self.encoding_mode,
         )
         .await
         {
@@ -598,4 +823,6 @@ pub struct Line {
     pub file_id: FileFingerprint,
     pub start_offset: u64,
     pub end_offset: u64,
+    /// Encoding Standard name when transcoding is required (`None` = already UTF-8 bytes).
+    pub encoding: Option<&'static str>,
 }

@@ -15,6 +15,14 @@ const MAX_CHANNELS: usize = 63; // MAXIMUM_WAIT_OBJECTS (64) minus 1 for shutdow
 const MAX_CONNECTION_TIMEOUT_SECS: u64 = 3600;
 const MAX_EVENT_TIMEOUT_MS: u64 = 60000;
 const MAX_BATCH_SIZE: u32 = 10000;
+const MAX_STATUS_INTERVAL_SECS: u64 = 3600;
+
+/// The `channel` value on internal events raised for a failure that belongs to
+/// the source rather than to any single channel.
+///
+/// Defined once and rejected by `validate`, so a consumer keying on `channel`
+/// can treat it as unambiguous rather than as a name a config might also use.
+pub(super) const SOURCE_LEVEL_CHANNEL: &str = "<source>";
 
 /// Configuration for the `windows_event_log` source.
 #[configurable_component(source(
@@ -183,6 +191,52 @@ pub struct WindowsEventLogConfig {
     #[serde(default = "default_render_message")]
     pub render_message: bool,
 
+    /// Interval in seconds at which each channel subscription is torn down and
+    /// rebuilt from its bookmark.
+    ///
+    /// Rebuilding from a bookmark is clean by construction: no gap and no
+    /// duplicates. The refresh therefore costs close to nothing and bounds
+    /// unknown-unknown degradation on subscriptions that would otherwise live
+    /// for weeks. It is also what retries a channel that was skipped for access
+    /// denied, so a transient ACL change heals within one interval instead of
+    /// requiring a restart.
+    ///
+    /// Set to 0 to disable.
+    #[serde(default = "default_subscription_refresh_secs")]
+    #[configurable(metadata(docs::examples = 86400))]
+    #[configurable(metadata(docs::examples = 3600))]
+    #[configurable(metadata(docs::examples = 0))]
+    pub subscription_refresh_secs: u64,
+
+    /// Where to write the JSON file describing the collection status of each
+    /// channel.
+    ///
+    /// The source rewrites this file on a fixed interval with per channel
+    /// facts: whether a subscription exists, the last event time and record id
+    /// it delivered, an estimate of the newest record in the channel, the
+    /// current resume position, and any gaps the resume ladder created. Another
+    /// process can poll it to decide whether collection is keeping up.
+    ///
+    /// Defaults to `windows_event_log_status.json` in this source's data
+    /// directory, alongside the checkpoint file. Set this only to put the file
+    /// somewhere else.
+    ///
+    /// The file is written whole each interval through a temporary file and a
+    /// rename, so a reader never sees a partial one.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "C:\\ProgramData\\vector\\wel-status.json"))]
+    #[configurable(metadata(docs::human_name = "Status File Path"))]
+    pub status_path: Option<PathBuf>,
+
+    /// Interval in seconds between status file writes.
+    ///
+    /// Each write costs a small number of Windows API calls per configured
+    /// channel, so the interval is the whole of the cost control.
+    #[serde(default = "default_status_interval_secs")]
+    #[configurable(metadata(docs::examples = 30))]
+    #[configurable(metadata(docs::examples = 60))]
+    pub status_interval_secs: u64,
+
     /// Controls how acknowledgements are handled for this source.
     ///
     /// When enabled, the source will wait for downstream sinks to acknowledge
@@ -286,7 +340,26 @@ impl Default for WindowsEventLogConfig {
             max_event_data_length: default_max_event_data_length(),
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
             render_message: default_render_message(),
+            subscription_refresh_secs: default_subscription_refresh_secs(),
+            // No path, so the status writer is off and this binary behaves
+            // exactly as it did before the writer existed.
+            status_path: None,
+            status_interval_secs: default_status_interval_secs(),
             acknowledgements: Default::default(),
+        }
+    }
+}
+
+impl WindowsEventLogConfig {
+    /// Periodic subscription refresh interval.
+    ///
+    /// Zero disables the refresh; it is expressed as an effectively infinite
+    /// interval so the call site has no second code path to get wrong.
+    pub(super) const fn subscription_refresh_interval(&self) -> std::time::Duration {
+        if self.subscription_refresh_secs == 0 {
+            std::time::Duration::from_secs(u64::MAX / 2)
+        } else {
+            std::time::Duration::from_secs(self.subscription_refresh_secs)
         }
     }
 }
@@ -341,6 +414,16 @@ impl WindowsEventLogConfig {
             return Err("Checkpoint interval must be between 1 and 3600 seconds".into());
         }
 
+        // The status writer runs on every host, so a zero or absurd interval is
+        // rejected rather than silently coerced.
+        if self.status_interval_secs == 0 || self.status_interval_secs > MAX_STATUS_INTERVAL_SECS {
+            return Err(format!(
+                "Status interval must be between 1 and {} seconds",
+                MAX_STATUS_INTERVAL_SECS
+            )
+            .into());
+        }
+
         // Prevent resource exhaustion via excessive batch sizes
         if self.batch_size == 0 || self.batch_size > MAX_BATCH_SIZE {
             return Err(format!("Batch size must be between 1 and {}", MAX_BATCH_SIZE).into());
@@ -350,6 +433,22 @@ impl WindowsEventLogConfig {
         for channel in &self.channels {
             if channel.trim().is_empty() {
                 return Err("Channel names cannot be empty".into());
+            }
+
+            // `<source>` is the channel value the source-level internal events
+            // carry when a failure belongs to the source rather than to any
+            // one channel. Windows cannot name a channel that, but only
+            // validation makes it a guarantee: without this, a typo'd config
+            // could make a per-channel event indistinguishable from the
+            // source-level sentinel for anything keying on `channel`.
+            if channel.trim() == SOURCE_LEVEL_CHANNEL {
+                return Err(format!(
+                    "Channel name '{}' is reserved: it marks source-level \
+                     failures that belong to no single channel. Use the real \
+                     Windows channel name.",
+                    SOURCE_LEVEL_CHANNEL
+                )
+                .into());
             }
 
             // Prevent excessively long channel names
@@ -593,6 +692,16 @@ const fn default_render_message() -> bool {
     true
 }
 
+/// Default ON at 24 hours.
+const fn default_subscription_refresh_secs() -> u64 {
+    86_400
+}
+
+/// Cadence of the status file when a path is configured.
+const fn default_status_interval_secs() -> u64 {
+    30
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,6 +790,9 @@ mod tests {
             max_event_data_length: 0,
             checkpoint_interval_secs: 5,
             render_message: true,
+            subscription_refresh_secs: 86_400,
+            status_path: Some(PathBuf::from("/test/data/status.json")),
+            status_interval_secs: 30,
             acknowledgements: SourceAcknowledgementsConfig::from(true),
         };
 
@@ -701,6 +813,49 @@ mod tests {
         );
         assert_eq!(config.batch_size, deserialized.batch_size);
         assert_eq!(config.render_message, deserialized.render_message);
+        assert_eq!(config.status_path, deserialized.status_path);
+        assert_eq!(
+            config.status_interval_secs,
+            deserialized.status_interval_secs
+        );
+    }
+
+    /// The status path is an override, not a switch. A config that never
+    /// mentions it still gets the file, at the derived location.
+    #[test]
+    fn the_status_path_is_an_optional_override() {
+        let config = WindowsEventLogConfig::default();
+        assert!(config.status_path.is_none());
+        assert_eq!(config.status_interval_secs, 30);
+
+        // An existing deployment's config parses unchanged, and the writer it
+        // never asked for is exactly the point: the reader has no other way to
+        // learn whether this source is collecting.
+        let parsed: WindowsEventLogConfig =
+            toml::from_str("channels = [\"System\"]").expect("minimal config must parse");
+        assert!(parsed.status_path.is_none());
+        assert_eq!(parsed.status_interval_secs, 30);
+    }
+
+    /// The writer runs on every host, so the interval is always meaningful and
+    /// is always checked, whether or not a path was named.
+    #[test]
+    fn a_status_interval_is_always_validated() {
+        let mut config = WindowsEventLogConfig {
+            status_interval_secs: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("Status interval"));
+
+        config.status_interval_secs = 3601;
+        assert!(config.validate().is_err());
+
+        config.status_interval_secs = 30;
+        assert!(config.validate().is_ok());
+
+        config.status_path = Some(PathBuf::from("C:\\ProgramData\\vector\\status.json"));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
