@@ -834,6 +834,12 @@ impl ChannelSubscription {
         self.close_current();
         self.skipped_this_generation = Some(reason);
         self.subscription_active_gauge.set(0.0);
+        // The code only. A skip names something an operator has to fix, and
+        // naming it without the code leaves them guessing, but the channel is
+        // deliberately NOT reported as being in a run of unavailability: that
+        // field is what the reader measures a tolerance against, and a skip is
+        // the one failure it must act on at once rather than wait out.
+        self.last_error = Some(code);
         error!(
             message = format!(
                 "Windows Event Log channel skipped for this subscription generation \
@@ -1739,24 +1745,29 @@ impl EventLogSubscription {
                                 if rung == Rung::IsolateOne {
                                     channel_sub.batch.isolate();
                                 }
-                                channel_sub.note_rung_move(previous, rung);
-                                warn!(
-                                    message = format!(
-                                        "Windows Event Log resume position appears poisoned; \
-                                         escaping by {} (channel={}).",
-                                        rung.as_str(),
-                                        channel_sub.channel
-                                    ),
-                                    error_code = "poison_escape",
-                                    // `EvtNext` cannot get past the record at
-                                    // the resume position.
-                                    error_type = error_type::READER_FAILED,
-                                    channel = %channel_sub.channel,
-                                    rung = rung.as_str(),
-                                    skipping_next_record = channel_sub.resume.skip_next_record,
-                                    win32_error = code,
-                                    internal_log_rate_limit = false,
-                                );
+                                // Announced only when the ladder moved, like every other
+                                // rung line: the terminal rung absorbs the escape, so a
+                                // channel parked there would report the same escape it did
+                                // not make for as long as it stayed stuck.
+                                if channel_sub.note_rung_move(previous, rung) {
+                                    warn!(
+                                        message = format!(
+                                            "Windows Event Log resume position appears poisoned; \
+                                             escaping by {} (channel={}).",
+                                            rung.as_str(),
+                                            channel_sub.channel
+                                        ),
+                                        error_code = "poison_escape",
+                                        // `EvtNext` cannot get past the record at
+                                        // the resume position.
+                                        error_type = error_type::READER_FAILED,
+                                        channel = %channel_sub.channel,
+                                        rung = rung.as_str(),
+                                        skipping_next_record = channel_sub.resume.skip_next_record,
+                                        win32_error = code,
+                                        internal_log_rate_limit = false,
+                                    );
+                                }
                             }
                             channel_sub.close_current();
                             channel_sub.schedule_retry(
@@ -6196,6 +6207,117 @@ mod tests {
                 gap.cause
             );
         }
+    }
+
+    /// A skipped channel reports the code it was classified from, and
+    /// deliberately reports no run of unavailability.
+    ///
+    /// The skip path is the one failure that never schedules a retry, so it is
+    /// the one place where nothing else would stamp the code. The onset is a
+    /// different matter: the reader measures its tolerance against that field,
+    /// and a skip is the one failure it must surface at once rather than wait
+    /// out, so stamping it here would hide an operator-fixable fault for the
+    /// whole tolerance window.
+    #[tokio::test]
+    async fn a_skipped_channel_reports_its_code() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+
+        {
+            // ERROR_EVT_INVALID_CHANNEL_PATH: a binding the operator has to fix.
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15000]);
+            subscription.force_rebuild_all();
+        }
+        let skipped = subscription.status_snapshot().channels["Application"].clone();
+        assert_eq!(
+            skipped.skipped_reason.as_deref(),
+            Some("invalid_channel_path"),
+            "the premise is a channel skipped for this generation"
+        );
+        assert_eq!(
+            skipped.last_error,
+            Some(15000),
+            "the code an operator needs is the one the skip was classified from"
+        );
+        assert_eq!(
+            skipped.unavailable_since, None,
+            "a skip is NOT a run of unavailability to be waited out: the reader              measures a tolerance against that field, and a channel an operator              has to fix must be acted on at once instead"
+        );
+
+        // The periodic refresh is what retries a skipped channel, and a
+        // subscription that comes back ends the run exactly as any recovery
+        // does.
+        subscription.force_rebuild_all();
+        let recovered = subscription.status_snapshot().channels["Application"].clone();
+        assert_eq!(recovered.skipped_reason, None);
+        assert_eq!(recovered.last_error, None);
+    }
+
+    /// The poison escape is announced when the ladder moved and not otherwise.
+    ///
+    /// The terminal rung absorbs every further escape, so a channel parked
+    /// there restates a move it did not make once per stuck run, forever. Both
+    /// directions are asserted in one test: an escape that moves the ladder
+    /// must still be visible, or gating it would just be silence.
+    #[tokio::test]
+    async fn a_poison_escape_is_announced_only_when_the_ladder_moved() {
+        let _seams = SeamSession::acquire();
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let mut subscription = subscription_from(&application_config()).await;
+        assert!(
+            !drain_all(&mut subscription).is_empty(),
+            "a resume position must exist before it can be found stuck"
+        );
+
+        /// Three rebuilds that resume at the same position, which is what the
+        /// escape is triggered by.
+        fn three_stuck_reads(
+            subscription: &mut EventLogSubscription,
+            seams: &SeamSession,
+        ) -> Vec<(String, String)> {
+            let capture = ErrorCodeCapture::default();
+            let collector = tracing_subscriber::registry().with(capture.clone());
+            tracing::subscriber::with_default(collector, || {
+                for _ in 0..3 {
+                    {
+                        let _guard = ScriptGuard::install(seams, &[(15011, 0)]);
+                        _ = subscription.pull_events(usize::MAX);
+                    }
+                    subscription.force_rebuild_all();
+                }
+            });
+            let seen = capture.seen.lock().unwrap().clone();
+            seen.into_iter()
+                .filter(|(_, code)| code == "poison_escape")
+                .collect()
+        }
+
+        let moved = three_stuck_reads(&mut subscription, &_seams);
+        assert_eq!(
+            moved.len(),
+            1,
+            "an escape that moves the ladder is deliberate data loss and must              be visible: {moved:#?}"
+        );
+
+        // Walk the ladder to its terminal rung, where there is nowhere left to
+        // escape to.
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011; 8]);
+            for _ in 0..8 {
+                subscription.force_rebuild_all();
+            }
+        }
+        assert!(
+            subscription.first_channel_is_future_only(),
+            "the premise is a channel parked on the terminal rung"
+        );
+
+        let parked = three_stuck_reads(&mut subscription, &_seams);
+        assert!(
+            parked.is_empty(),
+            "the terminal rung absorbed the escape, so there was no move to              announce: {parked:#?}"
+        );
     }
 
     /// The status file carries the run of failures, not just the latest one:
