@@ -456,9 +456,13 @@ impl BatchAdaptation {
 
 /// Observability edges for one channel, per episode.
 ///
-/// The contract is: onset ERROR once, repeats DEBUG, hourly reminder DEBUG,
-/// recovery WARN once. Anything noisier turns a channel outage into thousands
-/// of shipped error rows, which is what the original incident did.
+/// The contract is one line per edge and nothing per attempt: onset once,
+/// repeats, an hourly reminder, and recovery once, all DEBUG. Anything
+/// noisier turns a channel outage into thousands of shipped rows, which is
+/// what the original incident did. The whole band is DEBUG because the
+/// process runs at INFO by default: a transient failure that heals costs
+/// nothing, and the verdict on one that does not heal belongs to the reader
+/// of the status file, which sees the same failure as a fact.
 #[derive(Debug, Clone, Default)]
 pub(super) struct EpisodeState {
     onset_logged: bool,
@@ -468,11 +472,11 @@ pub(super) struct EpisodeState {
 /// What the caller should log for this failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailureEdge {
-    /// First failure of an episode: ERROR, once.
+    /// First failure of an episode: logged once.
     Onset,
-    /// The hourly still-unavailable reminder: DEBUG.
+    /// The hourly still-unavailable reminder.
     OngoingReminder,
-    /// A repeat inside an episode: DEBUG.
+    /// A repeat inside an episode.
     Repeat,
 }
 

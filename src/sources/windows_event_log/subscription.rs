@@ -212,6 +212,19 @@ enum RebuildKind {
     Proactive,
 }
 
+/// How soon a channel that just failed may try again.
+///
+/// Immediate exists for the one failure whose fix IS the next rebuild: the
+/// stored position died, and the rebuild at the new resume rung asks a
+/// question the first one could not. Everything else waits out the jittered
+/// backoff, and even this case takes the wait from its second failure on, so
+/// an unreadable channel cannot turn into a retry loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPacing {
+    Backoff,
+    Immediate,
+}
+
 /// Builds subscriptions for one channel.
 ///
 /// Holding the subscription behind a factory rather than a raw handle is the
@@ -497,6 +510,10 @@ struct ChannelSubscription {
     backoff: Backoff,
     batch: BatchAdaptation,
     episode: EpisodeState,
+    /// Whether this unavailability episode has already spent its one
+    /// no-wait rebuild. Cleared when a rebuild succeeds, so the allowance is
+    /// per episode rather than per process.
+    fast_recreate_used: bool,
     /// Earliest instant at which a rebuild may be attempted.
     retry_at: Option<std::time::Instant>,
     /// Skipped for this subscription generation. The periodic refresh is what
@@ -621,6 +638,9 @@ impl ChannelSubscription {
                 self.active_query_origin = origin;
                 self.skipped_this_generation = None;
                 self.backoff.reset();
+                // The episode ends here, so the next one gets its own no-wait
+                // rebuild.
+                self.fast_recreate_used = false;
                 self.subscription_active_gauge.set(1.0);
                 counter!(
                     CounterName::WindowsEventLogSubscriptionsTotal,
@@ -628,8 +648,14 @@ impl ChannelSubscription {
                 )
                 .increment(1);
 
-                // Recovery WARN, once per episode, carrying the rung we came
-                // back on and how far behind the channel is in data terms.
+                // The recovery edge, once per episode, carrying the rung we
+                // came back on and how far behind the channel is in data
+                // terms. DEBUG, like the onset: a transient subscribe failure
+                // that heals on its own is diagnostic detail, not an operator
+                // event, and the judgment about a channel that stays down is
+                // the reader's. The process runs at INFO by default, so these
+                // lines reach the shipped internal logs only when a support
+                // bundle raises the level.
                 if self.episode.observe_recovery() {
                     let resumed_from = self.resume.rung.resumed_from().as_str();
                     let last_event_at = self.last_event_at_rfc3339();
@@ -637,7 +663,7 @@ impl ChannelSubscription {
                     // callsite plus component_id and does NOT include the
                     // channel, so on a multi-channel source the second
                     // channel's edges would be swallowed.
-                    warn!(
+                    debug!(
                         message = format!(
                             "Windows Event Log channel recovered (channel={}, resumed_from={}, last_event_at={}).",
                             self.channel, resumed_from, last_event_at
@@ -703,7 +729,18 @@ impl ChannelSubscription {
                         let rung = self.resume.bookmark_dead();
                         self.bookmark_positioned = false;
                         self.log_rung_advance(rung, code, "bookmark_dead");
-                        self.schedule_retry(code, &error, cause);
+                        // The position died, not the channel, and the rebuild
+                        // at the new rung is the whole fix, so the first one of
+                        // an episode does not wait. Once per episode: a channel
+                        // that is genuinely unreadable must still back off
+                        // rather than spin against it.
+                        let pacing = if self.fast_recreate_used {
+                            RetryPacing::Backoff
+                        } else {
+                            self.fast_recreate_used = true;
+                            RetryPacing::Immediate
+                        };
+                        self.schedule_retry(code, &error, cause, pacing);
                     }
                     SubscribeOutcome::GeneratedQueryInvalid => {
                         // Our own ladder predicate is invalid. Advance exactly
@@ -713,9 +750,11 @@ impl ChannelSubscription {
                         if rung == Rung::IsolateOne {
                             self.batch.isolate();
                         }
-                        self.schedule_retry(code, &error, cause);
+                        self.schedule_retry(code, &error, cause, RetryPacing::Backoff);
                     }
-                    SubscribeOutcome::Retry => self.schedule_retry(code, &error, cause),
+                    SubscribeOutcome::Retry => {
+                        self.schedule_retry(code, &error, cause, RetryPacing::Backoff)
+                    }
                 }
                 false
             }
@@ -790,16 +829,31 @@ impl ChannelSubscription {
         );
     }
 
-    /// Log the failure edge and arm the backoff timer.
-    fn schedule_retry(&mut self, code: u32, error: &windows::core::Error, cause: &str) {
-        let delay = self.backoff.next_delay();
+    /// Log the failure edge and arm the retry timer.
+    fn schedule_retry(
+        &mut self,
+        code: u32,
+        error: &windows::core::Error,
+        cause: &str,
+        pacing: RetryPacing,
+    ) {
+        // The attempt counter advances either way, so a channel whose first
+        // retry was immediate still walks the same ladder from its next
+        // failure on and the reported attempt count stays the count of tries.
+        let backoff = self.backoff.next_delay();
+        let delay = match pacing {
+            RetryPacing::Backoff => backoff,
+            RetryPacing::Immediate => std::time::Duration::ZERO,
+        };
         self.retry_at = Some(std::time::Instant::now() + delay);
 
         let name = describe(code).unwrap_or("unknown");
         let last_event_at = self.last_event_at_rfc3339();
         match self.episode.observe_failure(std::time::Instant::now()) {
             FailureEdge::Onset => {
-                error!(
+                // DEBUG, paired with the recovery edge above: see the comment
+                // there for why an episode edge is not an operator event.
+                debug!(
                     message = format!(
                         "Windows Event Log channel query failed (channel={}, win32_error={}, \
                          last_event_at={}).",
@@ -1134,11 +1188,12 @@ impl EventLogSubscription {
                 backoff: Backoff::new(jitter_seed(channel)),
                 batch: BatchAdaptation::new(config.batch_size as usize),
                 episode: EpisodeState::default(),
+                fast_recreate_used: false,
                 retry_at: None,
                 skipped_this_generation: None,
                 next_refresh: std::time::Instant::now() + refresh_interval,
                 // Seeded from the checkpoint, not left unknown until the first
-                // event arrives. An onset ERROR raised right after a restart
+                // event arrives. An onset edge raised right after a restart
                 // would otherwise report `last_event_at=never` on a channel
                 // that has been collecting for weeks, which is the opposite of
                 // the triage fact this field exists to carry.
@@ -1568,7 +1623,12 @@ impl EventLogSubscription {
                                 );
                             }
                             channel_sub.close_current();
-                            channel_sub.schedule_retry(code, &err, "evt_next");
+                            channel_sub.schedule_retry(
+                                code,
+                                &err,
+                                "evt_next",
+                                RetryPacing::Backoff,
+                            );
                             channel_sub.subscription_active_gauge.set(0.0);
                             channel_drained = true;
                             break;
@@ -2013,8 +2073,17 @@ impl EventLogSubscription {
         probe.advance_rung() == Rung::SkipRecord
     }
 
+    /// Test-only: how long the first channel must still wait before its next
+    /// rebuild. Zero means the next pull may try immediately.
+    #[cfg(test)]
+    pub(super) fn first_channel_retry_delay(&self) -> Option<std::time::Duration> {
+        self.channels[0]
+            .retry_at
+            .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+    }
+
     /// Test-only: the `last_event_at` field value the first channel would put
-    /// on an onset ERROR or a recovery WARN.
+    /// on its onset and recovery edges.
     #[cfg(test)]
     pub(super) fn first_channel_last_event_at(&self) -> String {
         self.channels[0].last_event_at_rfc3339()
@@ -2913,6 +2982,30 @@ mod tests {
         }
     }
 
+    /// Captures `(level, error_code)` for every record at any level.
+    ///
+    /// The episode edges are DEBUG, so a warn-band capture cannot see them at
+    /// all and asserting they were emitted means reading the whole stream.
+    #[derive(Clone, Default)]
+    struct AllLevelCapture {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AllLevelCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = ErrorCodeVisitor(None);
+            event.record(&mut visitor);
+            self.seen.lock().unwrap().push((
+                event.metadata().level().to_string(),
+                visitor.0.unwrap_or_default(),
+            ));
+        }
+    }
+
     /// A failed PROACTIVE rebuild must leave the live subscription serving
     /// events.
     ///
@@ -3054,22 +3147,25 @@ mod tests {
         }
     }
 
-    /// The episode contract, in the vocabulary an operator sees: one unavailable
-    /// episode produces exactly one warn-band onset and exactly one warn-band
-    /// recovery. Everything in between is DEBUG.
+    /// The episode contract, in the vocabulary an operator sees: one
+    /// unavailable episode produces exactly one onset and exactly one
+    /// recovery, both DEBUG, and nothing at all in the warn band.
     ///
     /// The original incident shipped 12,650 error rows for one condition, and
     /// the lab's single unregister episode still logged four warn-band lines
-    /// against a design that calls for two.
+    /// against a design that calls for two. A subscribe failure that heals by
+    /// itself is not an operator event at any count, so the edges sit below
+    /// the shipped level and the reader of the status file, which sees the
+    /// same failure as a fact, is what decides whether it matters.
     #[tokio::test]
-    async fn one_episode_produces_exactly_one_onset_and_one_recovery() {
+    async fn one_episode_produces_one_debug_onset_and_one_debug_recovery() {
         let _seams = SeamSession::acquire();
         use tracing_subscriber::layer::SubscriberExt;
 
         let (mut subscription, _temp_dir) = application_subscription().await;
 
-        let counter = WarnBandCounter::default();
-        let collector = tracing_subscriber::registry().with(counter.clone());
+        let capture = AllLevelCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
 
         tracing::subscriber::with_default(collector, || {
             // Onset: the channel goes away underneath us.
@@ -3095,20 +3191,85 @@ mod tests {
             assert!(subscription.first_channel_is_live());
         });
 
-        let lines = counter.warns.lock().unwrap().clone();
+        let lines = capture.seen.lock().unwrap().clone();
+        let edges: Vec<&(String, String)> = lines
+            .iter()
+            .filter(|(_, code)| code == "channel_query_failed" || code == "channel_recovered")
+            .collect();
         assert_eq!(
-            lines.len(),
+            edges.len(),
             2,
             "one episode must produce exactly one onset and one recovery, got: {lines:#?}"
         );
-        assert!(
-            lines[0].starts_with("ERROR"),
-            "the onset is an ERROR, got: {lines:#?}"
+        assert_eq!(
+            edges[0],
+            &("DEBUG".to_string(), "channel_query_failed".to_string()),
+            "the onset is the first edge and is DEBUG, got: {lines:#?}"
         );
-        assert!(
-            lines[1].starts_with("WARN"),
-            "the recovery is a WARN, got: {lines:#?}"
+        assert_eq!(
+            edges[1],
+            &("DEBUG".to_string(), "channel_recovered".to_string()),
+            "the recovery is the second edge and is DEBUG, got: {lines:#?}"
         );
+        let warn_band: Vec<&(String, String)> = lines
+            .iter()
+            .filter(|(level, _)| level == "WARN" || level == "ERROR")
+            .collect();
+        assert!(
+            warn_band.is_empty(),
+            "a channel that went away and came back is not an operator event              and must raise no warn-band line, got: {warn_band:#?}"
+        );
+    }
+
+    /// A dead bookmark is the stored position dying, not the channel: the
+    /// rebuild at the next resume rung is the fix, and it usually works on the
+    /// spot. So the first failure of an episode retries without waiting.
+    ///
+    /// Exactly one per episode. The code arrives thousands of times a day from
+    /// the fleet's busiest channels, and a no-wait retry per failure would turn
+    /// a channel that is genuinely unreadable into a spin against it.
+    #[tokio::test]
+    async fn a_dead_bookmark_retries_once_without_waiting_then_backs_off() {
+        use std::time::Duration;
+
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011; 2]);
+            subscription.force_rebuild_all();
+            assert_eq!(
+                subscription.first_channel_retry_delay(),
+                Some(Duration::ZERO),
+                "the first dead bookmark of an episode must be retried at once"
+            );
+
+            subscription.force_rebuild_all();
+            let second = subscription
+                .first_channel_retry_delay()
+                .expect("a failed rebuild always arms the retry timer");
+            assert!(
+                second > Duration::ZERO,
+                "the second failure of the same episode must wait out the                  backoff, got {second:?}"
+            );
+        }
+
+        // A successful rebuild ends the episode, so the next one is allowed its
+        // own no-wait retry: the allowance is per episode, not per process.
+        subscription.force_rebuild_all();
+        assert!(
+            subscription.first_channel_is_live(),
+            "the premise is a channel that recovered"
+        );
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
+            subscription.force_rebuild_all();
+            assert_eq!(
+                subscription.first_channel_retry_delay(),
+                Some(Duration::ZERO),
+                "a new episode gets its own immediate retry"
+            );
+        }
     }
 
     /// Handle accounting across forced rebuilds.
@@ -4905,8 +5066,8 @@ mod tests {
         );
     }
 
-    /// `last_event_at` is the triage fact on the onset ERROR and the recovery
-    /// WARN, and the agent's give-up WARN reads it. It is absolute
+    /// `last_event_at` is the triage fact on the onset and recovery edges,
+    /// and the agent's give-up WARN reads it. It is absolute
     /// so consumers derive the age, and "never" is a distinct, meaningful value.
     #[tokio::test]
     async fn last_event_at_reads_never_until_an_event_arrives_and_a_timestamp_after() {

@@ -574,10 +574,10 @@ impl WindowsEventLogSource {
                         let (total, active) = subscription.channel_health_summary();
                         if active < total {
                             // DEBUG, not WARN. A channel that is down already
-                            // emitted its onset ERROR once and will emit its
-                            // recovery WARN once; this 30s pulse would turn one
-                            // episode into a warn-band line every half minute.
-                            // Exactly two warn-band lines per episode, no more.
+                            // emitted its onset edge once and will emit its
+                            // recovery edge once; this 30s pulse would turn one
+                            // episode into a line every half minute. One line
+                            // per edge, no more.
                             debug!(
                                 message = "Some channel subscriptions are inactive.",
                                 total_channels = total,
