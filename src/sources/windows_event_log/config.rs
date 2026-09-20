@@ -341,8 +341,9 @@ impl Default for WindowsEventLogConfig {
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
             render_message: default_render_message(),
             subscription_refresh_secs: default_subscription_refresh_secs(),
-            // No path, so the status writer is off and this binary behaves
-            // exactly as it did before the writer existed.
+            // No override: the file goes to its default name in the
+            // source's own data directory, which is where a reader looks for
+            // it. The writer runs either way.
             status_path: None,
             status_interval_secs: default_status_interval_secs(),
             acknowledgements: Default::default(),

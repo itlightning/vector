@@ -125,6 +125,27 @@ pub(super) struct ChannelStatus {
     pub(super) query_filters: bool,
     /// Whether the stored bookmark marks a real position.
     pub(super) bookmark_positioned: bool,
+    /// When this channel's current run of failures began: the first failure
+    /// after the last subscription this source built successfully. `null`
+    /// when the channel is not currently failing.
+    ///
+    /// The start of the run, not the latest failure: a reader deciding
+    /// whether an outage has gone on long enough to act on needs the point it
+    /// started, and every failure after the first is a retry of the same one.
+    /// Held across failed rebuilds and cleared when one succeeds.
+    ///
+    /// Additive: absent means a writer that did not report the fact, which is
+    /// NOT the same statement as a healthy channel, so a reader that finds
+    /// the key missing must not read a recovery into it.
+    #[serde(default)]
+    pub(super) unavailable_since: Option<String>,
+    /// Win32 code of the most recent failure of that run, `null` when there is
+    /// no run in progress. What is failing, where [`Self::unavailable_since`]
+    /// says how long it has been.
+    ///
+    /// Additive, on the same terms as [`Self::unavailable_since`].
+    #[serde(default)]
+    pub(super) last_error: Option<u32>,
     /// Consecutive failed rebuild attempts for this channel.
     pub(super) retry_attempt: u32,
     /// Times a name was absent from the publisher table and the per-event
@@ -549,6 +570,8 @@ mod tests {
                 newest_record_id: Some(123_460),
                 query_filters: false,
                 bookmark_positioned: true,
+                unavailable_since: None,
+                last_error: None,
                 retry_attempt: 0,
                 name_table_misses: 0,
                 gaps: vec![
@@ -574,6 +597,8 @@ mod tests {
                 newest_record_id: None,
                 query_filters: true,
                 bookmark_positioned: false,
+                unavailable_since: Some(rfc3339(ts(1_699_999_500))),
+                last_error: Some(15007),
                 retry_attempt: 3,
                 name_table_misses: 7,
                 gaps: Vec::new(),
@@ -603,6 +628,8 @@ mod tests {
         assert_eq!(defender["bookmark_positioned"], true);
         assert_eq!(defender["last_drained_at"], "2023-11-14T22:14:50.000Z");
         assert_eq!(defender["retry_attempt"], 0);
+        assert!(defender["unavailable_since"].is_null());
+        assert!(defender["last_error"].is_null());
         assert_eq!(defender["query_filters"], false);
         assert_eq!(defender["name_table_misses"], 0);
         assert_eq!(defender["gaps"][0]["cause"], "skip_record");
@@ -617,6 +644,8 @@ mod tests {
         assert!(security["last_drained_at"].is_null());
         assert!(security["newest_record_id"].is_null());
         assert_eq!(security["skipped_reason"], "access_denied");
+        assert_eq!(security["unavailable_since"], "2023-11-14T22:05:00.000Z");
+        assert_eq!(security["last_error"], 15007);
         assert_eq!(security["query_filters"], true);
         assert_eq!(security["name_table_misses"], 7);
     }
@@ -657,6 +686,11 @@ mod tests {
             security.name_table_misses, 0,
             "unreported misses are zero, not a parse failure"
         );
+        assert_eq!(
+            security.unavailable_since, None,
+            "a writer that did not report episodes says nothing about this              channel's health, and an absent key must not parse as a claim"
+        );
+        assert_eq!(security.last_error, None);
         assert_eq!(security.last_record_id, Some(10));
     }
 
