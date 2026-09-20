@@ -533,6 +533,15 @@ struct ChannelSubscription {
     /// never on an error, a batch cap, or a budget stop, all of which leave
     /// events unread.
     last_drained_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the current run of failures started, cleared by the rebuild that
+    /// ends it. Reported in the status file, where the reader needs the start
+    /// of the run rather than the latest failure to judge how long a channel
+    /// has been unavailable.
+    unavailable_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Win32 code of the most recent failure of that run, cleared with it.
+    /// Reported alongside, because how long a channel has been down and what
+    /// is wrong with it are two different questions.
+    last_error: Option<u32>,
     /// The active query filters events, so record ids skip by construction and
     /// gap detection cannot mean anything on this channel.
     query_filters: bool,
@@ -649,8 +658,10 @@ impl ChannelSubscription {
                 self.skipped_this_generation = None;
                 self.backoff.reset();
                 // The episode ends here, so the next one gets its own no-wait
-                // rebuild.
+                // rebuild, and the facts describing it stop being current.
                 self.fast_recreate_used = false;
+                self.unavailable_since = None;
+                self.last_error = None;
                 self.subscription_active_gauge.set(1.0);
                 counter!(
                     CounterName::WindowsEventLogSubscriptionsTotal,
@@ -739,8 +750,9 @@ impl ChannelSubscription {
                         let previous = self.resume.rung;
                         let rung = self.resume.bookmark_dead();
                         self.bookmark_positioned = false;
-                        self.note_rung_gap(previous, rung);
-                        self.log_rung_advance(rung, code, "bookmark_dead");
+                        if self.note_rung_move(previous, rung) {
+                            self.log_rung_advance(rung, code, "bookmark_dead");
+                        }
                         // The position died, not the channel, and the rebuild
                         // at the new rung is the whole fix, so the first one of
                         // an episode does not wait. Once per episode: a channel
@@ -759,8 +771,9 @@ impl ChannelSubscription {
                         // one rung and never retry the same predicate.
                         let previous = self.resume.rung;
                         let rung = self.resume.advance_rung();
-                        self.note_rung_gap(previous, rung);
-                        self.log_rung_advance(rung, code, "generated_query_invalid");
+                        if self.note_rung_move(previous, rung) {
+                            self.log_rung_advance(rung, code, "generated_query_invalid");
+                        }
                         if rung == Rung::IsolateOne {
                             self.batch.isolate();
                         }
@@ -860,6 +873,13 @@ impl ChannelSubscription {
             RetryPacing::Immediate => std::time::Duration::ZERO,
         };
         self.retry_at = Some(std::time::Instant::now() + delay);
+
+        // First failure of the run wins: what the reader needs is when the
+        // channel stopped working, and every failure after it is a retry of
+        // that same one. The code, unlike the time, is always the latest.
+        let now = chrono::Utc::now();
+        self.unavailable_since.get_or_insert(now);
+        self.last_error = Some(code);
 
         let name = describe(code).unwrap_or("unknown");
         let last_event_at = self.last_event_at_rfc3339();
@@ -982,7 +1002,13 @@ impl ChannelSubscription {
         self.last_drained_at = Some(chrono::Utc::now());
     }
 
-    /// Record the hole a ladder step just created, if it created one.
+    /// Record the hole a ladder step just created, if it created one, and
+    /// report whether the ladder moved at all.
+    ///
+    /// The return is what gates the announcement: the terminal rung absorbs
+    /// every further failure, so a channel wedged there restates a move that
+    /// did not happen once per rebuild, which on the fleet's busiest channels
+    /// is thousands of lines a day about one stuck channel.
     ///
     /// Called immediately after the step is taken, so `self.resume` already
     /// describes the new position and `time_floor` gives the point the source
@@ -998,9 +1024,9 @@ impl ChannelSubscription {
     /// The lossless steps also record nothing, which is decided by the recorder
     /// and not here, so every call site reports uniformly and none of them has
     /// to remember which steps lose data.
-    fn note_rung_gap(&mut self, previous: Rung, rung: Rung) {
+    fn note_rung_move(&mut self, previous: Rung, rung: Rung) -> bool {
         if previous == rung {
-            return;
+            return false;
         }
         let now = chrono::Utc::now();
         let resume_at = match rung {
@@ -1012,6 +1038,7 @@ impl ChannelSubscription {
         if let Some(gap) = gap_for_rung(rung, self.resume.last_event_time, resume_at, now) {
             super::status::push_gap(&mut self.gaps, gap);
         }
+        true
     }
 
     /// Everything the status file says about this channel.
@@ -1037,6 +1064,10 @@ impl ChannelSubscription {
             newest_record_id: newest_record_estimate(stats, self.resume.last_record_id),
             query_filters: self.query_filters,
             bookmark_positioned: self.bookmark_positioned,
+            unavailable_since: self
+                .unavailable_since
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            last_error: self.last_error,
             retry_attempt: self.backoff.attempt(),
             name_table_misses: self.name_table_misses,
             gaps: self.gaps.iter().cloned().collect(),
@@ -1292,6 +1323,8 @@ impl EventLogSubscription {
                 // been reached. Never seeded from the checkpoint: an old
                 // process reaching the head says nothing about this one.
                 last_drained_at: None,
+                unavailable_since: None,
+                last_error: None,
                 query_filters,
                 name_table_misses: 0,
                 gaps: std::collections::VecDeque::new(),
@@ -1706,7 +1739,7 @@ impl EventLogSubscription {
                                 if rung == Rung::IsolateOne {
                                     channel_sub.batch.isolate();
                                 }
-                                channel_sub.note_rung_gap(previous, rung);
+                                channel_sub.note_rung_move(previous, rung);
                                 warn!(
                                     message = format!(
                                         "Windows Event Log resume position appears poisoned; \
@@ -6163,6 +6196,106 @@ mod tests {
                 gap.cause
             );
         }
+    }
+
+    /// The status file carries the run of failures, not just the latest one:
+    /// when the channel stopped working and what is wrong with it.
+    ///
+    /// The reader owns the tolerance, so it needs a start it can measure from.
+    /// That start has to survive the failed rebuilds in between, which are
+    /// retries of the same outage, and has to disappear on recovery, because a
+    /// channel that is working is not unavailable since anything.
+    #[tokio::test]
+    async fn the_status_snapshot_reports_the_run_of_failures() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+
+        let healthy = subscription.status_snapshot();
+        assert_eq!(
+            healthy.channels["Application"].unavailable_since, None,
+            "a channel that has not failed is not unavailable since anything"
+        );
+        assert_eq!(healthy.channels["Application"].last_error, None);
+
+        let first = {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15007]);
+            subscription.force_rebuild_all();
+            subscription.status_snapshot().channels["Application"].clone()
+        };
+        let since = first
+            .unavailable_since
+            .clone()
+            .expect("the first failure starts the run");
+        assert_eq!(
+            first.last_error,
+            Some(15007),
+            "the reader needs the code to say what is wrong"
+        );
+
+        let second = {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[1722]);
+            subscription.force_rebuild_all();
+            subscription.status_snapshot().channels["Application"].clone()
+        };
+        assert_eq!(
+            second.unavailable_since,
+            Some(since),
+            "a failed rebuild is a retry of the same outage and must not              restart the clock the reader is measuring against"
+        );
+        assert_eq!(
+            second.last_error,
+            Some(1722),
+            "the code follows the latest failure, unlike the start"
+        );
+
+        subscription.force_rebuild_all();
+        assert!(
+            subscription.first_channel_is_live(),
+            "the premise is a channel that recovered"
+        );
+        let recovered = subscription.status_snapshot();
+        assert_eq!(
+            recovered.channels["Application"].unavailable_since, None,
+            "the run ended, so the file must stop reporting one"
+        );
+        assert_eq!(recovered.channels["Application"].last_error, None);
+    }
+
+    /// The ladder announcement is about movement, so a step that moves
+    /// nothing says nothing.
+    ///
+    /// The terminal rung absorbs every further failure. Announcing it per
+    /// rebuild is how one wedged channel turned into thousands of shipped
+    /// lines a day, all of them restating a move that did not happen.
+    #[tokio::test]
+    async fn a_resume_rung_that_does_not_move_is_not_announced() {
+        let _seams = SeamSession::acquire();
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // Nothing has been delivered, so the first dead bookmark has no stored
+        // time to fall back to and goes straight to the terminal rung. Every
+        // one after it has nowhere left to go.
+        let mut subscription = subscription_from(&application_config()).await;
+
+        let capture = ErrorCodeCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(collector, || {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[15011; 5]);
+            for _ in 0..5 {
+                subscription.force_rebuild_all();
+            }
+        });
+        assert!(
+            subscription.first_channel_is_future_only(),
+            "the premise is a channel parked on the terminal rung"
+        );
+
+        let lines = capture.seen.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec![("ERROR".to_string(), "resume_future_only".to_string())],
+            "five failures on a ladder that moved once must announce once"
+        );
     }
 
     /// The snapshot describes every configured channel with the facts a reader
