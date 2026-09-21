@@ -1,0 +1,68 @@
+vector_tag = "v0.57.0"
+upstream_commit = "8832452f57afb536ea0de53a093f9fd1b669ccec"
+agent_version = "1.11.3"
+linux_target = "x86_64-unknown-linux-gnu"
+linux_features = "sources-file,sources-internal_logs,sources-internal_metrics,sources-syslog,transforms-remap,transforms-throttle,transforms-reduce,transforms-route,sinks-http,sinks-file,sinks-console,sinks-blackhole,enrichment-tables-memory,vrl-functions-crypto,vrl-functions-env,vrl-functions-system"
+windows_features = "sources-file,sources-windows_event_log,sources-internal_logs,sources-internal_metrics,sources-syslog,transforms-remap,transforms-throttle,transforms-reduce,transforms-route,sinks-http,sinks-file,sinks-console,sinks-blackhole,enrichment-tables-memory,vrl-functions-crypto,vrl-functions-env,vrl-functions-system"
+linux_rustflags = ""
+windows_rustflags = "-Ctarget-feature=+crt-static"
+
+[[patches]]
+name = "grpc-optional"
+file = "10-grpc-optional.patch"
+sha256 = "58f81bae718056233bd9de2d1d2d68960bdd284b8dc13e71c6e76cb5f5262c4e"
+
+[[patches]]
+name = "windows-service-stopped-on-failed-start"
+file = "20-windows-service-stopped-on-failed-start.patch"
+sha256 = "72e7428c683d54da9be1fcc3b48058205fd3e8c935aad0fb1c5cfe4b00573deb"
+
+[[patches]]
+name = "file-source-encoding-auto"
+file = "30-file-source-encoding-auto.patch"
+sha256 = "ef2e96494fc1b10a072f20429bb44e6c0b3051b39eb1edb090c5d3735426fbf4"
+
+[[patches]]
+name = "file-status"
+file = "35-file-status.patch"
+sha256 = "5f8fee85e9f3a76c99524b6f87438eff17dbf9918e3598084d49ae2e2c7bc75c"
+
+[[patches]]
+name = "windows-event-log-userdata"
+file = "40-windows-event-log-userdata.patch"
+sha256 = "a34faa0136999791bd31464b48746e572e6afe749738b86e47aa92291f4879dd"
+
+[[patches]]
+name = "wel-resilience"
+file = "45-wel-resilience.patch"
+sha256 = "58080b9c72ba2916bb816fcf2a36e9a6f631b8e41a089c3dadf85033549ebf16"
+
+[[patches]]
+name = "wel-status"
+file = "46-wel-status.patch"
+sha256 = "84aa23005247b83f96098bcf1a0f1f7ff16e03fe4e407c9b16e0ef948a2db306"
+
+[[patches]]
+name = "vrl-compile-perf"
+file = "50-vrl-compile-perf.patch"
+sha256 = "5c82d5277cb1ac3c0dfeb06207e677c16e7d463901d7cfe3ad8e55f056795351"
+
+[[patches]]
+name = "http-sink-client-clock-utc-now"
+file = "60-http-sink-client-clock-utc-now.patch"
+sha256 = "3bb07b681a9dc751711639ef116f48f886dcff1bd5436ff527c09f99cdbe368b"
+
+[[patches]]
+name = "vrl-compile-memoize"
+file = "70-vrl-compile-memoize.patch"
+sha256 = "29f9a1dbd918fac675efd1a1cbde44277c75796be5895c1c2dac8d2cd4c72dbf"
+
+[[patches]]
+name = "event-source-id"
+file = "75-event-source-id.patch"
+sha256 = "f24b37f24e58385d1ed77415ee20a8d6fec169b72e90431d22bba40fc6195e8a"
+
+[[patches]]
+name = "alloc-tracing"
+file = "80-alloc-tracing.patch"
+sha256 = "c8f6535c8bf4ab4bd330b06e908b311dd32886a66c804884047d8569f4388c9f"

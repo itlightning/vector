@@ -3,6 +3,7 @@
 use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
+    time::Duration,
 };
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
@@ -253,12 +254,12 @@ pub struct RootOpts {
     pub no_graceful_shutdown_limit: bool,
 
     /// Set runtime allocation tracing
-    #[cfg(all(unix, feature = "tikv-jemallocator"))]
+    #[cfg(feature = "allocation-tracing")]
     #[arg(long, env = "ALLOCATION_TRACING", default_value = "false")]
     pub allocation_tracing: bool,
 
     /// Set allocation tracing reporting rate in milliseconds.
-    #[cfg(all(unix, feature = "tikv-jemallocator"))]
+    #[cfg(feature = "allocation-tracing")]
     #[arg(
         long,
         env = "ALLOCATION_TRACING_REPORTING_INTERVAL_MS",
@@ -307,6 +308,13 @@ pub struct RootOpts {
 }
 
 impl RootOpts {
+    /// How long graceful shutdown may take before Vector forces it, or `None` when the limit
+    /// is disabled and shutdown may take as long as it takes.
+    pub fn graceful_shutdown_duration(&self) -> Option<Duration> {
+        (!self.no_graceful_shutdown_limit)
+            .then(|| Duration::from_secs(u64::from(self.graceful_shutdown_limit_secs)))
+    }
+
     /// Return a list of config paths with the associated formats.
     pub fn config_paths_with_formats(&self) -> Vec<config::ConfigPath> {
         config::merge_path_lists(vec![
@@ -480,9 +488,9 @@ pub enum SubCommand {
 }
 
 impl SubCommand {
-    #[expect(
+    #[allow(
         clippy::missing_const_for_fn,
-        reason = "the #[cfg(windows)] arm calls a non-const method"
+        reason = "const-eligible on some targets only; the cfg arms differ"
     )]
     pub fn dangerously_allow_env_var_interpolation(&self) -> bool {
         match self {
@@ -530,6 +538,10 @@ pub enum Color {
 }
 
 impl Color {
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "the #[cfg(unix)] arm calls a non-const method"
+    )]
     pub fn use_color(&self) -> bool {
         match self {
             #[cfg(unix)]

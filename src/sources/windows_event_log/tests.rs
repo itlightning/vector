@@ -31,6 +31,11 @@ fn create_test_config() -> WindowsEventLogConfig {
         checkpoint_interval_secs: 5,
         acknowledgements: Default::default(),
         render_message: false,
+        subscription_refresh_secs: 86_400,
+        // Off, matching the default: these tests must exercise the source as a
+        // canonical build runs it.
+        status_path: None,
+        status_interval_secs: 30,
     }
 }
 
@@ -85,10 +90,12 @@ fn create_test_event() -> WindowsEvent {
         task_name: None,
         opcode_name: None,
         keyword_names: Vec::new(),
+        resolved_level: None,
         user_name: None,
         version: Some(1),
         qualifiers: Some(0),
         string_inserts: vec!["admin".to_string(), "2".to_string()],
+        message_source: MessageSource::Publisher,
     }
 }
 
@@ -197,6 +204,27 @@ mod config_tests {
                 .to_string()
                 .contains("Channel names cannot be empty")
         );
+    }
+
+    /// The source-level sentinel is a reserved `channel` value, so a config
+    /// can never mint a real channel that collides with it. Windows will not
+    /// create such a channel either, but that is an assumption about another
+    /// product; this makes it a property of our own input.
+    #[test]
+    fn the_source_level_channel_sentinel_is_rejected_as_a_configured_channel() {
+        for spelling in ["<source>", "  <source>  "] {
+            let mut config = create_test_config();
+            config.channels = vec!["System".to_string(), spelling.to_string()];
+
+            let message = config
+                .validate()
+                .expect_err("the sentinel must not be accepted as a channel")
+                .to_string();
+            assert!(
+                message.contains("reserved") && message.contains("<source>"),
+                "the error has to name the reserved value, got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -820,9 +848,9 @@ mod subscription_tests {
         // Should not panic or consume excessive memory
         let result = extract_xml_value(&large_xml, "EventID");
         // Should either truncate or return None, but not crash
-        match result {
-            Some(value) => assert!(value.len() <= 4096, "Should limit extracted text size"),
-            None => {} // Acceptable if parsing fails due to size limits
+        // None is acceptable: parsing may refuse the input on size alone.
+        if let Some(value) = result {
+            assert!(value.len() <= 4096, "Should limit extracted text size");
         }
     }
 }
@@ -865,10 +893,71 @@ async fn test_source_acknowledgements() {
 // Compliance tests
 #[tokio::test]
 async fn test_source_compliance() {
+    // Runs the whole source, so it opens real subscriptions and drives the
+    // drain loop: the same process-global seams every fault-injection test
+    // uses. Without the session this test silently corrupts them, which is the
+    // class of failure `test_seams` exists to make impossible.
+    let _seams = super::test_seams::SeamSession::acquire();
+
     let data_dir = tempfile::tempdir().expect("failed to create temp data_dir");
     let mut config = create_test_config();
     config.data_dir = Some(data_dir.path().to_path_buf());
     run_and_assert_source_compliance(config, Duration::from_millis(100), &SOURCE_TAGS).await;
+}
+
+/// The status file appears with nothing configured, at the path the reader
+/// scans for.
+///
+/// This is the only path production ever uses: the config generator cannot
+/// emit `status_path`, because a binary that predates the option rejects it at
+/// validate time and breaks every apply. So the derived default is what
+/// connects the two halves, and an explicit path is the rare case.
+#[tokio::test]
+async fn the_status_file_is_written_at_the_derived_default_path() {
+    let _seams = super::test_seams::SeamSession::acquire();
+
+    let data_dir = tempfile::tempdir().expect("failed to create temp data_dir");
+    let mut config = create_test_config();
+    config.data_dir = Some(data_dir.path().to_path_buf());
+    assert!(
+        config.status_path.is_none(),
+        "the case under test is the one that names no path"
+    );
+
+    run_and_assert_source_compliance(config, Duration::from_millis(500), &SOURCE_TAGS).await;
+
+    // The source resolves its own subdirectory of the data dir, so the file
+    // lands beside that source's checkpoint rather than in a shared directory.
+    let component_dirs: Vec<_> = std::fs::read_dir(data_dir.path())
+        .expect("the data dir must exist")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        component_dirs.len(),
+        1,
+        "expected one per-component directory, found {component_dirs:?}"
+    );
+
+    let status_path = component_dirs[0].join("windows_event_log_status.json");
+    let raw = std::fs::read(&status_path).unwrap_or_else(|e| {
+        panic!("no status file at {}: {e}", status_path.display());
+    });
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&raw).expect("the status file must be complete JSON");
+    assert_eq!(parsed["schema"], 1);
+    assert!(
+        parsed["as_of"].is_string(),
+        "the reader treats a stale as_of as no information, so it is required"
+    );
+    for channel in ["System", "Application"] {
+        assert!(
+            parsed["channels"][channel].is_object(),
+            "every configured channel must appear, reachable or not: {parsed}"
+        );
+    }
 }
 
 // ================================================================================================
@@ -1163,7 +1252,7 @@ mod fault_tolerance_tests {
         let result = extract_event_data(invalid_xml, &config);
         // Should return empty result or handle gracefully without crashing
         assert!(
-            result.structured_data.len() == 0,
+            result.structured_data.is_empty(),
             "Invalid XML should result in empty data"
         );
     }
@@ -1179,7 +1268,7 @@ mod fault_tolerance_tests {
 
         let config = WindowsEventLogConfig::default();
         for malicious_xml in &malicious_xmls {
-            let result = extract_event_data(&malicious_xml, &config);
+            let result = extract_event_data(malicious_xml, &config);
             // Should handle without crashing or excessive resource usage
             assert!(
                 result.structured_data.len() <= 100,
@@ -1398,7 +1487,7 @@ mod checkpoint_tests {
     #[test]
     fn test_checkpoint_path_construction() {
         // Verify that the checkpoint module exists and can be used
-        let _ = std::mem::size_of::<super::super::checkpoint::Checkpointer>();
+        assert!(std::mem::size_of::<super::super::checkpoint::Checkpointer>() > 0);
         // The actual file operations would require Windows, so we only validate type availability.
     }
 }
@@ -1439,30 +1528,47 @@ mod message_rendering_tests {
 
     #[test]
     fn test_render_message_false_uses_fallback() {
-        // When render_message is false, the parser should use fallback message
+        // When render_message is false there is no publisher template, so the
+        // message degrades to the honesty marker rather than to a synthetic
+        // sentence. A synthetic "Event ID X from Y on Z" reads as a real event
+        // message when no message was actually available, which is the thing
+        // the marker exists to prevent. The structured fields still carry the
+        // event id and provider.
         let config = WindowsEventLogConfig {
             render_message: false,
             ..Default::default()
         };
         let parser = EventLogParser::new(&config, LogNamespace::Legacy);
 
-        // Create event without rendered_message
         let mut event = create_test_event();
         event.rendered_message = None;
-        event.event_data.clear(); // No message in event_data either
-        event.string_inserts.clear(); // Clear string inserts to reach fallback path
+        event.message_source = MessageSource::None;
+        event.event_data.clear();
+        event.string_inserts.clear();
 
         let log_event = parser.parse_event(event.clone()).unwrap();
 
-        // Should have fallback message format: "Event ID X from Provider on Computer"
-        if let Some(message) = log_event.get(event_path!("message")) {
-            let msg_str = message.to_string_lossy();
-            assert!(
-                msg_str.contains("Event ID") || msg_str.contains(&event.event_id.to_string()),
-                "Fallback message should contain Event ID: got '{}'",
-                msg_str
-            );
-        }
+        let message = log_event
+            .get(event_path!("message"))
+            .expect("a message must always be present");
+        assert_eq!(
+            message.to_string_lossy(),
+            format!(
+                "no description; provider {} is not registered on this host",
+                event.provider_name
+            ),
+            "a degraded message must never render empty: an empty message hides \
+             a real signal about the host"
+        );
+        assert_eq!(
+            log_event.get(event_path!("message_source")),
+            Some(&Value::Bytes("none".into())),
+            "the structured field, not the text, is what consumers key on"
+        );
+        assert_eq!(
+            log_event.get(event_path!("event_id")),
+            Some(&Value::Integer(i64::from(event.event_id)))
+        );
     }
 
     #[test]
@@ -1676,5 +1782,150 @@ mod truncation_tests {
             config.validate().is_err(),
             "1001 event IDs should be rejected"
         );
+    }
+}
+
+// ================================================================================================
+// ACK DRAIN ON SHUTDOWN TESTS
+// ================================================================================================
+
+/// The restart-duplicate defect lived here: acks that landed while the source
+/// was shutting down were dropped, their checkpoints were never written, and
+/// the next start replayed the events. These tests assert on the checkpoint
+/// file, not on the drain returning, because returning promptly is exactly what
+/// the broken version did.
+#[cfg(test)]
+mod ack_drain_tests {
+    use std::{sync::Arc, time::Instant};
+
+    use super::super::{
+        Finalizer, FinalizerEntry, apply_ready_acks,
+        checkpoint::{ChannelPosition, Checkpointer},
+        drain_acks,
+    };
+    use super::*;
+    use crate::{event::BatchNotifier, test_util::temp_dir};
+
+    const BOOKMARK: &str =
+        "<BookmarkList><Bookmark Channel='Security' RecordId='42'/></BookmarkList>";
+
+    fn security_entry() -> FinalizerEntry {
+        FinalizerEntry {
+            positions: vec![ChannelPosition {
+                channel: "Security".to_string(),
+                bookmark_xml: BOOKMARK.to_string(),
+                last_event_time: Some("2026-08-09T00:00:00.0000000Z".to_string()),
+                last_record_id: Some(42),
+            }],
+        }
+    }
+
+    /// Read the checkpoint back through a fresh `Checkpointer` so the assertion
+    /// is about what is on disk, not about in-memory state.
+    async fn persisted_record_id(data_dir: &std::path::Path) -> Option<u64> {
+        Checkpointer::new(data_dir)
+            .await
+            .expect("checkpointer should load")
+            .get("Security")
+            .await
+            .and_then(|checkpoint| checkpoint.last_record_id)
+    }
+
+    #[tokio::test]
+    async fn ack_arriving_during_shutdown_is_checkpointed() {
+        let data_dir = temp_dir();
+        let checkpointer = Arc::new(
+            Checkpointer::new(&data_dir)
+                .await
+                .expect("checkpointer should initialize"),
+        );
+        let (finalizer, mut ack_stream) = Finalizer::new(true, Arc::clone(&checkpointer));
+
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        finalizer.finalize(security_entry(), Some(receiver)).await;
+
+        // Not acknowledged yet, so nothing may be checkpointed yet.
+        apply_ready_acks(&mut ack_stream, &checkpointer).await;
+        assert_eq!(
+            persisted_record_id(&data_dir).await,
+            None,
+            "checkpoint must not be written before the batch is acknowledged"
+        );
+
+        // The ack lands after the drain is already running: the delivered-but-
+        // not-yet-acknowledged window that produced the duplicates.
+        let ack_delay = std::time::Duration::from_millis(300);
+        let acker = tokio::spawn(async move {
+            tokio::time::sleep(ack_delay).await;
+            drop(batch); // resolves the receiver as Delivered
+        });
+
+        let started = Instant::now();
+        drain_acks(finalizer, &mut ack_stream, &checkpointer).await;
+        let waited = started.elapsed();
+        acker.await.expect("ack task should not panic");
+
+        assert_eq!(
+            persisted_record_id(&data_dir).await,
+            Some(42),
+            "an ack delivered during shutdown must reach the checkpoint file"
+        );
+        assert!(
+            waited >= ack_delay,
+            "drain returned in {waited:?}, before the ack could arrive; it did not wait for the outstanding batch"
+        );
+
+        _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn ready_acks_are_checkpointed_while_running() {
+        let data_dir = temp_dir();
+        let checkpointer = Arc::new(
+            Checkpointer::new(&data_dir)
+                .await
+                .expect("checkpointer should initialize"),
+        );
+        let (finalizer, mut ack_stream) = Finalizer::new(true, Arc::clone(&checkpointer));
+
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        finalizer.finalize(security_entry(), Some(receiver)).await;
+        drop(batch);
+
+        // The pull loop polls without waiting, so give the ack a moment to
+        // become ready, then take the same non-blocking pass the loop takes.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        apply_ready_acks(&mut ack_stream, &checkpointer).await;
+
+        assert_eq!(
+            persisted_record_id(&data_dir).await,
+            Some(42),
+            "a ready ack must be checkpointed without waiting for shutdown"
+        );
+
+        drain_acks(finalizer, &mut ack_stream, &checkpointer).await;
+        _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn sync_mode_drain_returns_without_hanging() {
+        let data_dir = temp_dir();
+        let checkpointer = Arc::new(
+            Checkpointer::new(&data_dir)
+                .await
+                .expect("checkpointer should initialize"),
+        );
+        let (finalizer, mut ack_stream) = Finalizer::new(false, Arc::clone(&checkpointer));
+
+        // Acknowledgements disabled: checkpoints are written inline, and the
+        // drain must be a no-op rather than a wait for acks that never come.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_acks(finalizer, &mut ack_stream, &checkpointer),
+        )
+        .await
+        .expect("sync-mode drain must not block shutdown");
+
+        _ = std::fs::remove_dir_all(&data_dir);
     }
 }
