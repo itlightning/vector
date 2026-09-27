@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use file_source_common::{
     FileFingerprint, FileSourceInternalEvents, Fingerprinter, ReadFrom,
     checkpointer::{Checkpointer, CheckpointsView},
-    status::{FileSourceStatus, FileState, FileStatus, StatusWriter, secs_ago},
+    status::{FileSourceStatus, FileStatus, ReadFailure, StatusWriter, secs_ago},
 };
 use futures::{
     Future, Sink, SinkExt,
@@ -117,22 +117,22 @@ where
 
         let mut known_small_files = HashMap::new();
 
-        // Paths the last scan found but could not fingerprint, and which are not merely
-        // waiting for a first complete line (those land in `known_small_files`). Kept
-        // for the status file: a file the source cannot read is otherwise invisible to
-        // anything downstream, and looks exactly like an idle one.
-        let mut unreadable_paths: Vec<PathBuf> = Vec::new();
+        // Paths the last scan found but failed to open or fingerprint, with why. Kept for
+        // the status file: a file the source cannot read is otherwise invisible to
+        // anything downstream, and looks exactly like an idle one. A path that vanished
+        // between the glob and the open is not here.
+        let mut unreadable_paths: Vec<(PathBuf, ReadFailure)> = Vec::new();
 
         let mut existing_files = Vec::new();
         for path in self.paths_provider.paths().into_iter() {
-            if let Some(file_id) = self
+            match self
                 .fingerprinter
-                .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
+                .try_fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
                 .await
             {
-                existing_files.push((path, file_id));
-            } else if !known_small_files.contains_key(&path) {
-                unreadable_paths.push(path);
+                Ok(Some(file_id)) => existing_files.push((path, file_id)),
+                Ok(None) => {}
+                Err(failure) => unreadable_paths.push((path, failure)),
             }
         }
 
@@ -221,11 +221,11 @@ where
                 // must stop being reported as unreadable.
                 unreadable_paths.clear();
                 for path in self.paths_provider.paths().into_iter() {
-                    if let Some(file_id) = self
+                    let fingerprint = self
                         .fingerprinter
-                        .fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
-                        .await
-                    {
+                        .try_fingerprint_or_emit(&path, &mut known_small_files, &self.emitter)
+                        .await;
+                    if let Ok(Some(file_id)) = fingerprint {
                         if let Some(watcher) = fp_map.get_mut(&file_id) {
                             // file fingerprint matches a watched file
                             let was_found_this_cycle = watcher.file_findable();
@@ -269,8 +269,8 @@ where
                                 .await;
                             self.emitter.emit_files_open(fp_map.len());
                         }
-                    } else if !known_small_files.contains_key(&path) {
-                        unreadable_paths.push(path);
+                    } else if let Err(failure) = fingerprint {
+                        unreadable_paths.push((path, failure));
                     }
                 }
                 stats.record("discovery", start.elapsed());
@@ -477,52 +477,26 @@ where
                 );
 
                 for (file_id, watcher) in &fp_map {
-                    // Re-stat here rather than reuse a size the read path already saw.
-                    // A size carried over from the last read reports position == size
-                    // for a file that grew but was NOT read, which is a wedged reader
-                    // reporting itself caught up.
-                    let size = fs::metadata(&watcher.path).await.ok().map(|m| m.len());
-                    let position = watcher.get_file_position();
-                    let state = match size {
-                        Some(size) if position < size => FileState::Reading,
-                        Some(_) => FileState::CaughtUp,
-                        // Watched, but no longer stattable: it vanished between the read
-                        // pass and here, or its permissions changed under us.
-                        None => FileState::Unreadable,
-                    };
-                    status.push(FileStatus {
-                        path: watcher.path.to_string_lossy().into_owned(),
-                        fingerprint: Some(*file_id),
-                        position: Some(position),
-                        size,
-                        last_read_secs_ago: Some(secs_ago(
-                            status_now,
-                            watcher.last_read_success().into_std(),
-                        )),
-                        state,
-                    });
+                    let last_read_secs_ago =
+                        secs_ago(status_now, watcher.last_read_success().into_std());
+                    if let Some(file) = FileStatus::watched(
+                        &watcher.path,
+                        *file_id,
+                        watcher.get_file_position(),
+                        last_read_secs_ago,
+                    )
+                    .await
+                    {
+                        status.push(file);
+                    }
                 }
 
                 for path in known_small_files.keys() {
-                    status.push(FileStatus {
-                        path: path.to_string_lossy().into_owned(),
-                        fingerprint: None,
-                        position: None,
-                        size: fs::metadata(path).await.ok().map(|m| m.len()),
-                        last_read_secs_ago: None,
-                        state: FileState::TooSmallToFingerprint,
-                    });
+                    status.push(FileStatus::too_small_to_fingerprint(path).await);
                 }
 
-                for path in &unreadable_paths {
-                    status.push(FileStatus {
-                        path: path.to_string_lossy().into_owned(),
-                        fingerprint: None,
-                        position: None,
-                        size: None,
-                        last_read_secs_ago: None,
-                        state: FileState::Unreadable,
-                    });
+                for (path, failure) in &unreadable_paths {
+                    status.push(FileStatus::unreadable(path, *failure));
                 }
 
                 status_writer.write(&status, status_now).await;

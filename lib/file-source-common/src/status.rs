@@ -74,10 +74,63 @@ pub enum FileState {
     /// and is not yet watched. The ordinary state of a log between creation and its
     /// first newline.
     TooSmallToFingerprint,
-    /// Discovered, but the source could not read it (permissions, or it vanished between
-    /// the glob and the open). The error itself is reported through the source's normal
-    /// internal events; this file only records that it happened.
+    /// Discovered, but opening or reading it for a fingerprint failed with something
+    /// other than "not found". The error is also reported through the source's normal
+    /// internal events; this file records its kind and OS code.
+    ///
+    /// A path that vanished between the glob and the open, or a watched file that can no
+    /// longer be stat'ed at snapshot time, is left out of the snapshot instead: it is gone,
+    /// or will be classified by the next scan.
     Unreadable,
+}
+
+/// Why a discovered file is [`FileState::Unreadable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadErrorKind {
+    /// The OS refused access (Windows `ERROR_ACCESS_DENIED`, unix `EACCES`/`EPERM`).
+    PermissionDenied,
+    /// Windows only: another process holds the file open without sharing read access.
+    SharingViolation,
+    /// Any other failure; `os_error_code` says which, when the OS gave one.
+    Other,
+}
+
+/// A read failure, reduced to what the status file reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadFailure {
+    pub kind: ReadErrorKind,
+    /// `raw_os_error()`: a Win32 error code on Windows, an errno elsewhere.
+    pub os_error_code: Option<i32>,
+}
+
+/// PROVENANCE: winerror.h `ERROR_SHARING_VIOLATION` (32L), Microsoft "System Error Codes
+/// (0-499)". Windows only: 32 is `EPIPE` on unix.
+#[cfg(windows)]
+const ERROR_SHARING_VIOLATION: i32 = 32;
+
+impl ReadFailure {
+    /// Classify an I/O error. The caller decides which errors are failures at all
+    /// (`NotFound` is not).
+    #[must_use]
+    pub fn of(error: &io::Error) -> Self {
+        let os_error_code = error.raw_os_error();
+        #[cfg(windows)]
+        let sharing = os_error_code == Some(ERROR_SHARING_VIOLATION);
+        #[cfg(not(windows))]
+        let sharing = false;
+        let kind = if sharing {
+            ReadErrorKind::SharingViolation
+        } else if error.kind() == io::ErrorKind::PermissionDenied {
+            ReadErrorKind::PermissionDenied
+        } else {
+            ReadErrorKind::Other
+        };
+        Self {
+            kind,
+            os_error_code,
+        }
+    }
 }
 
 /// One discovered file, as of the snapshot.
@@ -111,6 +164,79 @@ pub struct FileStatus {
 
     /// What the source is doing with it.
     pub state: FileState,
+
+    /// Why the file is unreadable. Present only with [`FileState::Unreadable`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<ReadErrorKind>,
+
+    /// The OS error code behind `error_kind` (Win32 on Windows, errno elsewhere), when
+    /// the OS gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_error_code: Option<i32>,
+}
+
+impl FileStatus {
+    /// A watched file, re-stat'ed now.
+    ///
+    /// The size is measured here rather than carried from the last read: a size cached
+    /// from the last read reports position == size for a file that grew but was NOT read,
+    /// which is a wedged reader reporting itself caught up.
+    ///
+    /// `None` when the stat fails. The file vanished after the read pass (a rotation or a
+    /// cleanup renamed or deleted it), or its permissions changed; either way the next
+    /// scan either finds it again or drops the watcher, and reporting it as unreadable in
+    /// between would claim a read failure that never happened.
+    pub async fn watched(
+        path: &Path,
+        fingerprint: FileFingerprint,
+        position: FilePosition,
+        last_read_secs_ago: u64,
+    ) -> Option<Self> {
+        let size = tokio::fs::metadata(path).await.ok()?.len();
+        Some(Self {
+            path: path.to_string_lossy().into_owned(),
+            fingerprint: Some(fingerprint),
+            position: Some(position),
+            size: Some(size),
+            last_read_secs_ago: Some(last_read_secs_ago),
+            state: if position < size {
+                FileState::Reading
+            } else {
+                FileState::CaughtUp
+            },
+            error_kind: None,
+            os_error_code: None,
+        })
+    }
+
+    /// A discovered file still waiting for its first complete line.
+    pub async fn too_small_to_fingerprint(path: &Path) -> Self {
+        Self {
+            path: path.to_string_lossy().into_owned(),
+            fingerprint: None,
+            position: None,
+            size: tokio::fs::metadata(path).await.ok().map(|m| m.len()),
+            last_read_secs_ago: None,
+            state: FileState::TooSmallToFingerprint,
+            error_kind: None,
+            os_error_code: None,
+        }
+    }
+
+    /// A discovered file the source failed to open or fingerprint.
+    #[must_use]
+    pub fn unreadable(path: &Path, failure: ReadFailure) -> Self {
+        Self {
+            path: path.to_string_lossy().into_owned(),
+            fingerprint: None,
+            position: None,
+            size: None,
+            last_read_secs_ago: None,
+            state: FileState::Unreadable,
+            error_kind: Some(failure.kind),
+            os_error_code: failure.os_error_code,
+        }
+    }
 }
 
 /// One snapshot of a `file` source.
@@ -318,6 +444,8 @@ mod tests {
             size: Some(100),
             last_read_secs_ago: Some(3),
             state: FileState::CaughtUp,
+            error_kind: None,
+            os_error_code: None,
         });
         status
     }
@@ -358,17 +486,18 @@ mod tests {
         assert_eq!(status.include_patterns, vec!["/var/log/*.log".to_string()]);
     }
 
+    const DENIED: ReadFailure = ReadFailure {
+        kind: ReadErrorKind::PermissionDenied,
+        os_error_code: Some(5),
+    };
+
     #[test]
     fn unreadable_files_are_counted() {
         let mut status = FileSourceStatus::new(Utc::now(), vec![], Duration::ZERO, Duration::ZERO);
-        status.push(FileStatus {
-            path: "/var/log/denied.log".to_string(),
-            fingerprint: None,
-            position: None,
-            size: None,
-            last_read_secs_ago: None,
-            state: FileState::Unreadable,
-        });
+        status.push(FileStatus::unreadable(
+            Path::new("/var/log/denied.log"),
+            DENIED,
+        ));
         status.push(FileStatus {
             path: "/var/log/fine.log".to_string(),
             fingerprint: None,
@@ -376,9 +505,146 @@ mod tests {
             size: Some(0),
             last_read_secs_ago: None,
             state: FileState::CaughtUp,
+            error_kind: None,
+            os_error_code: None,
         });
         assert_eq!(status.files_discovered, 2);
         assert_eq!(status.files_unreadable, 1);
+    }
+
+    /// A watched file renamed away after the read pass (a rotation, or a cleanup of a
+    /// drained file) is gone, not unreadable: no entry, and nothing counted.
+    #[tokio::test]
+    async fn a_watched_file_renamed_away_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let watched = dir.path().join("spool.log");
+        let renamed = dir.path().join("spool.log.1");
+        std::fs::write(&watched, b"0123456789").unwrap();
+        let fingerprint = FileFingerprint::FirstLinesChecksum(7);
+
+        let before = FileStatus::watched(&watched, fingerprint, 4, 1).await;
+        assert_eq!(
+            before.map(|f| (f.state, f.size)),
+            Some((FileState::Reading, Some(10)))
+        );
+
+        std::fs::rename(&watched, &renamed).unwrap();
+        let mut status = FileSourceStatus::new(Utc::now(), vec![], Duration::ZERO, Duration::ZERO);
+        if let Some(file) = FileStatus::watched(&watched, fingerprint, 10, 1).await {
+            status.push(file);
+        }
+
+        assert_eq!(status.files, vec![]);
+        assert_eq!(status.files_discovered, 0);
+        assert_eq!(status.files_unreadable, 0);
+    }
+
+    /// The size is re-measured, so a file read to its end reads caught up and one that
+    /// grew since reads behind.
+    #[tokio::test]
+    async fn a_watched_file_is_sized_at_snapshot_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let fingerprint = FileFingerprint::FirstLinesChecksum(7);
+
+        let caught_up = FileStatus::watched(&path, fingerprint, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(caught_up.state, FileState::CaughtUp);
+
+        std::fs::write(&path, b"0123456789abc").unwrap();
+        let behind = FileStatus::watched(&path, fingerprint, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((behind.state, behind.size), (FileState::Reading, Some(13)));
+    }
+
+    /// An unreadable entry carries why, as literal field spellings the consumer parses.
+    #[test]
+    fn an_unreadable_entry_carries_its_error() {
+        let file = FileStatus::unreadable(
+            Path::new(r"C:\ProgramData\app\locked.log"),
+            ReadFailure {
+                kind: ReadErrorKind::SharingViolation,
+                os_error_code: Some(32),
+            },
+        );
+        assert_eq!(
+            serde_json::to_string(&file).unwrap(),
+            r#"{"path":"C:\\ProgramData\\app\\locked.log","state":"unreadable","error_kind":"sharing_violation","os_error_code":32}"#
+        );
+    }
+
+    #[test]
+    fn the_error_fields_round_trip() {
+        let mut status = sample();
+        status.push(FileStatus::unreadable(
+            Path::new("/var/log/denied.log"),
+            DENIED,
+        ));
+        status.push(FileStatus::unreadable(
+            Path::new("/var/log/odd.log"),
+            ReadFailure {
+                kind: ReadErrorKind::Other,
+                os_error_code: None,
+            },
+        ));
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: FileSourceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, status);
+        assert_eq!(parsed.files_unreadable, 2);
+    }
+
+    /// Entries written before the error fields existed still parse.
+    #[test]
+    fn an_entry_without_error_fields_parses() {
+        let file: FileStatus =
+            serde_json::from_str(r#"{"path":"/var/log/a.log","state":"unreadable"}"#).unwrap();
+        assert_eq!((file.error_kind, file.os_error_code), (None, None));
+    }
+
+    #[test]
+    fn io_errors_are_classified() {
+        let denied = ReadFailure::of(&io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            (denied.kind, denied.os_error_code),
+            (ReadErrorKind::PermissionDenied, None)
+        );
+        let other = ReadFailure::of(&io::Error::other("boom"));
+        assert_eq!(
+            (other.kind, other.os_error_code),
+            (ReadErrorKind::Other, None)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_codes_are_classified() {
+        let denied = ReadFailure::of(&io::Error::from_raw_os_error(5));
+        assert_eq!(
+            (denied.kind, denied.os_error_code),
+            (ReadErrorKind::PermissionDenied, Some(5))
+        );
+        let sharing = ReadFailure::of(&io::Error::from_raw_os_error(32));
+        assert_eq!(
+            (sharing.kind, sharing.os_error_code),
+            (ReadErrorKind::SharingViolation, Some(32))
+        );
+        // ERROR_LOCK_VIOLATION: a different failure, not folded into sharing.
+        let lock = ReadFailure::of(&io::Error::from_raw_os_error(33));
+        assert_eq!(
+            (lock.kind, lock.os_error_code),
+            (ReadErrorKind::Other, Some(33))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn errno_32_is_not_a_sharing_violation() {
+        // EPIPE shares the number with ERROR_SHARING_VIOLATION.
+        let pipe = ReadFailure::of(&io::Error::from_raw_os_error(32));
+        assert_eq!(pipe.kind, ReadErrorKind::Other);
     }
 
     /// The first write is due immediately, and arming pushes it out by exactly the
