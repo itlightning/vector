@@ -143,6 +143,11 @@ pub(super) static EVT_NEXT_SCRIPT: std::sync::Mutex<
     Option<std::collections::VecDeque<(u32, u32)>>,
 > = std::sync::Mutex::new(None);
 
+/// Script count that keeps the handles the real call returned and replaces
+/// only its code.
+#[cfg(test)]
+pub(super) const KEEP_REAL_BATCH: u32 = u32::MAX;
+
 /// Test-only script that replaces the `EvtSubscribe` result with a win32 code.
 ///
 /// A failed rebuild is otherwise unreachable from a test on a healthy host, and
@@ -1660,6 +1665,11 @@ impl EventLogSubscription {
                         .as_mut()
                         .and_then(std::collections::VecDeque::pop_front);
                     match scripted {
+                        // Keeps the real batch and replaces only the code, for
+                        // a test that needs the returned events delivered.
+                        Some((code, KEEP_REAL_BATCH)) => Err(windows::core::Error::from_hresult(
+                            windows::core::HRESULT(code as i32),
+                        )),
                         Some((code, count)) => {
                             // The real call already ran and may have populated
                             // handles. Close them and hand the drain loop a
@@ -1704,6 +1714,10 @@ impl EventLogSubscription {
                     }
                 }
 
+                // "No more items" with handles beside it: the batch is
+                // delivered like a successful one, and the head is stamped
+                // only once it has been.
+                let mut closing_batch = false;
                 if let Err(err) = result {
                     let code = win32_code(&err);
                     let outcome =
@@ -1727,9 +1741,14 @@ impl EventLogSubscription {
                             // the head whether or not this pull also returned
                             // handles: the code is the service saying the
                             // queue is empty once they are handed over.
-                            channel_sub.note_reached_head();
-                            channel_drained = true;
-                            break;
+                            // Returned handles are real events and are never
+                            // discarded here; the batch below delivers them.
+                            if returned == 0 {
+                                channel_sub.note_reached_head();
+                                channel_drained = true;
+                                break;
+                            }
+                            closing_batch = true;
                         }
                         DrainOutcome::SkipChannel(reason) => {
                             channel_sub.skip_channel(reason, code, &err);
@@ -2104,6 +2123,12 @@ impl EventLogSubscription {
                     channel_sub.batch.observe_clean_batch();
                 }
                 channel_sub.backoff.reset();
+
+                if closing_batch {
+                    channel_sub.note_reached_head();
+                    channel_drained = true;
+                    break;
+                }
             }
 
             if channel_drained && !bookmark_failed {
@@ -6537,6 +6562,7 @@ mod tests {
         let _seams = SeamSession::acquire();
         let mut subscription = subscription_from(&application_config()).await;
         {
+            let _renders = RenderFailGuard::install(&_seams);
             let _guard = ScriptGuard::install(&_seams, &[(259, 3)]);
             _ = subscription.pull_events(usize::MAX);
         }
@@ -6549,6 +6575,57 @@ mod tests {
         assert_eq!(channel.polls_at_head, 1);
         assert_eq!(channel.polls_on_budget, 0);
         assert_eq!(channel.last_budget_poll_at, None);
+    }
+
+    /// Events handed back beside "no more items" are real: they are delivered
+    /// exactly once, and the head is stamped after them.
+    #[tokio::test]
+    async fn a_closing_batch_beside_no_more_items_is_delivered_once() {
+        let _seams = SeamSession::acquire();
+        let mut baseline = subscription_from(&application_config()).await;
+        let before = drain_all(&mut baseline);
+        assert!(
+            before.len() > 2,
+            "the Application backlog must outlast the closing batch"
+        );
+        drop(baseline);
+
+        let mut subscription = subscription_from(&application_config()).await;
+        let closing: Vec<u64> = {
+            let _guard = ScriptGuard::install(&_seams, &[(259, KEEP_REAL_BATCH)]);
+            subscription
+                .pull_events(2)
+                .unwrap_or_default()
+                .iter()
+                .map(|e| e.record_id)
+                .collect()
+        };
+        assert_eq!(
+            closing,
+            before[..2],
+            "both events returned beside no more items are delivered"
+        );
+
+        let channel = application_status(&subscription);
+        assert!(channel.last_drained_at.is_some());
+        assert_eq!(channel.polls_at_head, 1);
+        assert_eq!(channel.polls_on_budget, 0);
+
+        let mut delivered = closing;
+        delivered.extend(drain_all(&mut subscription));
+        let mut seen = std::collections::HashSet::new();
+        for record_id in &delivered {
+            assert!(
+                seen.insert(*record_id),
+                "record {record_id} was delivered twice"
+            );
+        }
+        for record_id in &before {
+            assert!(
+                seen.contains(record_id),
+                "record {record_id} was never delivered"
+            );
+        }
     }
 
     /// A poll cut off by the budget proves nothing about the head, and is
