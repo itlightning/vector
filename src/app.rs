@@ -69,8 +69,7 @@ impl ApplicationConfig {
     ) -> Result<Self, ExitCode> {
         let config_paths = opts.config_paths_with_formats();
 
-        let graceful_shutdown_duration = (!opts.no_graceful_shutdown_limit)
-            .then(|| Duration::from_secs(u64::from(opts.graceful_shutdown_limit_secs)));
+        let graceful_shutdown_duration = opts.graceful_shutdown_duration();
 
         let watcher_conf = if opts.watch_config {
             Some(watcher_config(
@@ -218,6 +217,10 @@ impl Application {
             opts.root.internal_logs_source_rate_limit,
         );
 
+        // Earliest point at which the profiler's startup outcome can reach a log sink.
+        #[cfg(feature = "mimalloc-pprof")]
+        crate::heap_profile::log_started();
+
         #[cfg(unix)]
         if opts.root.raise_fd_limit {
             crate::cli::raise_file_descriptor_limit();
@@ -252,6 +255,15 @@ impl Application {
         }
 
         config::set_env_var_interpolation(opts.root.dangerously_allow_env_var_interpolation);
+
+        // Past the subcommand dispatch above, so only the long-running server pays for it.
+        #[cfg(windows)]
+        crate::heap_reclaim::spawn();
+
+        // Same placement, same reason. Off unless SPARKLOGS_RSS_LOG_INTERVAL_SECS is set; in a
+        // mimalloc-pprof build the heap snapshots already carry a sample without it.
+        #[cfg(windows)]
+        crate::process_memory::spawn();
 
         let config = runtime.block_on(ApplicationConfig::from_opts(
             &opts.root,
@@ -317,7 +329,15 @@ pub struct StartedApplication {
 
 impl StartedApplication {
     pub async fn run(self) -> ExitStatus {
-        self.main().await.shutdown().await
+        let status = self.main().await.shutdown().await;
+
+        // Both the console entry point and the Windows service entry point return through
+        // here, and a console interrupt arrives as a shutdown signal rather than as an
+        // abrupt exit, so this one site covers every ordinary way the process ends.
+        #[cfg(feature = "mimalloc-pprof")]
+        crate::heap_profile::dump();
+
+        status
     }
 
     pub async fn main(self) -> FinishedApplication {
@@ -549,6 +569,25 @@ fn get_log_levels(default: &str) -> String {
         .unwrap_or_else(|_| default.into())
 }
 
+/// How long an idle blocking-pool thread is kept before it is reaped.
+///
+/// Tokio's default is 10 seconds, which this replaces. The pool inflates during bursts and, at
+/// that default, never deflates on a pipeline that sees work every few seconds: a thread has to
+/// sit idle for the whole 10 seconds to be reaped, and the next batch always arrives first, so a
+/// pool inflated once stays inflated. Measured here: a first run against an empty data directory
+/// peaked at ~251 blocking threads, steady busy ingest sat at ~44, and a process left idle well
+/// after ingest still held 126, of which 113 were parked doing nothing. Steady-state need is 11
+/// blocking tasks (5 Windows Event Log `wait_for_events_blocking` readers, 4 file-source loops,
+/// 2 workers). 200ms drains the burst population between bursts instead.
+///
+/// The churn this trades against is close to zero, because every steady-state blocking task is
+/// long-lived and therefore occupied rather than parked, and the keep-alive only ever applies to
+/// a thread that is idle. Only the transient burst population is affected.
+///
+/// `max_blocking_threads(20_000)` above is a deliberate upstream choice and is intentionally left
+/// alone: it caps how far the pool may inflate, while this controls how long it stays inflated.
+const BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_millis(200);
+
 pub fn build_runtime(
     threads: Option<usize>,
     chunk_size_events: Option<NonZeroUsize>,
@@ -556,6 +595,7 @@ pub fn build_runtime(
 ) -> Result<Runtime, ExitCode> {
     let mut rt_builder = runtime::Builder::new_multi_thread();
     rt_builder.max_blocking_threads(20_000);
+    rt_builder.thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE);
     rt_builder.enable_all().thread_name(thread_name);
 
     let threads = threads.unwrap_or_else(crate::num_threads);
