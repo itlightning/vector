@@ -527,12 +527,20 @@ struct ChannelSubscription {
     last_event_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Previous record id, for gap detection.
     last_record_id_seen: Option<u64>,
-    /// When a read on this channel last came back with zero events, which is
-    /// the only exact statement that the subscription was at the head. Reported
-    /// in the status file. Set only where a read genuinely returned nothing:
-    /// never on an error, a batch cap, or a budget stop, all of which leave
-    /// events unread.
+    /// When a poll of this channel last ended with the subscription's queue
+    /// empty, the only exact statement that it was at the head. Reported in
+    /// the status file. Earned by a pull that returned nothing, or by one that
+    /// ended with "no more items"; never by an error, a full batch, or a budget
+    /// stop, all of which can leave events unread.
     last_drained_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Polls that ended at the head, since the process started. Never reset,
+    /// so a rebuild cannot hide how a channel has been ending its polls.
+    polls_at_head: u64,
+    /// Polls that ended on the per-poll event budget, since the process
+    /// started. Never reset, like [`Self::polls_at_head`].
+    polls_on_budget: u64,
+    /// When a poll last ended on the budget.
+    last_budget_poll_at: Option<chrono::DateTime<chrono::Utc>>,
     /// When the current run of failures started, cleared by the rebuild that
     /// ends it. Reported in the status file, where the reader needs the start
     /// of the run rather than the latest failure to judge how long a channel
@@ -994,18 +1002,31 @@ impl ChannelSubscription {
         }
     }
 
-    /// Note that a read on this channel came back empty.
+    /// Note that a poll of this channel ended with the subscription's queue
+    /// empty.
     ///
     /// The one exact statement available about being caught up, and it is
     /// stamped here rather than inferred by whatever polls the status file:
     /// this loop runs far more often than that poll, so a busy channel can hit
     /// the head repeatedly between two polls and be caught mid-batch by both.
     ///
-    /// Every caller must have an EMPTY read in hand. An error, a batch cap, or
-    /// an exhausted budget all leave events unread, and stamping any of them
+    /// Every caller must hold the service's own word that nothing is left: a
+    /// pull that returned nothing, or a pull that ended with "no more items".
+    /// The second earns it even when the same pull also returned events, since
+    /// the code says the queue was empty once those were handed over, which is
+    /// the statement an empty pull makes. An error, a full batch, or an
+    /// exhausted budget all can leave events unread, and stamping any of them
     /// would claim the head while a backlog sits behind it.
-    fn note_drained_to_empty(&mut self) {
+    fn note_reached_head(&mut self) {
         self.last_drained_at = Some(chrono::Utc::now());
+        self.polls_at_head += 1;
+    }
+
+    /// Note that a poll of this channel stopped on the per-poll event budget,
+    /// which says nothing about what is still queued.
+    fn note_budget_stop(&mut self) {
+        self.last_budget_poll_at = Some(chrono::Utc::now());
+        self.polls_on_budget += 1;
     }
 
     /// Record the hole a ladder step just created, if it created one, and
@@ -1076,6 +1097,11 @@ impl ChannelSubscription {
             last_error: self.last_error,
             retry_attempt: self.backoff.attempt(),
             name_table_misses: self.name_table_misses,
+            polls_at_head: self.polls_at_head,
+            polls_on_budget: self.polls_on_budget,
+            last_budget_poll_at: self
+                .last_budget_poll_at
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             gaps: self.gaps.iter().cloned().collect(),
         }
     }
@@ -1329,6 +1355,9 @@ impl EventLogSubscription {
                 // been reached. Never seeded from the checkpoint: an old
                 // process reaching the head says nothing about this one.
                 last_drained_at: None,
+                polls_at_head: 0,
+                polls_on_budget: 0,
+                last_budget_poll_at: None,
                 unavailable_since: None,
                 last_error: None,
                 query_filters,
@@ -1597,6 +1626,7 @@ impl EventLogSubscription {
             // channel without waiting for a fresh OS signal.
             'drain: loop {
                 if channel_count >= channel_limit {
+                    channel_sub.note_budget_stop();
                     break;
                 }
 
@@ -1693,13 +1723,11 @@ impl EventLogSubscription {
 
                     match outcome {
                         DrainOutcome::Drained => {
-                            // The channel said it has nothing more. Stamped
-                            // only with an empty batch: were handles ever
-                            // returned alongside this code, records were read
-                            // and being at the head is no longer provable.
-                            if returned == 0 {
-                                channel_sub.note_drained_to_empty();
-                            }
+                            // The channel said it has nothing more, which is
+                            // the head whether or not this pull also returned
+                            // handles: the code is the service saying the
+                            // queue is empty once they are handed over.
+                            channel_sub.note_reached_head();
                             channel_drained = true;
                             break;
                         }
@@ -1788,7 +1816,7 @@ impl EventLogSubscription {
                     // is at the head of the channel, exactly and with no
                     // arithmetic. This is the other of the only two ways to
                     // learn that.
-                    channel_sub.note_drained_to_empty();
+                    channel_sub.note_reached_head();
                     channel_drained = true;
                     break;
                 }
@@ -6491,5 +6519,107 @@ mod tests {
                  source may not be"
             );
         }
+    }
+
+    fn application_status(subscription: &EventLogSubscription) -> ChannelStatus {
+        subscription
+            .status_snapshot()
+            .channels
+            .remove("Application")
+            .expect("every configured channel appears")
+    }
+
+    /// "No more items" says the queue was empty once the returned events were
+    /// handed over, so the closing pull reaches the head even when it carried
+    /// events.
+    #[tokio::test]
+    async fn a_closing_pull_with_events_and_no_more_items_reaches_the_head() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        {
+            let _guard = ScriptGuard::install(&_seams, &[(259, 3)]);
+            _ = subscription.pull_events(usize::MAX);
+        }
+
+        let channel = application_status(&subscription);
+        assert!(
+            channel.last_drained_at.is_some(),
+            "a poll that ended on no more items is at the head"
+        );
+        assert_eq!(channel.polls_at_head, 1);
+        assert_eq!(channel.polls_on_budget, 0);
+        assert_eq!(channel.last_budget_poll_at, None);
+    }
+
+    /// A poll cut off by the budget proves nothing about the head, and is
+    /// counted and stamped as a budget stop instead.
+    #[tokio::test]
+    async fn a_poll_ending_on_the_budget_is_counted_and_not_stamped() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        let delivered = subscription.pull_events(20).unwrap_or_default();
+        assert_eq!(
+            delivered.len(),
+            20,
+            "the premise is a channel with a backlog, read up to the event budget"
+        );
+
+        let channel = application_status(&subscription);
+        assert_eq!(channel.last_drained_at, None);
+        assert_eq!(channel.polls_at_head, 0);
+        assert_eq!(channel.polls_on_budget, 1);
+        assert!(channel.last_budget_poll_at.is_some());
+    }
+
+    /// Both empty endings, a successful pull of nothing and "no more items"
+    /// with nothing, reach the head and count.
+    #[tokio::test]
+    async fn an_empty_pull_still_reaches_the_head() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        {
+            let _guard = ScriptGuard::install(&_seams, &[(0, 0)]);
+            _ = subscription.pull_events(usize::MAX);
+        }
+        let channel = application_status(&subscription);
+        assert!(channel.last_drained_at.is_some());
+        assert_eq!(channel.polls_at_head, 1);
+
+        {
+            let _guard = ScriptGuard::install(&_seams, &[(259, 0)]);
+            _ = subscription.pull_events(usize::MAX);
+        }
+        let channel = application_status(&subscription);
+        assert_eq!(channel.polls_at_head, 2);
+        assert_eq!(channel.polls_on_budget, 0);
+    }
+
+    /// The counters run since process start. A rebuild of either kind must not
+    /// reset them, or a flapping channel would hide how its polls end.
+    #[tokio::test]
+    async fn the_poll_counters_survive_a_subscription_rebuild() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        assert_eq!(
+            subscription.pull_events(20).unwrap_or_default().len(),
+            20,
+            "the premise is a channel with a backlog, read up to the event budget"
+        );
+        {
+            let _guard = ScriptGuard::install(&_seams, &[(0, 0)]);
+            _ = subscription.pull_events(usize::MAX);
+        }
+        let before = application_status(&subscription);
+        assert_eq!((before.polls_at_head, before.polls_on_budget), (1, 1));
+
+        subscription.force_rebuild_all();
+        subscription.force_proactive_rebuild_all();
+        assert!(subscription.first_channel_is_live());
+
+        let after = application_status(&subscription);
+        assert_eq!(after.polls_at_head, 1);
+        assert_eq!(after.polls_on_budget, 1);
+        assert_eq!(after.last_budget_poll_at, before.last_budget_poll_at);
+        assert_eq!(after.last_drained_at, before.last_drained_at);
     }
 }
