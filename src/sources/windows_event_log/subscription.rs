@@ -1558,6 +1558,7 @@ impl EventLogSubscription {
         // the budget did not reach this pull is reached earlier in the next.
         // A channel that stops on the budget re-arms its own signal, so the
         // next wait returns at once rather than after `event_timeout_ms`.
+        // Bounded first so the sum below cannot overflow when the counter wraps.
         let start = self.round_robin_index % num_channels;
         self.round_robin_index = self.round_robin_index.wrapping_add(1);
 
