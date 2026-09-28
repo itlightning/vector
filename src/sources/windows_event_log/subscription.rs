@@ -56,9 +56,6 @@ pub(super) static DRAIN_STEP_HOOK: std::sync::Mutex<
     Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>,
 > = std::sync::Mutex::new(None);
 
-/// Smallest per-channel drain budget, however many channels share a source.
-const MIN_PER_CHANNEL_BUDGET: usize = 8;
-
 /// RAII wrapper for EvtOpenPublisherMetadata handles.
 /// Calls EvtClose on drop to prevent handle leaks when evicted from LRU cache.
 pub struct PublisherHandle(pub isize);
@@ -172,14 +169,15 @@ pub(super) static FAIL_ALL_BOOKMARK_UPDATES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Test-only record of the batch size requested from each `EvtNext` call, as
-/// `(channel, requested)`.
+/// `(slot, channel, requested)`, where `slot` is the channel's position in the
+/// subscription so that channels sharing a name stay distinguishable.
 ///
 /// The batch ladder is only meaningful as what we ASK the API for next, so this
 /// is the observable the adaptation tests assert on, rather than the internal
 /// counter. It doubles as the round-robin observable: the channel order across
 /// calls is visible here and nowhere else.
 #[cfg(test)]
-pub(super) static EVT_NEXT_REQUESTS: std::sync::Mutex<Option<Vec<(String, usize)>>> =
+pub(super) static EVT_NEXT_REQUESTS: std::sync::Mutex<Option<Vec<(usize, String, usize)>>> =
     std::sync::Mutex::new(None);
 
 /// Test-only running total of the event count `EvtNext` handed back.
@@ -1472,11 +1470,11 @@ impl EventLogSubscription {
 
     /// Pull events from all signaled channels with fair scheduling.
     ///
-    /// Each channel gets a per-channel budget of `max_events / num_channels`
-    /// to prevent a single busy channel (e.g., Security) from starving others.
-    /// The starting channel rotates each call via round-robin. Channels that
-    /// don't use their budget simply leave slots unused — the next pull_events
-    /// call reclaims them naturally since the signal stays set.
+    /// The pull's `max_events` is one budget shared by every channel: each
+    /// channel visited may take whatever the channels before it left. The
+    /// starting channel advances by one each call, so a busy channel that took
+    /// the whole budget in one pull is visited later in the next, and a channel
+    /// the budget did not reach keeps its signal set and is revisited at once.
     ///
     /// # At-least-once delivery semantics
     ///
@@ -1551,14 +1549,15 @@ impl EventLogSubscription {
         let mut all_events = std::mem::take(&mut self.event_buffer);
         all_events.clear();
         let num_channels = self.channels.len().max(1);
-        // A floor as well as a share. With many channels on one source an even
-        // split lands at a handful of events each, which is enough throughput
-        // (a channel that exhausts its budget re-arms its own signal, so the
-        // next wait returns at once rather than after `event_timeout_ms`) but
-        // spends a syscall per handful. The floor buys back the syscalls; the
-        // rotating start keeps the split fair across pulls rather than within
-        // one.
-        let per_channel_budget = (max_events / num_channels).max(MIN_PER_CHANNEL_BUDGET);
+        // One budget shared by the whole pull: each channel visited may take
+        // everything the channels before it left, and a channel reached with
+        // nothing left is not visited. An even share per channel left a lone
+        // busy channel beside idle siblings draining in small nibbles, never
+        // reaching its head while the loop around it was slow. Fairness comes
+        // from the starting channel advancing by one every pull, so a channel
+        // the budget did not reach this pull is reached earlier in the next.
+        // A channel that stops on the budget re-arms its own signal, so the
+        // next wait returns at once rather than after `event_timeout_ms`.
         let start = self.round_robin_index % num_channels;
         self.round_robin_index = self.round_robin_index.wrapping_add(1);
 
@@ -1566,7 +1565,7 @@ impl EventLogSubscription {
             let channel_idx = (start + i) % num_channels;
             let now = std::time::Instant::now();
             let channel_sub = &mut self.channels[channel_idx];
-            let channel_limit = per_channel_budget.min(max_events.saturating_sub(all_events.len()));
+            let channel_limit = max_events.saturating_sub(all_events.len());
 
             if channel_limit == 0 {
                 break;
@@ -1649,7 +1648,11 @@ impl EventLogSubscription {
                 // the adaptation ladder is asserted on.
                 #[cfg(test)]
                 if let Some(log) = EVT_NEXT_REQUESTS.lock().unwrap().as_mut() {
-                    log.push((channel_sub.channel.clone(), event_handles.len()));
+                    log.push((
+                        channel_idx,
+                        channel_sub.channel.clone(),
+                        event_handles.len(),
+                    ));
                 }
 
                 let result = unsafe { EvtNext(handle, &mut event_handles, 0, 0, &mut returned) };
@@ -1667,6 +1670,7 @@ impl EventLogSubscription {
                     match scripted {
                         // Keeps the real batch and replaces only the code, for
                         // a test that needs the returned events delivered.
+                        Some((0, KEEP_REAL_BATCH)) => Ok(()),
                         Some((code, KEEP_REAL_BATCH)) => Err(windows::core::Error::from_hresult(
                             windows::core::HRESULT(code as i32),
                         )),
@@ -2182,6 +2186,12 @@ impl EventLogSubscription {
         for channel in &mut self.channels {
             channel.rebuild("test_forced", RebuildKind::FromDead);
         }
+    }
+
+    /// Test-only: drop one channel, shrinking the set the rotation runs over.
+    #[cfg(test)]
+    pub(super) fn remove_channel(&mut self, slot: usize) {
+        drop(self.channels.remove(slot));
     }
 
     /// Test-only: run a PROACTIVE rebuild on every channel, the way the periodic
@@ -3694,7 +3704,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|log| log.iter().map(|(_, size)| *size).collect())
+                .map(|log| log.iter().map(|(_, _, size)| *size).collect())
                 .unwrap_or_default()
         }
 
@@ -3704,7 +3714,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|log| log.iter().map(|(channel, _)| channel.clone()).collect())
+                .map(|log| log.iter().map(|(_, channel, _)| channel.clone()).collect())
+                .unwrap_or_default()
+        }
+
+        /// `(slot, requested)` per call, in call order.
+        fn slot_requests(&self) -> Vec<(usize, usize)> {
+            EVT_NEXT_REQUESTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|log| log.iter().map(|(slot, _, size)| (*slot, *size)).collect())
                 .unwrap_or_default()
         }
 
@@ -3997,59 +4017,237 @@ mod tests {
     // Per-channel budget and round-robin fairness.
     // ---------------------------------------------------------------------
 
-    /// The event budget is SPLIT across channels, not handed to each of them.
-    /// A channel count that does not divide the budget evenly is the case that
-    /// distinguishes a division from anything else.
-    #[tokio::test]
-    async fn the_per_channel_budget_divides_the_max_across_channels() {
-        let _seams = SeamSession::acquire();
+    fn three_channel_config() -> WindowsEventLogConfig {
         let mut config = application_config();
         config.channels = vec![
             "Application".to_string(),
             "System".to_string(),
             "Setup".to_string(),
         ];
-        let mut subscription = subscription_from(&config).await;
+        config
+    }
+
+    fn channel_status(subscription: &EventLogSubscription, channel: &str) -> ChannelStatus {
+        subscription
+            .status_snapshot()
+            .channels
+            .remove(channel)
+            .expect("every configured channel appears")
+    }
+
+    /// The pull budget is shared, not split: every channel visited is offered
+    /// whatever the pull has left, which with idle siblings is all of it.
+    #[tokio::test]
+    async fn every_channel_is_offered_what_remains_of_the_pull_budget() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&three_channel_config()).await;
 
         let request_log = RequestLog::install(&_seams);
         let _guard = ScriptGuard::install(&_seams, &[(259, 0); 3]);
         _ = subscription.pull_events(60);
 
         assert_eq!(
-            request_log.sizes().first().copied(),
-            Some(20),
-            "60 events across 3 channels is 20 per channel, not 60 and not 180"
+            request_log.sizes(),
+            vec![60, 60, 60],
+            "idle channels take nothing, so each one is offered the whole 60"
         );
     }
 
-    /// The share has a FLOOR as well as a divisor.
-    ///
-    /// Dividing alone lands at a couple of events each once a source carries
-    /// tens of channels, which spends one `EvtNext` per couple of events. The
-    /// floor buys those syscalls back. It costs nothing in fairness because the
-    /// starting channel rotates every call, so a budget that does not stretch to
-    /// every channel in one pull still reaches them all across pulls.
+    /// A small budget is offered whole too; nothing rounds it up or down.
     #[tokio::test]
-    async fn a_small_budget_spread_thin_still_asks_for_a_worthwhile_batch() {
+    async fn a_small_budget_is_offered_whole() {
         let _seams = SeamSession::acquire();
-        let mut config = application_config();
-        config.channels = vec![
-            "Application".to_string(),
-            "System".to_string(),
-            "Setup".to_string(),
-        ];
-        let mut subscription = subscription_from(&config).await;
+        let mut subscription = subscription_from(&three_channel_config()).await;
 
         let request_log = RequestLog::install(&_seams);
         let _guard = ScriptGuard::install(&_seams, &[(259, 0); 3]);
-        // Seven across three would divide to two.
         _ = subscription.pull_events(7);
 
+        assert_eq!(request_log.sizes(), vec![7, 7, 7]);
+    }
+
+    /// A lone busy channel beside idle siblings drains its whole queue in one
+    /// pull and reaches its head, rather than stopping at a per-channel share.
+    #[tokio::test]
+    async fn a_lone_busy_channel_drains_to_its_head_in_one_pull() {
+        let _seams = SeamSession::acquire();
+        let mut config = three_channel_config();
+        config.batch_size = 60;
+        let mut subscription = subscription_from(&config).await;
+        let live = subscription.live_channel_names();
         assert_eq!(
-            request_log.sizes().first().copied(),
-            Some(7),
-            "the floor lifts a 2-per-channel share to 8, and the pull's own \
-             remaining allowance of 7 caps the first request"
+            live.len(),
+            3,
+            "every channel must be readable, got {live:?}"
+        );
+
+        let delivered = {
+            let _guard =
+                ScriptGuard::install(&_seams, &[(259, KEEP_REAL_BATCH), (259, 0), (259, 0)]);
+            subscription.pull_events(100).unwrap_or_default()
+        };
+
+        assert_eq!(delivered.len(), 60, "all 60 queued events in one pull");
+        let busy = channel_status(&subscription, &live[0]);
+        assert!(busy.last_drained_at.is_some());
+        assert_eq!(busy.polls_at_head, 1);
+        assert_eq!(busy.polls_on_budget, 0);
+    }
+
+    /// The second channel takes what the first left, stops on the budget, and
+    /// the third is not visited at all because nothing is left for it.
+    #[tokio::test]
+    async fn the_next_channel_takes_what_is_left_and_stops_on_the_budget() {
+        let _seams = SeamSession::acquire();
+        let mut config = three_channel_config();
+        config.batch_size = 60;
+        let mut subscription = subscription_from(&config).await;
+        let live = subscription.live_channel_names();
+        assert_eq!(
+            live.len(),
+            3,
+            "every channel must be readable, got {live:?}"
+        );
+
+        let request_log = RequestLog::install(&_seams);
+        let delivered = {
+            let _guard =
+                ScriptGuard::install(&_seams, &[(259, KEEP_REAL_BATCH), (0, KEEP_REAL_BATCH)]);
+            subscription.pull_events(100).unwrap_or_default()
+        };
+
+        assert_eq!(request_log.channels(), live[..2].to_vec());
+        assert_eq!(request_log.sizes(), vec![60, 40]);
+        assert_eq!(delivered.len(), 100);
+
+        let first = channel_status(&subscription, &live[0]);
+        assert_eq!((first.polls_at_head, first.polls_on_budget), (1, 0));
+        let second = channel_status(&subscription, &live[1]);
+        assert_eq!((second.polls_at_head, second.polls_on_budget), (0, 1));
+        assert_eq!(second.last_drained_at, None);
+        let third = channel_status(&subscription, &live[2]);
+        assert_eq!((third.polls_at_head, third.polls_on_budget), (0, 0));
+    }
+
+    /// Fairness comes from the rotation across pulls: the channel that got
+    /// nothing in one pull is offered the whole budget first in the next.
+    #[tokio::test]
+    async fn the_next_pull_offers_the_whole_budget_to_the_next_channel_first() {
+        let _seams = SeamSession::acquire();
+        let mut config = application_config();
+        config.channels = vec!["Application".to_string(), "System".to_string()];
+        let mut subscription = subscription_from(&config).await;
+        let live = subscription.live_channel_names();
+        assert_eq!(
+            live.len(),
+            2,
+            "both channels must be readable, got {live:?}"
+        );
+
+        let request_log = RequestLog::install(&_seams);
+        for expected in [&live[0], &live[1]] {
+            request_log.clear();
+            let _guard = ScriptGuard::install(&_seams, &[(0, KEEP_REAL_BATCH)]);
+            let delivered = subscription.pull_events(40).unwrap_or_default();
+            assert_eq!(delivered.len(), 40);
+            assert_eq!(request_log.channels(), vec![expected.clone()]);
+            assert_eq!(request_log.sizes(), vec![40]);
+        }
+    }
+
+    /// The rotation, over five channels that are all busy: each takes the whole
+    /// budget, so every pull reaches exactly the channel it starts on, and the
+    /// order has to come from the rotation alone.
+    ///
+    /// Every pull is checked against its row: the start advances by one, every
+    /// ask is the remainder at that point, and a channel the budget did not
+    /// reach moves one place earlier in the next pull. Then the set changes
+    /// under the rotation, by a rebuild and by a removal, and the rotation must
+    /// stay in range and still start on every remaining channel once.
+    #[tokio::test]
+    async fn the_starting_channel_rotates_through_every_channel() {
+        const N: usize = 5;
+        const MAX_EVENTS: usize = 10;
+
+        let _seams = SeamSession::acquire();
+        let mut config = application_config();
+        // Five subscriptions to one channel with a deep backlog, told apart by
+        // their slot, so every one of them is busy for the whole test.
+        config.channels = vec!["Application".to_string(); N];
+        let mut subscription = subscription_from(&config).await;
+        assert_eq!(subscription.live_channel_names().len(), N);
+
+        let request_log = RequestLog::install(&_seams);
+        // Busy: every call hands back the full ask.
+        let _guard = ScriptGuard::install(&_seams, &[(0, KEEP_REAL_BATCH); 64]);
+
+        // Pulls one call at a time; returns the slots asked, in order, and
+        // checks that each ask is exactly what the pull had left.
+        let pull = |subscription: &mut EventLogSubscription| -> Vec<usize> {
+            request_log.clear();
+            let delivered = subscription.pull_events(MAX_EVENTS).unwrap_or_default();
+            let asks = request_log.slot_requests();
+            let mut remaining = MAX_EVENTS;
+            for &(_, ask) in &asks {
+                assert_eq!(ask, remaining, "each ask is the remainder at that point");
+                remaining -= ask;
+            }
+            assert_eq!(delivered.len(), MAX_EVENTS - remaining);
+            assert!(asks.iter().map(|(_, ask)| ask).sum::<usize>() <= MAX_EVENTS);
+            asks.into_iter().map(|(slot, _)| slot).collect()
+        };
+        let order =
+            |start: usize, n: usize| -> Vec<usize> { (0..n).map(|i| (start + i) % n).collect() };
+
+        // One row per pull: the slot it must start on.
+        let rows: Vec<usize> = (0..=N).map(|k| k % N).collect();
+        let mut firsts = Vec::new();
+        let mut previous: Option<(usize, Vec<usize>)> = None;
+        for (k, &start) in rows.iter().enumerate() {
+            let visited = pull(&mut subscription);
+            assert_eq!(
+                visited,
+                vec![start],
+                "pull {k} reaches only its starting slot"
+            );
+            firsts.push(start);
+            if let Some((prev_start, prev_visited)) = &previous {
+                assert_eq!(start, (prev_start + 1) % N, "pull {k} starts one later");
+                let prev_order = order(*prev_start, N);
+                let this_order = order(start, N);
+                for slot in prev_order.iter().filter(|s| !prev_visited.contains(s)) {
+                    let before = prev_order.iter().position(|s| s == slot).unwrap();
+                    let now = this_order.iter().position(|s| s == slot).unwrap();
+                    assert_eq!(now + 1, before, "slot {slot} moved one place earlier");
+                }
+            }
+            previous = Some((start, visited));
+        }
+        let mut first_n = firsts[..N].to_vec();
+        first_n.sort_unstable();
+        assert_eq!(
+            first_n,
+            (0..N).collect::<Vec<_>>(),
+            "each slot starts exactly once in {N} pulls"
+        );
+
+        // A rebuild does not move the rotation.
+        subscription.force_rebuild_all();
+        assert_eq!(pull(&mut subscription), vec![(N + 1) % N]);
+
+        // A removal shrinks the set: the start stays in range and every
+        // remaining slot starts exactly once in the next N - 1 pulls.
+        subscription.remove_channel(N - 1);
+        let mut after: Vec<usize> = (0..N - 1).flat_map(|_| pull(&mut subscription)).collect();
+        assert!(
+            after.iter().all(|&slot| slot < N - 1),
+            "every slot is in range: {after:?}"
+        );
+        after.sort_unstable();
+        assert_eq!(
+            after,
+            (0..N - 1).collect::<Vec<_>>(),
+            "no remaining slot is skipped"
         );
     }
 
@@ -6547,11 +6745,7 @@ mod tests {
     }
 
     fn application_status(subscription: &EventLogSubscription) -> ChannelStatus {
-        subscription
-            .status_snapshot()
-            .channels
-            .remove("Application")
-            .expect("every configured channel appears")
+        channel_status(subscription, "Application")
     }
 
     /// "No more items" says the queue was empty once the returned events were
