@@ -92,13 +92,17 @@ pub(super) struct ChannelStatus {
     pub(super) rung: String,
     /// `TimeCreated` of the most recent event delivered from this channel.
     pub(super) last_event_at: Option<String>,
-    /// When this channel last returned zero events to a read, meaning the
-    /// subscription was at the head of the channel at that moment. `null` until
-    /// it has happened since the process started.
+    /// When a poll of this channel last ended with the subscription's queue
+    /// empty, meaning the subscription was at the head of the channel at that
+    /// moment. `null` until it has happened since the process started.
+    ///
+    /// Earned by a read that returned zero events, or by a read that ended with
+    /// "no more items" even if it also returned events: both say the queue was
+    /// empty at that instant. Never earned by a full batch or a budget stop.
     ///
     /// Exact, unlike [`Self::newest_record_id`], and it is the fact a reader
-    /// should decide on: a read that comes back empty IS caught up, with no
-    /// arithmetic and no approximation. It has to be stamped here because the
+    /// should decide on: a queue the service reports empty IS caught up, with
+    /// no arithmetic and no approximation. It has to be stamped here because the
     /// source reads far more often than anything polling this file, so a busy
     /// channel can reach the head many times between two samples and be caught
     /// mid-batch by both of them.
@@ -155,6 +159,26 @@ pub(super) struct ChannelStatus {
     /// counted misses meant.
     #[serde(default)]
     pub(super) name_table_misses: u64,
+    /// Polls of this channel that ended at the head, i.e. that earned
+    /// [`Self::last_drained_at`]. Monotonic since the process started; a
+    /// subscription rebuild does not reset it.
+    ///
+    /// Additive: absent means a writer that did not count, not zero polls.
+    #[serde(default)]
+    pub(super) polls_at_head: u64,
+    /// Polls of this channel that stopped on the per-poll event budget, so
+    /// events may still be waiting. Monotonic since the process started, like
+    /// [`Self::polls_at_head`].
+    ///
+    /// Additive, on the same terms as [`Self::polls_at_head`].
+    #[serde(default)]
+    pub(super) polls_on_budget: u64,
+    /// When a poll last stopped on the budget. `null` until one has since the
+    /// process started.
+    ///
+    /// Additive, on the same terms as [`Self::polls_at_head`].
+    #[serde(default)]
+    pub(super) last_budget_poll_at: Option<String>,
     /// Holes this source knows it created, newest last.
     pub(super) gaps: Vec<GapRecord>,
 }
@@ -574,6 +598,9 @@ mod tests {
                 last_error: None,
                 retry_attempt: 0,
                 name_table_misses: 0,
+                polls_at_head: 41,
+                polls_on_budget: 2,
+                last_budget_poll_at: Some(rfc3339(ts(1_700_000_080))),
                 gaps: vec![
                     gap_for_rung(
                         Rung::SkipRecord,
@@ -601,6 +628,9 @@ mod tests {
                 last_error: Some(15007),
                 retry_attempt: 3,
                 name_table_misses: 7,
+                polls_at_head: 0,
+                polls_on_budget: 0,
+                last_budget_poll_at: None,
                 gaps: Vec::new(),
             },
         );
@@ -648,6 +678,40 @@ mod tests {
         assert_eq!(security["last_error"], 15007);
         assert_eq!(security["query_filters"], true);
         assert_eq!(security["name_table_misses"], 7);
+    }
+
+    /// The poll counters are integers and the budget stamp is an explicit
+    /// null until a budget stop happens, never a missing key.
+    #[test]
+    fn the_poll_counters_serialize_with_their_documented_types() {
+        let value = serde_json::to_value(sample_snapshot()).unwrap();
+
+        let defender = &value["channels"]["Microsoft-Windows-Windows Defender/Operational"];
+        assert_eq!(defender["polls_at_head"], 41);
+        assert_eq!(defender["polls_on_budget"], 2);
+        assert_eq!(defender["last_budget_poll_at"], "2023-11-14T22:14:40.000Z");
+
+        let security = value["channels"]["Security"].as_object().unwrap();
+        assert_eq!(security["polls_at_head"], 0);
+        assert_eq!(security["polls_on_budget"], 0);
+        assert!(
+            security.contains_key("last_budget_poll_at")
+                && security["last_budget_poll_at"].is_null(),
+            "no budget stop yet is an explicit null"
+        );
+
+        // An older reader, which ignores unknown keys, still parses the file.
+        #[derive(Deserialize)]
+        struct OlderChannel {
+            last_drained_at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct OlderSnapshot {
+            channels: BTreeMap<String, OlderChannel>,
+        }
+        let older: OlderSnapshot = serde_json::from_value(value).expect("additive keys only");
+        assert_eq!(older.channels.len(), 2);
+        assert_eq!(older.channels["Security"].last_drained_at, None);
     }
 
     /// Additive fields must not invalidate a file a previous writer produced.
