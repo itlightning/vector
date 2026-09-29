@@ -462,11 +462,11 @@ impl SubscriptionFactory {
     /// ladder: every rung would compose the same shape, fail the same way, and
     /// walk to `FutureOnly`, discarding the backlog over a query we wrote.
     ///
-    /// Every failure steps down except the two that say nothing about the
-    /// query (see [`subscribe_failure_is_not_the_query`]): a bookmark death
-    /// belongs to the ladder, and an RPC failure to the backoff. Dropping the
-    /// ids over either would lose suppression for the process over a fault
-    /// that is not ours.
+    /// Every failure steps down except those that say nothing about the query
+    /// (see [`subscribe_failure_is_not_the_query`]): a bookmark death belongs
+    /// to the ladder, an RPC failure to the backoff, and a channel fault to the
+    /// channel skip. Dropping the ids over any of them would lose suppression
+    /// for the process over a fault that is not ours.
     fn fallback_after(
         &mut self,
         origin: QueryOrigin,
@@ -5812,9 +5812,9 @@ mod tests {
     }
 
     /// The rejection chain: a refusal steps down ids plus floor, then the floor
-    /// alone, then the base query, without moving the rung. A bookmark death
-    /// or an RPC failure leaves the ids in place and goes to the ordinary
-    /// classification, so neither ever costs the suppression.
+    /// alone, then the base query, without moving the rung. A bookmark death,
+    /// an RPC failure or a channel fault leaves the ids in place and goes to
+    /// the ordinary classification, so none of them ever costs the suppression.
     #[tokio::test]
     async fn a_refused_suppress_query_steps_down_unless_the_query_is_not_at_fault() {
         const OPERATOR: Option<&str> = Some("*[System[Level<=4]]");
@@ -5941,6 +5941,16 @@ mod tests {
                 suppress_active: true,
                 rung_kept: true,
                 skipped: None,
+            },
+            Row {
+                name: "access denied skips the channel and keeps the ids",
+                event_query: None,
+                time_rung: false,
+                script: &[5],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: true,
+                skipped: Some(SkipReason::AccessDenied),
             },
             Row {
                 name: "any other refusal drops the ids, and the base query is accepted",

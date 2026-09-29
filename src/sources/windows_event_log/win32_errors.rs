@@ -279,15 +279,20 @@ pub(super) const fn classify_subscribe(code: u32, query_origin: QueryOrigin) -> 
 }
 
 /// Whether a failed `EvtSubscribe` says nothing about the query: the stored
-/// position died, or the service could not be reached. The ladder and the
-/// backoff own these. Any other subscribe failure may be the query's, so a
-/// query this source composed falls back to a simpler one instead of charging
-/// the failure to the ladder.
+/// position died, the service could not be reached, or the channel is absent,
+/// unreadable or not subscribable. The ladder, the backoff and the channel skip
+/// own these. Any other subscribe failure may be the query's, so a query this
+/// source composed falls back to a simpler one instead of charging the failure
+/// to the ladder.
 pub(super) const fn subscribe_failure_is_not_the_query(code: u32) -> bool {
     matches!(
         classify_subscribe(code, QueryOrigin::Operator),
         SubscribeOutcome::BookmarkDead
-    ) || code == RPC_S_UNKNOWN_IF.0 as u32
+    ) || code == ERROR_ACCESS_DENIED.0
+        || code == ERROR_EVT_INVALID_CHANNEL_PATH.0
+        || code == ERROR_EVT_CHANNEL_NOT_FOUND.0
+        || code == ERROR_EVT_SUBSCRIPTION_TO_DIRECT_CHANNEL.0
+        || code == RPC_S_UNKNOWN_IF.0 as u32
         || code == RPC_S_SERVER_UNAVAILABLE.0 as u32
         || code == RPC_S_CALL_FAILED.0 as u32
         || code == RPC_S_CALL_CANCELLED.0 as u32
@@ -524,8 +529,8 @@ mod tests {
         assert_eq!(disposition, RenderDisposition::GrowBuffer);
     }
 
-    /// Bookmark death and the RPC family never make a composed query fall
-    /// back; anything else, named or not, may be the query's fault.
+    /// Bookmark death, the RPC family and channel faults never make a composed
+    /// query fall back; anything else, named or not, may be the query's fault.
     #[test]
     fn only_position_and_service_failures_are_not_the_query() {
         for code in [
@@ -537,10 +542,14 @@ mod tests {
             1722,
             1726,
             1818,
+            5,
+            15000,
+            15007,
+            15009,
         ] {
             assert!(subscribe_failure_is_not_the_query(code), "{code}");
         }
-        for code in [15001u32, 87, 5, 15000, 15007, 15009, 6, 60123] {
+        for code in [15001u32, 87, 6, 1223, 60123] {
             assert!(!subscribe_failure_is_not_the_query(code), "{code}");
         }
     }
