@@ -36,6 +36,7 @@ fn create_test_config() -> WindowsEventLogConfig {
         // canonical build runs it.
         status_path: None,
         status_interval_secs: 30,
+        suppress_ids: Default::default(),
     }
 }
 

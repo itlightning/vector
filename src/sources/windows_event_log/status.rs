@@ -115,7 +115,8 @@ pub(super) struct ChannelStatus {
     /// behind channel caught up. See [`newest_record_estimate`] for what makes
     /// it an estimate and when it is withheld entirely.
     pub(super) newest_record_id: Option<u64>,
-    /// Whether the collector's base query selects a subset of events.
+    /// Whether the active query selects a subset of events: the configured
+    /// query filters, or [`Self::suppress_active`] is true.
     ///
     /// Reported so a reader can withhold a lag figure it cannot compute:
     /// [`Self::newest_record_id`] counts every record in the channel while
@@ -127,6 +128,20 @@ pub(super) struct ChannelStatus {
     /// `false`, which is what an unfiltered collector meant.
     #[serde(default)]
     pub(super) query_filters: bool,
+    /// Whether the channel's suppress ids are in the active query. False when
+    /// none are configured, and false for the rest of the process once the
+    /// service rejected a query carrying them.
+    ///
+    /// Additive: absent means a writer without suppress ids.
+    #[serde(default)]
+    pub(super) suppress_active: bool,
+    /// Records the service handed back on this channel since the process
+    /// started. Suppressed records never are, so they are not counted.
+    /// Monotonic, like [`Self::polls_at_head`].
+    ///
+    /// Additive: absent means a writer that did not count, not zero reads.
+    #[serde(default)]
+    pub(super) records_read: u64,
     /// Whether the stored bookmark marks a real position.
     pub(super) bookmark_positioned: bool,
     /// When this channel's current run of failures began: the first failure
@@ -593,6 +608,8 @@ mod tests {
                 last_record_id: Some(123_456),
                 newest_record_id: Some(123_460),
                 query_filters: false,
+                suppress_active: false,
+                records_read: 9_876,
                 bookmark_positioned: true,
                 unavailable_since: None,
                 last_error: None,
@@ -623,6 +640,8 @@ mod tests {
                 last_record_id: None,
                 newest_record_id: None,
                 query_filters: true,
+                suppress_active: true,
+                records_read: 0,
                 bookmark_positioned: false,
                 unavailable_since: Some(rfc3339(ts(1_699_999_500))),
                 last_error: Some(15007),
@@ -661,6 +680,8 @@ mod tests {
         assert!(defender["unavailable_since"].is_null());
         assert!(defender["last_error"].is_null());
         assert_eq!(defender["query_filters"], false);
+        assert_eq!(defender["suppress_active"], false);
+        assert_eq!(defender["records_read"], 9_876);
         assert_eq!(defender["name_table_misses"], 0);
         assert_eq!(defender["gaps"][0]["cause"], "skip_record");
         assert_eq!(defender["gaps"][0]["exact"], true);
@@ -677,6 +698,8 @@ mod tests {
         assert_eq!(security["unavailable_since"], "2023-11-14T22:05:00.000Z");
         assert_eq!(security["last_error"], 15007);
         assert_eq!(security["query_filters"], true);
+        assert_eq!(security["suppress_active"], true);
+        assert_eq!(security["records_read"], 0);
         assert_eq!(security["name_table_misses"], 7);
     }
 
@@ -755,6 +778,11 @@ mod tests {
             "a writer that did not report episodes says nothing about this              channel's health, and an absent key must not parse as a claim"
         );
         assert_eq!(security.last_error, None);
+        assert!(
+            !security.suppress_active,
+            "unreported means no suppress ids"
+        );
+        assert_eq!(security.records_read, 0);
         assert_eq!(security.last_record_id, Some(10));
     }
 

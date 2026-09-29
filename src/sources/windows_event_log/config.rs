@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 use vector_config::component::GenerateConfig;
 use vector_lib::configurable::configurable_component;
@@ -6,7 +9,7 @@ use vector_lib::configurable::configurable_component;
 use crate::{config::SourceAcknowledgementsConfig, serde::bool_or_struct};
 
 // Validation constants
-const MAX_CHANNEL_NAME_LENGTH: usize = 256;
+pub(super) const MAX_CHANNEL_NAME_LENGTH: usize = 256;
 const MAX_XPATH_QUERY_LENGTH: usize = 4096;
 const MAX_FIELD_NAME_LENGTH: usize = 128;
 const MAX_FIELD_COUNT: usize = 100;
@@ -16,6 +19,9 @@ const MAX_CONNECTION_TIMEOUT_SECS: u64 = 3600;
 const MAX_EVENT_TIMEOUT_MS: u64 = 60000;
 const MAX_BATCH_SIZE: u32 = 10000;
 const MAX_STATUS_INTERVAL_SECS: u64 = 3600;
+pub(super) const MAX_SUPPRESS_PROVIDERS_PER_CHANNEL: usize = 4;
+pub(super) const MAX_SUPPRESS_IDS_PER_CHANNEL: usize = 64;
+const MAX_SUPPRESS_PROVIDER_LENGTH: usize = 128;
 
 /// The `channel` value on internal events raised for a failure that belongs to
 /// the source rather than to any single channel.
@@ -237,6 +243,18 @@ pub struct WindowsEventLogConfig {
     #[configurable(metadata(docs::examples = 60))]
     pub status_interval_secs: u64,
 
+    /// Event ids the Event Log service drops before delivery, per channel.
+    ///
+    /// Each key must be one of `channels`. A suppressed record is never pulled
+    /// or rendered, so it costs this source nothing. Matching on the provider
+    /// name is case-insensitive. Ignored for a channel whose `event_query` is a
+    /// structured `<QueryList>`.
+    #[serde(default)]
+    #[configurable(metadata(
+        docs::additional_props_description = "The suppress rules for one channel."
+    ))]
+    pub suppress_ids: BTreeMap<String, Vec<SuppressRule>>,
+
     /// Controls how acknowledgements are handled for this source.
     ///
     /// When enabled, the source will wait for downstream sinks to acknowledge
@@ -250,6 +268,21 @@ pub struct WindowsEventLogConfig {
     #[configurable(derived)]
     #[serde(default, deserialize_with = "bool_or_struct")]
     pub acknowledgements: SourceAcknowledgementsConfig,
+}
+
+/// Event ids from one provider for the Event Log service to suppress.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SuppressRule {
+    /// Provider name. Letters, digits, space, `.`, `_` and `-`, starting with a
+    /// letter or digit, at most 128 characters.
+    #[configurable(metadata(docs::examples = "Microsoft-Windows-Security-Auditing"))]
+    pub provider: String,
+
+    /// Event ids from this provider to suppress.
+    #[configurable(metadata(docs::examples = 4658))]
+    pub event_ids: Vec<u16>,
 }
 
 /// Event data formatting options for custom field type conversion.
@@ -346,6 +379,7 @@ impl Default for WindowsEventLogConfig {
             // it. The writer runs either way.
             status_path: None,
             status_interval_secs: default_status_interval_secs(),
+            suppress_ids: BTreeMap::new(),
             acknowledgements: Default::default(),
         }
     }
@@ -635,8 +669,80 @@ impl WindowsEventLogConfig {
             }
         }
 
+        self.validate_suppress_ids()?;
+
         Ok(())
     }
+
+    /// The bounds keep the composed query inside what the Event Log service
+    /// accepts; the pack builder and the agent enforce the same or tighter ones.
+    fn validate_suppress_ids(&self) -> Result<(), crate::Error> {
+        for (channel, rules) in &self.suppress_ids {
+            if !self.channels.contains(channel) {
+                return Err(format!(
+                    "suppress_ids names channel '{channel}', which is not in channels"
+                )
+                .into());
+            }
+            if rules.is_empty() {
+                return Err(format!("suppress_ids for channel '{channel}' is empty").into());
+            }
+            if rules.len() > MAX_SUPPRESS_PROVIDERS_PER_CHANNEL {
+                return Err(format!(
+                    "suppress_ids for channel '{channel}' names {} providers, maximum is {}",
+                    rules.len(),
+                    MAX_SUPPRESS_PROVIDERS_PER_CHANNEL
+                )
+                .into());
+            }
+            let ids: usize = rules.iter().map(|rule| rule.event_ids.len()).sum();
+            if ids > MAX_SUPPRESS_IDS_PER_CHANNEL {
+                return Err(format!(
+                    "suppress_ids for channel '{channel}' lists {ids} event ids, maximum is {}",
+                    MAX_SUPPRESS_IDS_PER_CHANNEL
+                )
+                .into());
+            }
+            for (index, rule) in rules.iter().enumerate() {
+                if !is_valid_suppress_provider(&rule.provider) {
+                    return Err(format!(
+                        "suppress_ids provider '{}' for channel '{channel}' is not a valid provider name",
+                        rule.provider
+                    )
+                    .into());
+                }
+                if rule.event_ids.is_empty() {
+                    return Err(format!(
+                        "suppress_ids provider '{}' for channel '{channel}' lists no event ids",
+                        rule.provider
+                    )
+                    .into());
+                }
+                // The service matches providers case-insensitively, so two
+                // spellings of one name are one provider.
+                if rules[..index]
+                    .iter()
+                    .any(|earlier| earlier.provider.eq_ignore_ascii_case(&rule.provider))
+                {
+                    return Err(format!(
+                        "suppress_ids for channel '{channel}' names provider '{}' twice",
+                        rule.provider
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}$`: nothing that needs escaping inside
+/// the XPath string literal the name is composed into.
+fn is_valid_suppress_provider(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.len() <= MAX_SUPPRESS_PROVIDER_LENGTH
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
 }
 
 /// Check if a channel name contains glob pattern characters
@@ -794,6 +900,7 @@ mod tests {
             subscription_refresh_secs: 86_400,
             status_path: Some(PathBuf::from("/test/data/status.json")),
             status_interval_secs: 30,
+            suppress_ids: BTreeMap::new(),
             acknowledgements: SourceAcknowledgementsConfig::from(true),
         };
 
@@ -857,6 +964,203 @@ mod tests {
 
         config.status_path = Some(PathBuf::from("C:\\ProgramData\\vector\\status.json"));
         assert!(config.validate().is_ok());
+    }
+
+    fn suppress(provider: &str, event_ids: &[u16]) -> SuppressRule {
+        SuppressRule {
+            provider: provider.to_string(),
+            event_ids: event_ids.to_vec(),
+        }
+    }
+
+    /// Every bound on `suppress_ids`, accepted at the limit and rejected one
+    /// past it. The pack builder and the agent hold the same bounds, so a
+    /// rejection here is a config nothing upstream should produce.
+    #[test]
+    fn suppress_ids_validation_table() {
+        let sixty_four: Vec<u16> = (1..=64).collect();
+        let sixty_five: Vec<u16> = (1..=65).collect();
+        let long_name = format!("P{}", "a".repeat(127));
+        let too_long_name = format!("P{}", "a".repeat(128));
+
+        let rows: Vec<(&str, BTreeMap<String, Vec<SuppressRule>>, bool)> = vec![
+            ("empty map", BTreeMap::new(), true),
+            (
+                "one provider, one id",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("Microsoft-Windows-Security-Auditing", &[4658])],
+                )]),
+                true,
+            ),
+            (
+                "key not in channels",
+                BTreeMap::from([("Application".into(), vec![suppress("P", &[1])])]),
+                false,
+            ),
+            (
+                "no rules for a channel",
+                BTreeMap::from([("Security".into(), Vec::new())]),
+                false,
+            ),
+            (
+                "four providers",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![
+                        suppress("A", &[1]),
+                        suppress("B", &[1]),
+                        suppress("C", &[1]),
+                        suppress("D", &[1]),
+                    ],
+                )]),
+                true,
+            ),
+            (
+                "five providers",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![
+                        suppress("A", &[1]),
+                        suppress("B", &[1]),
+                        suppress("C", &[1]),
+                        suppress("D", &[1]),
+                        suppress("E", &[1]),
+                    ],
+                )]),
+                false,
+            ),
+            (
+                "64 ids",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &sixty_four)])]),
+                true,
+            ),
+            (
+                "65 ids",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &sixty_five)])]),
+                false,
+            ),
+            (
+                "65 ids across two providers",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("A", &sixty_four), suppress("B", &[1])],
+                )]),
+                false,
+            ),
+            (
+                "ids 0 and 65535",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &[0, u16::MAX])])]),
+                true,
+            ),
+            (
+                "no ids",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &[])])]),
+                false,
+            ),
+            (
+                "duplicate provider",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("A", &[1]), suppress("A", &[2])],
+                )]),
+                false,
+            ),
+            (
+                "duplicate provider in another case",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("Ab", &[1]), suppress("aB", &[2])],
+                )]),
+                false,
+            ),
+            (
+                "provider with every allowed character",
+                BTreeMap::from([("Security".into(), vec![suppress("Az09 ._-z", &[1])])]),
+                true,
+            ),
+            (
+                "provider at 128 characters",
+                BTreeMap::from([("Security".into(), vec![suppress(&long_name, &[1])])]),
+                true,
+            ),
+            (
+                "provider at 129 characters",
+                BTreeMap::from([("Security".into(), vec![suppress(&too_long_name, &[1])])]),
+                false,
+            ),
+            (
+                "empty provider",
+                BTreeMap::from([("Security".into(), vec![suppress("", &[1])])]),
+                false,
+            ),
+            (
+                "provider starting with a separator",
+                BTreeMap::from([("Security".into(), vec![suppress("-A", &[1])])]),
+                false,
+            ),
+            (
+                "provider with an apostrophe",
+                BTreeMap::from([("Security".into(), vec![suppress("A'B", &[1])])]),
+                false,
+            ),
+            (
+                "provider with markup",
+                BTreeMap::from([("Security".into(), vec![suppress("A<B", &[1])])]),
+                false,
+            ),
+            (
+                "provider with a non-ASCII letter",
+                BTreeMap::from([("Security".into(), vec![suppress("Aé", &[1])])]),
+                false,
+            ),
+        ];
+
+        for (name, suppress_ids, valid) in rows {
+            let config = WindowsEventLogConfig {
+                channels: vec!["System".to_string(), "Security".to_string()],
+                suppress_ids,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.validate().is_ok(),
+                valid,
+                "{name}: {:?}",
+                config.validate()
+            );
+        }
+    }
+
+    /// Absent is empty, and a rendered rule parses into the typed shape.
+    #[test]
+    fn suppress_ids_parse_from_config() {
+        let absent: WindowsEventLogConfig =
+            toml::from_str("channels = [\"Security\"]").expect("minimal config must parse");
+        assert!(absent.suppress_ids.is_empty());
+
+        let parsed: WindowsEventLogConfig = toml::from_str(
+            "channels = [\"Security\"]\n\
+             [[suppress_ids.Security]]\n\
+             provider = \"microsoft-windows-security-auditing\"\n\
+             event_ids = [4658, 4690]\n",
+        )
+        .expect("a suppress rule must parse");
+        assert_eq!(
+            parsed.suppress_ids["Security"],
+            vec![suppress(
+                "microsoft-windows-security-auditing",
+                &[4658, 4690]
+            )]
+        );
+        assert!(parsed.validate().is_ok());
+
+        let out_of_range = toml::from_str::<WindowsEventLogConfig>(
+            "channels = [\"Security\"]\n\
+             [[suppress_ids.Security]]\n\
+             provider = \"P\"\n\
+             event_ids = [65536]\n",
+        );
+        assert!(out_of_range.is_err(), "an id past 65535 does not parse");
     }
 
     #[test]
