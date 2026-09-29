@@ -1686,3 +1686,407 @@ async fn test_checkpoint_resume_no_duplicate_record_ids() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Suppress ids on the lab channel
+// ---------------------------------------------------------------------------
+//
+// These run unelevated against a channel the owner registered once with write
+// and clear granted to the working account. A missing channel fails the test:
+// skipping would report suppression as proven on a machine that proved nothing.
+//
+// Every test holds the seam session, which creating a subscription requires
+// anyway and which also serializes use of the one lab channel.
+
+mod suppress_lab {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::EventLog::{
+        EVT_HANDLE, EvtClose, EvtNext, EvtSubscribe, EvtSubscribeStartAtOldestRecord,
+    };
+    use windows::Win32::System::Threading::CreateEventW;
+    use windows::core::HSTRING;
+
+    use super::super::checkpoint::Checkpointer;
+    use super::super::recovery::{ResumeState, Rung, TimeRung};
+    use super::super::status::ChannelStatus;
+    use super::super::subscription::{EventLogSubscription, SubscriptionFactory};
+    use super::super::test_seams::SeamSession;
+    use super::super::win32_errors::QueryOrigin;
+    use super::{Command, SuppressRule, WindowsEventLogConfig};
+
+    const LAB_CHANNEL: &str = "SparkLogs-WelLab/Operational";
+    const LAB_PROVIDER: &str = "SparkLogs-WelLab";
+    const KEPT_ID: u16 = 1;
+    const SUPPRESSED_ID: u16 = 2;
+
+    fn missing_lab(detail: &str) -> ! {
+        panic!(
+            "the lab channel {LAB_CHANNEL} is not usable ({detail}). Register it and grant \
+             this account read, write and clear once from an elevated PowerShell (the agent \
+             repo's wel-lab tooling documents the grant)"
+        )
+    }
+
+    fn wevtutil(args: &[&str]) -> String {
+        let out = Command::new("wevtutil")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| missing_lab(&format!("wevtutil did not start: {e}")));
+        if !out.status.success() {
+            missing_lab(&format!(
+                "wevtutil {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn record_count() -> u64 {
+        wevtutil(&["gli", LAB_CHANNEL])
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("numberOfLogRecords:"))
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or_else(|| missing_lab("no record count from wevtutil gli"))
+    }
+
+    /// Empty the channel, so each test counts only what it wrote.
+    fn clear() {
+        wevtutil(&["cl", LAB_CHANNEL]);
+        assert_eq!(record_count(), 0, "the lab channel did not clear");
+    }
+
+    /// Write `count` records of `event_id` through the lab provider and wait
+    /// for the service to log them.
+    ///
+    /// The .NET `EventProvider` writes at ETW speed, which a 50,000 record
+    /// flood needs; `New-WinEvent` manages tens per second. A write the
+    /// session buffers refuse is retried, and the record count is checked, so
+    /// a wrong descriptor fails here rather than as a missing event later.
+    fn write(event_id: u16, count: u32) {
+        let before = record_count();
+        // PROVENANCE: the lab manifest's provider GUID (the agent repo's
+        // `xtask/src/wel_lab.rs` `PROVIDER_GUID`); channel 16, level 4 and
+        // keyword 0x8000000000000000 as `wevtutil qe` rendered a `New-WinEvent`
+        // record of that manifest on 2026-09-29 (mc.exe numbers a manifest's
+        // first channel 16).
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             $p = New-Object System.Diagnostics.Eventing.EventProvider \
+             ([guid]'d6f3a2b1-6c44-4e0b-9a7e-3f1c5d8e2a90'); \
+             $d = New-Object System.Diagnostics.Eventing.EventDescriptor \
+             ({event_id}, 0, 16, 4, 0, 0, [long]::MinValue); \
+             $n = 0; while ($n -lt {count}) {{ \
+             if ($p.WriteEvent([ref]$d, [object[]]@('lab', '-'))) {{ $n++ }} \
+             else {{ Start-Sleep -Milliseconds 5 }} }}; $p.Dispose()"
+        );
+        let status = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .expect("powershell must start");
+        assert!(status.success(), "the lab write failed: {status}");
+
+        let want = before + u64::from(count);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let have = record_count();
+            if have == want {
+                return;
+            }
+            assert!(
+                have < want && Instant::now() < deadline,
+                "the lab channel holds {have} records, expected {want}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn lab_rule(provider: &str, event_ids: &[u16]) -> SuppressRule {
+        SuppressRule {
+            provider: provider.to_string(),
+            event_ids: event_ids.to_vec(),
+        }
+    }
+
+    async fn checkpointer() -> (Arc<Checkpointer>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let checkpointer = Arc::new(Checkpointer::new(dir.path()).await.expect("checkpointer"));
+        (checkpointer, dir)
+    }
+
+    async fn subscribe(
+        rules: Vec<SuppressRule>,
+        checkpointer: Arc<Checkpointer>,
+    ) -> EventLogSubscription {
+        let mut config = WindowsEventLogConfig {
+            channels: vec![LAB_CHANNEL.to_string()],
+            read_existing_events: true,
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
+        if !rules.is_empty() {
+            config.suppress_ids.insert(LAB_CHANNEL.to_string(), rules);
+        }
+        config.validate().expect("the lab config is valid");
+        EventLogSubscription::new(&config, checkpointer, false)
+            .await
+            .expect("the lab subscription opens")
+    }
+
+    fn status(subscription: &EventLogSubscription) -> ChannelStatus {
+        subscription
+            .status_snapshot()
+            .channels
+            .remove(LAB_CHANNEL)
+            .expect("the lab channel is reported")
+    }
+
+    /// Pull until `want` events have arrived and one more pull finds nothing,
+    /// returning the event ids in delivery order.
+    fn drain(subscription: &mut EventLogSubscription, want: usize) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let batch = subscription.pull_events(1_000).expect("pull");
+            if batch.is_empty() && ids.len() >= want {
+                return ids;
+            }
+            ids.extend(batch.iter().map(|event| event.event_id));
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {want} events arrived: {ids:?}",
+                ids.len()
+            );
+            if batch.is_empty() {
+                subscription.wait_for_events_blocking(200);
+            }
+        }
+    }
+
+    /// A suppressed id never reaches the collector and is never read; the kept
+    /// id around it arrives in full.
+    #[tokio::test]
+    async fn suppressed_ids_are_never_delivered_or_read() {
+        let _seams = SeamSession::acquire();
+        clear();
+        write(KEPT_ID, 5);
+        write(SUPPRESSED_ID, 20);
+        write(KEPT_ID, 5);
+
+        let (checkpointer, _dir) = checkpointer().await;
+        let mut subscription =
+            subscribe(vec![lab_rule(LAB_PROVIDER, &[SUPPRESSED_ID])], checkpointer).await;
+        let ids = drain(&mut subscription, 10);
+
+        assert_eq!(
+            ids,
+            vec![u32::from(KEPT_ID); 10],
+            "kept ids only, all of them"
+        );
+        let status = status(&subscription);
+        assert_eq!(status.records_read, 10, "suppressed records are never read");
+        assert!(status.suppress_active);
+        assert!(status.query_filters);
+    }
+
+    /// The service matches the provider name case-insensitively, so the
+    /// lowercase spelling the pack emits suppresses.
+    #[tokio::test]
+    async fn a_lowercase_provider_spelling_suppresses() {
+        let _seams = SeamSession::acquire();
+        clear();
+        write(KEPT_ID, 3);
+        write(SUPPRESSED_ID, 3);
+
+        let (checkpointer, _dir) = checkpointer().await;
+        let lowercase = LAB_PROVIDER.to_ascii_lowercase();
+        let mut subscription =
+            subscribe(vec![lab_rule(&lowercase, &[SUPPRESSED_ID])], checkpointer).await;
+
+        assert_eq!(drain(&mut subscription, 3), vec![u32::from(KEPT_ID); 3]);
+        assert_eq!(status(&subscription).records_read, 3);
+    }
+
+    /// The largest query `validate` allows, with the time floor beside it, is
+    /// accepted by `EvtSubscribe` and still suppresses.
+    #[tokio::test]
+    async fn the_worst_case_suppress_query_is_accepted_and_honored() {
+        let _seams = SeamSession::acquire();
+        clear();
+        write(KEPT_ID, 3);
+        write(SUPPRESSED_ID, 3);
+
+        // 64 five-digit ids but id 2, split so the element count is largest,
+        // under four providers, three of them at the longest name allowed.
+        let mut lab_ids = vec![SUPPRESSED_ID];
+        lab_ids.extend(65_476..=65_535);
+        let long = |tag: char| format!("{tag}{}", "p".repeat(127));
+        let rules = vec![
+            lab_rule(LAB_PROVIDER, &lab_ids),
+            lab_rule(&long('B'), &[10_000]),
+            lab_rule(&long('C'), &[10_001]),
+            lab_rule(&long('D'), &[10_002]),
+        ];
+        WindowsEventLogConfig {
+            channels: vec![LAB_CHANNEL.to_string()],
+            suppress_ids: std::collections::BTreeMap::from([(
+                LAB_CHANNEL.to_string(),
+                rules.clone(),
+            )]),
+            ..Default::default()
+        }
+        .validate()
+        .expect("the worst case is inside the bounds");
+
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(chrono::Utc::now() - chrono::Duration::hours(1), 1);
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+        let factory = SubscriptionFactory::new(
+            LAB_CHANNEL.to_string(),
+            "*".to_string(),
+            QueryOrigin::Generated,
+            true,
+            rules,
+        );
+        let (query, origin) = factory.query_for(&resume);
+        assert_eq!(origin, QueryOrigin::Suppressed);
+        assert_eq!(
+            query.matches("<Suppress>").count(),
+            8,
+            "seven id elements and the floor"
+        );
+
+        let signal = unsafe { CreateEventW(None, true, false, None) }.expect("event handle");
+        let handle = unsafe {
+            EvtSubscribe(
+                None,
+                signal,
+                &HSTRING::from(LAB_CHANNEL),
+                &HSTRING::from(query.as_str()),
+                EVT_HANDLE(0),
+                None,
+                None,
+                EvtSubscribeStartAtOldestRecord.0,
+            )
+        }
+        .unwrap_or_else(|e| {
+            panic!(
+                "EvtSubscribe rejected the {}-char worst case: {e}\n{query}",
+                query.len()
+            )
+        });
+
+        let mut delivered = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while delivered < 3 && Instant::now() < deadline {
+            let mut batch = [0isize; 16];
+            let mut returned = 0u32;
+            if unsafe { EvtNext(handle, &mut batch, 500, 0, &mut returned) }.is_ok() {
+                for raw in &batch[..returned as usize] {
+                    unsafe { _ = EvtClose(EVT_HANDLE(*raw)) };
+                }
+                delivered += returned as usize;
+            }
+        }
+        let mut batch = [0isize; 16];
+        let mut returned = 0u32;
+        let extra = unsafe { EvtNext(handle, &mut batch, 500, 0, &mut returned) };
+        for raw in &batch[..returned as usize] {
+            unsafe { _ = EvtClose(EVT_HANDLE(*raw)) };
+        }
+        unsafe {
+            _ = EvtClose(handle);
+            _ = CloseHandle(signal);
+        }
+        assert_eq!(delivered, 3, "the three kept records");
+        assert!(
+            extra.is_err() && returned == 0,
+            "the three suppressed records must not follow"
+        );
+    }
+
+    /// A stored bookmark on a record the new query suppresses: the first start
+    /// after the ids are turned on, on a host whose last record read was a
+    /// flood record.
+    ///
+    /// `StartAfterBookmark | Strict` resumes from it with no ladder move and
+    /// delivers only what came after, with no re-delivery.
+    #[tokio::test]
+    async fn a_bookmark_on_a_now_suppressed_record_resumes_without_a_rung_move() {
+        let _seams = SeamSession::acquire();
+        clear();
+        write(KEPT_ID, 2);
+        write(SUPPRESSED_ID, 3);
+
+        let (checkpointer, _dir) = checkpointer().await;
+        let mut before = subscribe(Vec::new(), Arc::clone(&checkpointer)).await;
+        let ids = drain(&mut before, 5);
+        assert_eq!(
+            ids.last(),
+            Some(&u32::from(SUPPRESSED_ID)),
+            "premise: the bookmark is on a flood record"
+        );
+        before.flush_bookmarks().await.expect("flush");
+        drop(before);
+
+        write(KEPT_ID, 2);
+        let mut after =
+            subscribe(vec![lab_rule(LAB_PROVIDER, &[SUPPRESSED_ID])], checkpointer).await;
+        let resumed = status(&after);
+        assert!(resumed.subscribed, "the resume subscribed");
+        assert_eq!(resumed.rung, "bookmark", "no ladder move");
+        assert!(resumed.gaps.is_empty(), "no gap recorded");
+
+        assert_eq!(
+            drain(&mut after, 2),
+            vec![u32::from(KEPT_ID); 2],
+            "only what came after"
+        );
+        assert_eq!(status(&after).rung, "bookmark");
+    }
+
+    /// The head witness under a suppressed flood: 50,000 suppressed records
+    /// ahead of one kept record, read from the oldest. The service scans the
+    /// flood to find the kept record, and until it has, nothing may say the
+    /// channel is at its head.
+    #[tokio::test]
+    async fn the_head_is_not_stamped_before_the_record_behind_a_suppressed_flood() {
+        const FLOOD: u32 = 50_000;
+        let _seams = SeamSession::acquire();
+        clear();
+        write(SUPPRESSED_ID, FLOOD);
+        write(KEPT_ID, 1);
+
+        let (checkpointer, _dir) = checkpointer().await;
+        let mut subscription =
+            subscribe(vec![lab_rule(LAB_PROVIDER, &[SUPPRESSED_ID])], checkpointer).await;
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut pulls = 0u32;
+        loop {
+            let batch = subscription.pull_events(1_000).expect("pull");
+            pulls += 1;
+            if !batch.is_empty() {
+                assert_eq!(
+                    batch.iter().map(|e| e.event_id).collect::<Vec<_>>(),
+                    vec![u32::from(KEPT_ID)]
+                );
+                break;
+            }
+            let status = status(&subscription);
+            assert!(
+                status.last_drained_at.is_none(),
+                "the head was stamped at {:?} after {pulls} pulls, before the kept record \
+                 behind {FLOOD} suppressed ones arrived",
+                status.last_drained_at
+            );
+            assert!(Instant::now() < deadline, "the kept record never arrived");
+            subscription.wait_for_events_blocking(500);
+        }
+        let status = status(&subscription);
+        assert_eq!(status.records_read, 1, "the flood was never read");
+    }
+}

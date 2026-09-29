@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use metrics::counter;
 use quick_xml::{Reader, events::Event as XmlEvent};
+use vector_lib::{counter, internal_event::CounterName};
 
 use super::config::WindowsEventLogConfig;
 use super::error::*;
@@ -52,6 +52,36 @@ pub struct EventDataResult {
     pub user_data: HashMap<String, String>,
 }
 
+/// Where an event's `message` text came from.
+///
+/// This is the authoritative signal for downstream consumers. The honesty
+/// suffix that appears in the message text is for humans reading the line; a
+/// consumer that needs to branch keys on this field and never on the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageSource {
+    /// Rendered by the publisher (or delivered pre-rendered in
+    /// `<RenderingInfo>`). The message means what it says.
+    Publisher,
+    /// The publisher template was unavailable, so the message is assembled from
+    /// the raw string inserts. Some applications define a real message table
+    /// where the single insert is a bare numeric parameter, so this text can be
+    /// nonsense without the template. That is why it is marked rather than
+    /// presented as an ordinary message.
+    Inserts,
+    /// Neither a template nor any inserts were available.
+    None,
+}
+
+impl MessageSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publisher => "publisher",
+            Self::Inserts => "inserts",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Represents a Windows Event Log event.
 #[derive(Debug, Clone)]
 pub struct WindowsEvent {
@@ -78,29 +108,46 @@ pub struct WindowsEvent {
     pub task_name: Option<String>,
     pub opcode_name: Option<String>,
     pub keyword_names: Vec<String>,
+    /// Publisher-table (or hardcoded fallback) level display string. `None`
+    /// means the hardcoded English match in [`fallback_level_name`].
+    pub resolved_level: Option<String>,
     /// Resolved account name from user_id SID (e.g. "NT AUTHORITY\SYSTEM").
     pub user_name: Option<String>,
     pub version: Option<u8>,
     pub qualifiers: Option<u16>,
     pub string_inserts: Vec<String>,
+    /// How `rendered_message` was obtained, or would have to be reconstructed.
+    /// Authoritative for consumers; see [`MessageSource`].
+    pub message_source: MessageSource,
 }
 
 impl WindowsEvent {
     /// Returns the human-readable level name for this event.
     ///
-    /// Level 0 maps to "Information" per standard convention. Windows uses
-    /// Level=0 for "LogAlways" and for all Security audit events. Mapping it to
-    /// "Information" prevents SOC analysts from seeing "Unknown" on every logon event.
-    pub const fn level_name(&self) -> &'static str {
-        match self.level {
-            0 => "Information",
-            1 => "Critical",
-            2 => "Error",
-            3 => "Warning",
-            4 => "Information",
-            5 => "Verbose",
-            _ => "Unknown",
-        }
+    /// A publisher-table string wins when present (locale-resolved, and the
+    /// only way to name custom levels at 16+). Otherwise the hardcoded English
+    /// match. Level 0 maps to "Information": Windows uses Level=0 for
+    /// "LogAlways" and for all Security audit events.
+    pub fn level_name(&self) -> &str {
+        self.resolved_level
+            .as_deref()
+            .unwrap_or_else(|| fallback_level_name(self.level))
+    }
+}
+
+/// Hardcoded English names for the Windows-owned levels 0-5.
+///
+/// Miss fallback when the publisher table has no row for this value. Custom
+/// levels at 16+ cannot be known here and return "Unknown".
+pub(super) const fn fallback_level_name(level: u8) -> &'static str {
+    match level {
+        0 => "Information",
+        1 => "Critical",
+        2 => "Error",
+        3 => "Warning",
+        4 => "Information",
+        5 => "Verbose",
+        _ => "Unknown",
     }
 }
 
@@ -196,12 +243,12 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
                 }
             }
             Ok(XmlEvent::Text(ref e)) => {
-                if in_system && text_target != TextTarget::None {
-                    if let Ok(text) = e.unescape() {
-                        if text_buf.len() + text.len() <= 4096 {
-                            text_buf.push_str(&text);
-                        }
-                    }
+                if in_system
+                    && text_target != TextTarget::None
+                    && let Ok(text) = e.unescape()
+                    && text_buf.len() + text.len() <= 4096
+                {
+                    text_buf.push_str(&text);
                 }
             }
             Ok(XmlEvent::End(ref e)) => {
@@ -209,11 +256,11 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
                 let local = local.as_ref();
                 if local == b"System" {
                     // Commit any pending text before exiting
-                    commit_text(&text_target, &text_buf, &mut fields);
+                    commit_text(text_target, &text_buf, &mut fields);
                     break;
                 }
                 if in_system && text_target != TextTarget::None {
-                    commit_text(&text_target, &text_buf, &mut fields);
+                    commit_text(text_target, &text_buf, &mut fields);
                     text_target = TextTarget::None;
                     text_buf.clear();
                 }
@@ -230,7 +277,7 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
 }
 
 /// Commit collected element text into the appropriate SystemFields field.
-fn commit_text(target: &TextTarget, text: &str, fields: &mut SystemFields) {
+fn commit_text(target: TextTarget, text: &str, fields: &mut SystemFields) {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
@@ -347,13 +394,13 @@ pub fn build_event(
     if let Some(ref only_ids) = config.only_event_ids
         && !only_ids.contains(&event_id)
     {
-        counter!("windows_event_log_events_filtered_total", "reason" => "event_id_not_in_only_list")
+        counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_not_in_only_list")
             .increment(1);
         return Ok(None);
     }
 
     if config.ignore_event_ids.contains(&event_id) {
-        counter!("windows_event_log_events_filtered_total", "reason" => "event_id_ignored")
+        counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_ignored")
             .increment(1);
         return Ok(None);
     }
@@ -373,7 +420,10 @@ pub fn build_event(
             let diff = (Utc::now() - dt_utc).num_days().abs();
             if diff > 365 * 10 {
                 warn!(
-                    message = "Event timestamp is more than 10 years from current time.",
+                    message = format!(
+                        "Event timestamp is more than 10 years from current time \
+                         (channel={channel}, record_id={record_id})."
+                    ),
                     timestamp = %dt_utc,
                     channel = %channel,
                     record_id = record_id,
@@ -387,13 +437,21 @@ pub fn build_event(
     if let Some(max_age_secs) = config.max_event_age_secs {
         let age = Utc::now().signed_duration_since(time_created);
         if age.num_seconds() > max_age_secs as i64 {
-            counter!("windows_event_log_events_filtered_total", "reason" => "max_age_exceeded")
+            counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "max_age_exceeded")
                 .increment(1);
             return Ok(None);
         }
     }
 
     let event_data_result = extract_event_data(&xml, config);
+
+    let message_source = if rendered_message.is_some() {
+        MessageSource::Publisher
+    } else if event_data_result.string_inserts.is_empty() {
+        MessageSource::None
+    } else {
+        MessageSource::Inserts
+    };
 
     let event = WindowsEvent {
         record_id,
@@ -429,10 +487,12 @@ pub fn build_event(
         task_name: None,
         opcode_name: None,
         keyword_names: Vec::new(),
+        resolved_level: None,
         user_name: None,
         version: system_fields.version,
         qualifiers: system_fields.qualifiers,
         string_inserts: event_data_result.string_inserts,
+        message_source,
     };
 
     Ok(Some(event))
@@ -479,7 +539,38 @@ pub fn extract_event_data(xml: &str, config: &WindowsEventLogConfig) -> EventDat
     }
 }
 
+/// One open element strictly inside the parsed section.
+///
+/// Collects the element's own text and whether it has a child element. An
+/// element with a child is a wrapper; one without is a leaf that carries a field.
+struct SectionFrame {
+    /// Local element name (namespace prefix/URI stripped) used as the leaf key.
+    name: String,
+    /// `Data@Name` value when this frame is a `<Data Name="...">` element.
+    data_name: Option<String>,
+    is_data: bool,
+    text: String,
+    had_child: bool,
+}
+
 /// Parse a specific XML section (EventData or UserData).
+///
+/// EventData is a flat list of `<Data Name="...">value</Data>` (plus positional
+/// `<Data>` inserts). UserData instead holds provider-defined XML: a wrapper
+/// element whose leaf children are the fields, e.g.
+/// `<UserData><RuleAndFileData xmlns="..."><PolicyName>x</PolicyName>
+/// <FilePath>y</FilePath></RuleAndFileData></UserData>`. Both shapes are handled
+/// in one pass:
+/// - `<Data Name>` elements populate `named_data` in either section (last write
+///   wins, matching prior behavior); positional `<Data>` becomes an EventData
+///   insert.
+/// - Under UserData only, any other leaf element is flattened by its local name
+///   (namespace stripped), taking the leaf even under arbitrary wrapper nesting.
+///   A repeated leaf name keeps the first value so output is deterministic.
+///
+/// Wrapper (non-leaf) elements, empty or whitespace-only leaves, and attributes
+/// other than `Data@Name` are ignored. EventData keeps flat-list semantics; leaf
+/// flattening is scoped to UserData so EventData extraction is unchanged.
 fn parse_section(
     xml: &str,
     section_name: &str,
@@ -491,17 +582,23 @@ fn parse_section(
 
     let mut buf = Vec::new();
     let mut inside_section = false;
-    let mut inside_data = false;
-    let mut current_data_name = String::new();
-    let mut current_data_value = String::new();
+    // Provider leaf flattening applies to UserData only; EventData stays a flat
+    // Data list so its extraction is byte-for-byte unchanged.
+    let flatten_leaves = section_name == "UserData";
+    // Open elements inside the section. Depth is bounded transitively by
+    // MAX_ITERATIONS (each element costs at least one read), so no separate
+    // depth cap is needed to keep this hard-bounded.
+    let mut stack: Vec<SectionFrame> = Vec::new();
 
     const MAX_ITERATIONS: usize = 500;
     const MAX_FIELDS: usize = 100;
+    const MAX_VALUE_SIZE: usize = 1024 * 1024;
     let mut iterations = 0;
 
     loop {
         if iterations >= MAX_ITERATIONS
-            || (named_data.len() >= MAX_FIELDS || inserts.len() >= MAX_FIELDS)
+            || named_data.len() >= MAX_FIELDS
+            || inserts.len() >= MAX_FIELDS
         {
             break;
         }
@@ -509,48 +606,76 @@ fn parse_section(
 
         match reader.read_event_into(&mut buf) {
             Ok(XmlEvent::Start(ref e)) => {
-                let name = e.name();
-                if name.as_ref() == section_name.as_bytes() {
+                let qname = e.name();
+                if !inside_section && qname.as_ref() == section_name.as_bytes() {
                     inside_section = true;
-                } else if inside_section && name.as_ref() == b"Data" {
-                    inside_data = true;
-                    current_data_name.clear();
-                    current_data_value.clear();
-
-                    for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"Name" {
-                            let name_value = String::from_utf8_lossy(&attr.value);
-                            if name_value.len() <= 128 && !name_value.trim().is_empty() {
-                                current_data_name = name_value.into_owned();
+                } else if inside_section {
+                    // The parent now has a child element, so it is a wrapper.
+                    if let Some(top) = stack.last_mut() {
+                        top.had_child = true;
+                    }
+                    let is_data = qname.as_ref() == b"Data";
+                    let mut data_name = None;
+                    if is_data {
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"Name" {
+                                let name_value = String::from_utf8_lossy(&attr.value);
+                                if name_value.len() <= 128 && !name_value.trim().is_empty() {
+                                    data_name = Some(name_value.into_owned());
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
+                    let local = qname.local_name();
+                    stack.push(SectionFrame {
+                        name: String::from_utf8_lossy(local.as_ref()).into_owned(),
+                        data_name,
+                        is_data,
+                        text: String::new(),
+                        had_child: false,
+                    });
+                }
+            }
+            Ok(XmlEvent::Empty(_)) => {
+                // Self-closing element carries no text, so it is never a
+                // value-bearing leaf, but it does make its parent a wrapper.
+                if inside_section && let Some(top) = stack.last_mut() {
+                    top.had_child = true;
                 }
             }
             Ok(XmlEvent::End(ref e)) => {
-                let name = e.name();
-                if name.as_ref() == section_name.as_bytes() {
-                    inside_section = false;
-                } else if name.as_ref() == b"Data" && inside_data {
-                    inside_data = false;
-
-                    if !current_data_name.is_empty() {
-                        named_data.insert(current_data_name.clone(), current_data_value.clone());
-                    } else if section_name == "EventData" && inserts.len() < MAX_FIELDS {
-                        inserts.push(current_data_value.clone());
+                if inside_section {
+                    if let Some(frame) = stack.pop() {
+                        if frame.is_data {
+                            // Preserve prior Data handling for both sections.
+                            if let Some(data_name) = frame.data_name {
+                                named_data.insert(data_name, frame.text);
+                            } else if section_name == "EventData" && inserts.len() < MAX_FIELDS {
+                                inserts.push(frame.text);
+                            }
+                        } else if flatten_leaves && !frame.had_child {
+                            let trimmed = frame.text.trim();
+                            if !trimmed.is_empty() && named_data.len() < MAX_FIELDS {
+                                // First write wins on a repeated leaf name so the
+                                // flattened output is deterministic.
+                                named_data
+                                    .entry(frame.name)
+                                    .or_insert_with(|| trimmed.to_string());
+                            }
+                        }
+                    } else if e.name().as_ref() == section_name.as_bytes() {
+                        inside_section = false;
                     }
                 }
             }
             Ok(XmlEvent::Text(ref e)) => {
                 if inside_section
-                    && inside_data
+                    && let Some(top) = stack.last_mut()
                     && let Ok(text) = e.unescape()
+                    && top.text.len() + text.len() <= MAX_VALUE_SIZE
                 {
-                    const MAX_VALUE_SIZE: usize = 1024 * 1024;
-                    if current_data_value.len() + text.len() <= MAX_VALUE_SIZE {
-                        current_data_value.push_str(&text);
-                    }
+                    top.text.push_str(&text);
                 }
             }
             Ok(XmlEvent::Eof) => break,
@@ -599,20 +724,16 @@ pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
                     current_element.clear();
                 }
             }
-            Ok(XmlEvent::Text(ref e)) => {
-                if inside_target {
-                    match e.unescape() {
-                        Ok(text) => {
-                            if current_element.len() + text.len() > 4096 {
-                                warn!(message = "XML element text too long, truncating.");
-                                break;
-                            }
-                            current_element.push_str(&text);
-                        }
-                        Err(_) => return None,
+            Ok(XmlEvent::Text(ref e)) if inside_target => match e.unescape() {
+                Ok(text) => {
+                    if current_element.len() + text.len() > 4096 {
+                        warn!(message = "XML element text too long, truncating.");
+                        break;
                     }
+                    current_element.push_str(&text);
                 }
-            }
+                Err(_) => return None,
+            },
             Ok(XmlEvent::End(ref e)) => {
                 let name = e.name();
                 let element_name = String::from_utf8_lossy(name.as_ref());
@@ -631,27 +752,24 @@ pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     None
 }
 
+/// One quoting style of `attr_name='value'`. Splitting rather than slicing by
+/// byte offset keeps the search on char boundaries by construction.
+#[cfg(test)]
+fn attribute_quoted_with(xml: &str, attr_name: &str, quote: char) -> Option<String> {
+    let needle = format!("{attr_name}={quote}");
+    let (_, rest) = xml.split_once(&needle)?;
+    let (value, _) = rest.split_once(quote)?;
+    Some(value.to_string())
+}
+
 /// Extract an XML attribute value by attribute name via string search.
 ///
 /// Prefer `parse_system_section` for bulk System field extraction (single pass).
 /// This function is retained for one-off lookups outside the hot path.
 #[cfg(test)]
 pub fn extract_xml_attribute(xml: &str, attr_name: &str) -> Option<String> {
-    let needle = format!("{attr_name}='");
-    if let Some(start) = xml.find(&needle) {
-        let value_start = start + needle.len();
-        if let Some(end) = xml[value_start..].find('\'') {
-            return Some(xml[value_start..value_start + end].to_string());
-        }
-    }
-    let needle = format!("{attr_name}=\"");
-    if let Some(start) = xml.find(&needle) {
-        let value_start = start + needle.len();
-        if let Some(end) = xml[value_start..].find('"') {
-            return Some(xml[value_start..value_start + end].to_string());
-        }
-    }
-    None
+    attribute_quoted_with(xml, attr_name, '\'')
+        .or_else(|| attribute_quoted_with(xml, attr_name, '"'))
 }
 
 #[cfg(test)]
@@ -835,10 +953,12 @@ mod tests {
             task_name: None,
             opcode_name: None,
             keyword_names: Vec::new(),
+            resolved_level: None,
             user_name: None,
             version: Some(1),
             qualifiers: Some(0),
             string_inserts: vec![],
+            message_source: MessageSource::Publisher,
         };
 
         assert_eq!(event.level_name(), "Error");
@@ -870,10 +990,12 @@ mod tests {
             task_name: None,
             opcode_name: None,
             keyword_names: Vec::new(),
+            resolved_level: None,
             user_name: None,
             version: Some(2),
             qualifiers: Some(0),
             string_inserts: vec![],
+            message_source: MessageSource::Publisher,
         };
 
         assert_eq!(event.level_name(), "Information");
@@ -922,8 +1044,10 @@ mod tests {
         </Event>
         "#;
 
-        let mut config = WindowsEventLogConfig::default();
-        config.max_event_data_length = 20;
+        let config = WindowsEventLogConfig {
+            max_event_data_length: 20,
+            ..Default::default()
+        };
 
         let result = extract_event_data(xml, &config);
 
@@ -1092,8 +1216,11 @@ mod tests {
         </Event>
         "#;
 
-        let mut config = WindowsEventLogConfig::default();
-        config.max_event_age_secs = Some(3600); // 1 hour
+        // 1 hour
+        let config = WindowsEventLogConfig {
+            max_event_age_secs: Some(3600),
+            ..Default::default()
+        };
 
         let result = parse_event_xml(xml.to_string(), "Application", &config, None);
         assert!(
@@ -1122,13 +1249,243 @@ mod tests {
             "#
         );
 
-        let mut config = WindowsEventLogConfig::default();
-        config.max_event_age_secs = Some(3600); // 1 hour
+        // 1 hour
+        let config = WindowsEventLogConfig {
+            max_event_age_secs: Some(3600),
+            ..Default::default()
+        };
 
         let result = parse_event_xml(xml, "Application", &config, None);
         assert!(
             result.unwrap().is_some(),
             "Recent event should pass max_event_age_secs filter"
         );
+    }
+
+    #[test]
+    fn test_user_data_applocker_namespaced_leaves() {
+        // AppLocker EXE/DLL block: provider element under a default xmlns whose
+        // leaf children hold the fields. Namespace must be stripped from keys.
+        let xml = r#"
+        <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+            <System><EventID>8004</EventID></System>
+            <UserData>
+                <RuleAndFileData xmlns="http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0">
+                    <PolicyNameLength>3</PolicyNameLength>
+                    <PolicyName>EXE</PolicyName>
+                    <RuleId>{9420c496-046d-45ab-bd0e-455b2649e41e}</RuleId>
+                    <RuleName>Deny bad.exe</RuleName>
+                    <TargetUser>S-1-5-21-1</TargetUser>
+                    <FullFilePath>C:\App\bad.exe</FullFilePath>
+                </RuleAndFileData>
+            </UserData>
+        </Event>
+        "#;
+
+        let config = WindowsEventLogConfig::default();
+        let result = extract_event_data(xml, &config);
+
+        assert_eq!(
+            result.user_data.get("PolicyName").map(String::as_str),
+            Some("EXE")
+        );
+        assert_eq!(
+            result.user_data.get("FullFilePath").map(String::as_str),
+            Some(r"C:\App\bad.exe")
+        );
+        assert_eq!(
+            result.user_data.get("RuleName").map(String::as_str),
+            Some("Deny bad.exe")
+        );
+        assert_eq!(
+            result.user_data.get("PolicyNameLength").map(String::as_str),
+            Some("3")
+        );
+        // The wrapper element itself is not a leaf and must not appear.
+        assert!(!result.user_data.contains_key("RuleAndFileData"));
+    }
+
+    #[test]
+    fn test_user_data_nested_wrapper_leaves() {
+        // Two wrapper levels: the leaf's local name is the key regardless of depth.
+        let xml = r#"
+        <Event>
+            <System><EventID>102</EventID></System>
+            <UserData>
+                <TaskSchedulerEvent xmlns="http://example/eventlog">
+                    <EventInfo>
+                        <TaskName>\Microsoft\Windows\Defrag\ScheduledDefrag</TaskName>
+                        <ActionName>C:\Windows\system32\defrag.exe</ActionName>
+                        <ResultCode>0</ResultCode>
+                    </EventInfo>
+                </TaskSchedulerEvent>
+            </UserData>
+        </Event>
+        "#;
+
+        let config = WindowsEventLogConfig::default();
+        let result = extract_event_data(xml, &config);
+
+        assert_eq!(
+            result.user_data.get("TaskName").map(String::as_str),
+            Some(r"\Microsoft\Windows\Defrag\ScheduledDefrag")
+        );
+        assert_eq!(
+            result.user_data.get("ResultCode").map(String::as_str),
+            Some("0")
+        );
+        assert!(!result.user_data.contains_key("EventInfo"));
+        assert!(!result.user_data.contains_key("TaskSchedulerEvent"));
+    }
+
+    #[test]
+    fn test_user_data_mixed_data_and_leaves() {
+        // Some providers place <Data Name> elements alongside plain leaves under
+        // UserData. Both must be captured.
+        let xml = r#"
+        <Event>
+            <System><EventID>1</EventID></System>
+            <UserData>
+                <CustomProvider xmlns="http://example/p">
+                    <Data Name="ErrorCode">0x5</Data>
+                    <Reason>AccessDenied</Reason>
+                </CustomProvider>
+            </UserData>
+        </Event>
+        "#;
+
+        let config = WindowsEventLogConfig::default();
+        let result = extract_event_data(xml, &config);
+
+        assert_eq!(
+            result.user_data.get("ErrorCode").map(String::as_str),
+            Some("0x5")
+        );
+        assert_eq!(
+            result.user_data.get("Reason").map(String::as_str),
+            Some("AccessDenied")
+        );
+    }
+
+    #[test]
+    fn test_user_data_duplicate_leaf_first_wins() {
+        let xml = r#"
+        <Event>
+            <System><EventID>1</EventID></System>
+            <UserData>
+                <Wrapper xmlns="http://example/p">
+                    <Item>first</Item>
+                    <Item>second</Item>
+                    <Item>third</Item>
+                </Wrapper>
+            </UserData>
+        </Event>
+        "#;
+
+        let config = WindowsEventLogConfig::default();
+        let result = extract_event_data(xml, &config);
+
+        assert_eq!(
+            result.user_data.get("Item").map(String::as_str),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn test_user_data_oversized_leaf_capped() {
+        let long = "y".repeat(500);
+        let xml = format!(
+            r#"
+        <Event>
+            <System><EventID>1</EventID></System>
+            <UserData>
+                <Wrapper xmlns="http://example/p">
+                    <FilePath>{long}</FilePath>
+                </Wrapper>
+            </UserData>
+        </Event>
+        "#
+        );
+
+        let mut config = WindowsEventLogConfig::default();
+        config.max_event_data_length = 32;
+
+        let result = extract_event_data(&xml, &config);
+
+        let value = result.user_data.get("FilePath").unwrap();
+        assert!(
+            value.ends_with("...[truncated]"),
+            "Oversized leaf should be truncated"
+        );
+        assert!(
+            value.len() <= 32 + "...[truncated]".len(),
+            "Truncated leaf should respect limit"
+        );
+    }
+
+    #[test]
+    fn test_user_data_empty_omitted() {
+        // Empty section and whitespace-only/self-closing leaves yield nothing,
+        // so the caller's is_empty() gate omits the user_data field.
+        let empty = r#"
+        <Event><System><EventID>1</EventID></System><UserData></UserData></Event>
+        "#;
+        let config = WindowsEventLogConfig::default();
+        assert!(extract_event_data(empty, &config).user_data.is_empty());
+
+        let blank_leaves = r#"
+        <Event>
+            <System><EventID>1</EventID></System>
+            <UserData>
+                <Wrapper xmlns="http://example/p">
+                    <Empty></Empty>
+                    <Blank>   </Blank>
+                    <SelfClosing/>
+                </Wrapper>
+            </UserData>
+        </Event>
+        "#;
+        assert!(
+            extract_event_data(blank_leaves, &config)
+                .user_data
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_event_data_unaffected_by_userdata_flattening() {
+        // EventData in the same document keeps flat named + positional handling.
+        let xml = r#"
+        <Event>
+            <System><EventID>4624</EventID></System>
+            <EventData>
+                <Data Name="LogonType">2</Data>
+                <Data Name="TargetUserName">alice</Data>
+                <Data>positional</Data>
+            </EventData>
+            <UserData>
+                <Wrapper xmlns="http://example/p"><Leaf>v</Leaf></Wrapper>
+            </UserData>
+        </Event>
+        "#;
+
+        let config = WindowsEventLogConfig::default();
+        let result = extract_event_data(xml, &config);
+
+        assert_eq!(
+            result.structured_data.get("LogonType").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            result
+                .structured_data
+                .get("TargetUserName")
+                .map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(result.string_inserts, vec!["positional".to_string()]);
+        // UserData leaf did not leak into event_data.
+        assert!(!result.structured_data.contains_key("Leaf"));
+        assert_eq!(result.user_data.get("Leaf").map(String::as_str), Some("v"));
     }
 }
