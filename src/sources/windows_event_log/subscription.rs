@@ -10,9 +10,7 @@ use vector_lib::{
     counter, gauge,
     internal_event::{CounterName, GaugeName, error_type},
 };
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_EVT_INVALID_QUERY, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EvtClose, EvtNext, EvtOpenChannelConfig, EvtSubscribe,
     EvtSubscribeStartAfterBookmark, EvtSubscribeStartAtOldestRecord, EvtSubscribeStrict,
@@ -37,7 +35,7 @@ use super::{
     status::{ChannelStatus, GapRecord, StatusSnapshot, gap_for_rung, newest_record_estimate},
     win32_errors::{
         DrainOutcome, QueryOrigin, SkipReason, SubscribeOutcome, classify_evt_next,
-        classify_subscribe, describe, win32_code,
+        classify_subscribe, describe, subscribe_failure_is_not_the_query, win32_code,
     },
     xml_parser,
 };
@@ -456,17 +454,19 @@ impl SubscriptionFactory {
         query
     }
 
-    /// What to subscribe with after the service rejected `origin`'s query as
-    /// invalid (15001), or `None` when nothing is left to try.
-    ///
-    /// Keyed on 15001 alone. Any other failure says nothing about the query, and
-    /// retrying without the ids on a bookmark death or an RPC blip would drop
-    /// suppression for the generation over a fault that is not ours.
+    /// What to subscribe with after the service refused `origin`'s query, or
+    /// `None` when nothing is left to try.
     ///
     /// The chain is ids plus floor, then the floor alone, then the base query.
-    /// A composed floor is OURS, so its rejection must not be charged to the
+    /// A composed query is OURS, so its rejection must not be charged to the
     /// ladder: every rung would compose the same shape, fail the same way, and
     /// walk to `FutureOnly`, discarding the backlog over a query we wrote.
+    ///
+    /// Every failure steps down except the two that say nothing about the
+    /// query (see [`subscribe_failure_is_not_the_query`]): a bookmark death
+    /// belongs to the ladder, and an RPC failure to the backoff. Dropping the
+    /// ids over either would lose suppression for the process over a fault
+    /// that is not ours.
     fn fallback_after(
         &mut self,
         origin: QueryOrigin,
@@ -475,7 +475,7 @@ impl SubscriptionFactory {
         error: &windows::core::Error,
     ) -> Option<(String, QueryOrigin)> {
         let code = win32_code(error);
-        if code != ERROR_EVT_INVALID_QUERY.0 {
+        if subscribe_failure_is_not_the_query(code) {
             return None;
         }
         if origin == QueryOrigin::Suppressed {
@@ -5811,12 +5811,12 @@ mod tests {
         subscription
     }
 
-    /// The rejection chain: 15001 steps down ids plus floor, then the floor
-    /// alone, then the base query, without moving the rung. Any other code
-    /// leaves the ids in place and goes to the ordinary classification, so a
-    /// bookmark death or an RPC blip never costs the suppression.
+    /// The rejection chain: a refusal steps down ids plus floor, then the floor
+    /// alone, then the base query, without moving the rung. A bookmark death
+    /// or an RPC failure leaves the ids in place and goes to the ordinary
+    /// classification, so neither ever costs the suppression.
     #[tokio::test]
-    async fn the_suppress_rejection_chain_steps_down_on_15001_only() {
+    async fn a_refused_suppress_query_steps_down_unless_the_query_is_not_at_fault() {
         const OPERATOR: Option<&str> = Some("*[System[Level<=4]]");
         let _seams = SeamSession::acquire();
 
@@ -5939,6 +5939,26 @@ mod tests {
                 script: &[1722],
                 live_with: None,
                 suppress_active: true,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "any other refusal drops the ids, and the base query is accepted",
+                event_query: None,
+                time_rung: false,
+                script: &[87],
+                live_with: Some(QueryOrigin::Generated),
+                suppress_active: false,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "time rung: any other refusal steps down through the floor to the base",
+                event_query: OPERATOR,
+                time_rung: true,
+                script: &[87, 87],
+                live_with: Some(QueryOrigin::Operator),
+                suppress_active: false,
                 rung_kept: true,
                 skipped: None,
             },
