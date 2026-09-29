@@ -78,6 +78,10 @@ pub(super) enum QueryOrigin {
     /// A resume-ladder predicate this source generated. Invalid means our
     /// predicate is wrong, which the next ladder rung may fix.
     Generated,
+    /// A query this source generated that carries the channel's suppress ids.
+    /// Invalid means the ids are the likeliest cause, so they are dropped and
+    /// the rung stays where it is.
+    Suppressed,
 }
 
 /// Why a channel is being skipped for this subscription generation.
@@ -127,6 +131,9 @@ pub(super) enum DrainOutcome {
     /// Discard any returned handles, tear down, and resubscribe from the last
     /// persisted checkpoint with backoff. This is also where unknown codes go.
     Rebuild,
+    /// Discard any returned handles and resubscribe at once without the suppress
+    /// ids, on the same rung: the query is ours and the ids are what changed it.
+    DropSuppressIds,
 }
 
 /// What a failed `EvtSubscribe` means.
@@ -219,6 +226,7 @@ pub(super) const fn classify_evt_next(
             // Our own predicate: rebuilding advances the ladder, which is what
             // gives the next attempt a different predicate.
             QueryOrigin::Generated => DrainOutcome::Rebuild,
+            QueryOrigin::Suppressed => DrainOutcome::DropSuppressIds,
         },
 
         // Oversized event: shrinking the batch is the targeted fix, and it is
@@ -245,7 +253,11 @@ pub(super) const fn classify_subscribe(code: u32, query_origin: QueryOrigin) -> 
             QueryOrigin::Operator => {
                 SubscribeOutcome::SkipChannel(SkipReason::OperatorQueryInvalid)
             }
-            QueryOrigin::Generated => SubscribeOutcome::GeneratedQueryInvalid,
+            // `SubscriptionFactory::build` retries a rejected suppress query
+            // without its ids before the error gets here.
+            QueryOrigin::Generated | QueryOrigin::Suppressed => {
+                SubscribeOutcome::GeneratedQueryInvalid
+            }
         },
 
         // Bookmark-death codes. 1168 belongs here and is easy to miss: with
@@ -428,6 +440,29 @@ mod tests {
         assert_eq!(
             classify_subscribe(15001, QueryOrigin::Generated),
             SubscribeOutcome::GeneratedQueryInvalid
+        );
+    }
+
+    /// 15001 at `EvtNext` on a query carrying suppress ids drops the ids and
+    /// keeps the rung; without ids it stays a ladder rebuild.
+    #[test]
+    fn invalid_query_on_a_suppress_query_drops_the_ids() {
+        assert_eq!(
+            classify_evt_next(15001, 0, QueryOrigin::Suppressed),
+            DrainOutcome::DropSuppressIds
+        );
+        assert_eq!(
+            classify_evt_next(15001, 0, QueryOrigin::Generated),
+            DrainOutcome::Rebuild
+        );
+        // Any other code on the same query is classified as for a generated one.
+        assert_eq!(
+            classify_evt_next(1168, 0, QueryOrigin::Suppressed),
+            DrainOutcome::Rebuild
+        );
+        assert_eq!(
+            classify_subscribe(1168, QueryOrigin::Suppressed),
+            SubscribeOutcome::BookmarkDead
         );
     }
 
