@@ -4,14 +4,44 @@
 //! subscription lifecycle and event pulling.
 
 use metrics::Gauge;
-use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::System::EventLog::{
-    EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords, EvtOpenLog,
-    EvtRender, EvtRenderEventXml,
+    EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords,
+    EvtLogOldestRecordNumber, EvtOpenLog, EvtRender, EvtRenderEventXml,
 };
 use windows::core::HSTRING;
 
 use super::error::WindowsEventLogError;
+use super::status::ChannelRecordStats;
+use super::win32_errors::{RenderDisposition, classify_render, win32_code};
+
+/// Test-only rewrite of the rendered XML, applied to the string this function
+/// is about to return.
+///
+/// This supplies an INPUT, not a decision. Everything downstream that cares
+/// about `<RenderingInfo>` derives it by parsing this XML, so injecting an
+/// event whose XML carries the element exercises the real derivation. A WEC
+/// forwarding pair is the only way to obtain such an event from the API, and
+/// setting the derived flag directly would assert the seam instead.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(super) static RENDER_XML_REWRITE: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(String) -> String + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+/// Apply the test-only rewrite, if one is installed.
+#[cfg(test)]
+fn rewrite_xml(xml: String) -> String {
+    let rewrite = RENDER_XML_REWRITE.lock().unwrap().clone();
+    match rewrite {
+        Some(f) => f(xml),
+        None => xml,
+    }
+}
+
+#[cfg(not(test))]
+const fn rewrite_xml(xml: String) -> String {
+    xml
+}
 
 /// Render an event handle to XML using reusable buffers.
 pub(super) fn render_event_xml(
@@ -20,6 +50,17 @@ pub(super) fn render_event_xml(
     event_handle: EVT_HANDLE,
 ) -> Result<String, WindowsEventLogError> {
     const MAX_BUFFER_SIZE: u32 = 10 * 1024 * 1024; // 10MB limit
+
+    // Test-only fault injection for the unprocessable-event path. A real
+    // malformed event is not producible on demand, and the behavior under test
+    // (skip the event, keep the subscription, advance past it) is exactly what
+    // must not be asserted from the implementation.
+    #[cfg(test)]
+    if super::subscription::FAIL_ALL_RENDERS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(WindowsEventLogError::ReadEventError {
+            source: windows::core::Error::from_hresult(windows::core::HRESULT(13)),
+        });
+    }
 
     let buffer_size = render_buffer.len() as u32;
     let mut buffer_used = 0u32;
@@ -38,7 +79,11 @@ pub(super) fn render_event_xml(
     };
 
     if let Err(e) = result {
-        if e.code() == ERROR_INSUFFICIENT_BUFFER.into() {
+        // Classified on the render path, whose disposition type has no
+        // subscription-rebuild arm at all. ERROR_INSUFFICIENT_BUFFER is routine
+        // here on every size probe; routing it anywhere near the drain
+        // classifier would tear down subscriptions on normal buffer growth.
+        if classify_render(win32_code(&e)) == RenderDisposition::GrowBuffer {
             if buffer_used == 0 {
                 return Ok(String::new());
             }
@@ -72,8 +117,9 @@ pub(super) fn render_event_xml(
                 render_buffer.resize(SHRINK_THRESHOLD, 0);
                 render_buffer.shrink_to_fit();
             }
+            shrink_decode_buffer(decode_buffer);
 
-            return Ok(result);
+            return Ok(rewrite_xml(result));
         }
         return Err(WindowsEventLogError::ReadEventError { source: e });
     }
@@ -87,25 +133,84 @@ pub(super) fn render_event_xml(
         render_buffer.resize(SHRINK_THRESHOLD, 0);
         render_buffer.shrink_to_fit();
     }
+    shrink_decode_buffer(decode_buffer);
 
-    Ok(result)
+    Ok(rewrite_xml(result))
 }
 
-/// Update the channel record count gauge using EvtGetLogInfo.
+/// Decoded UTF-16 scratch: its resting size, and the size past which an outsized
+/// event has to give the memory back.
 ///
+/// The buffer only ever grows. It is resized to whatever the largest event so
+/// far needed and never handed back, so one 2 MB event pins 4 MB of scratch per
+/// source for the life of the process. That is the cost being removed.
+///
+/// Both numbers are RULED, not derived: rest at 16 KiB, shrink above 256 KiB.
+/// They are written in `u16` elements because that is what this buffer holds, so
+/// 8 K elements is the 16 KiB rest and 128 K elements is the 256 KiB ceiling.
+/// The ratio to the render buffer's own 64 KiB threshold is a consequence of
+/// those two numbers, not a reason for them.
+const DECODE_BUFFER_AT_REST: usize = 8 * 1024;
+const DECODE_SHRINK_THRESHOLD: usize = 128 * 1024;
+
+/// Return the decode scratch to its resting size after an outsized event.
+fn shrink_decode_buffer(decode_buffer: &mut Vec<u16>) {
+    if decode_buffer.len() > DECODE_SHRINK_THRESHOLD {
+        decode_buffer.resize(DECODE_BUFFER_AT_REST, 0);
+        decode_buffer.shrink_to_fit();
+    }
+}
+
+/// Test-only count of channel metadata queries, whoever asked for them.
+///
+/// The whole point of the speculative-pull flag is to avoid steady
+/// `EvtOpenLog`/`EvtGetLogInfo` churn on an idle host, so "was the metadata
+/// query issued" IS the contract, and a gauge write is not observable.
+#[cfg(test)]
+pub(super) static CHANNEL_RECORDS_UPDATES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Reports total records in the channel. SOC teams compare this against
 /// `rate(events_read_total)` to detect ingestion lag.
 /// Best-effort: if any API call fails, the gauge is left unchanged.
 pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
+    if let Some(stats) = channel_record_stats(channel) {
+        gauge.set(stats.count as f64);
+    }
+}
+
+/// Read the record count and the oldest record id of a channel in one open.
+///
+/// Both properties come off the same log handle, so the pair costs one
+/// `EvtOpenLog` and two `EvtGetLogInfo` calls. Returns `None` if the channel
+/// cannot be opened or either property is unavailable: a partial answer would
+/// let a caller compute a record position out of one real number and one
+/// invented one.
+pub(super) fn channel_record_stats(channel: &str) -> Option<ChannelRecordStats> {
+    #[cfg(test)]
+    CHANNEL_RECORDS_UPDATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
     let channel_hstring = HSTRING::from(channel);
     let log_handle = unsafe {
         // EvtOpenChannelPath = 1
-        match EvtOpenLog(None, &channel_hstring, 1) {
-            Ok(h) => h,
-            Err(_) => return,
-        }
+        EvtOpenLog(None, &channel_hstring, 1).ok()?
     };
 
+    let count = log_info_u64(log_handle, EvtLogNumberOfLogRecords.0);
+    let oldest = log_info_u64(log_handle, EvtLogOldestRecordNumber.0);
+
+    unsafe {
+        _ = EvtClose(log_handle);
+    }
+
+    Some(ChannelRecordStats {
+        count: count?,
+        oldest: oldest?,
+    })
+}
+
+/// Read one `UInt64` log property off an open log handle.
+fn log_info_u64(log_handle: EVT_HANDLE, property: i32) -> Option<u64> {
     // EVT_VARIANT is 16 bytes: 8 bytes value + 4 bytes count + 4 bytes type
     let mut buffer = [0u8; 16];
     let mut buffer_used = 0u32;
@@ -113,22 +218,18 @@ pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
     let result = unsafe {
         EvtGetLogInfo(
             log_handle,
-            EVT_LOG_PROPERTY_ID(EvtLogNumberOfLogRecords.0),
+            EVT_LOG_PROPERTY_ID(property),
             buffer.len() as u32,
             Some(buffer.as_mut_ptr() as *mut _),
             &mut buffer_used,
         )
     };
 
-    unsafe {
-        let _ = EvtClose(log_handle);
+    if result.is_err() {
+        return None;
     }
-
-    if result.is_ok() {
-        // EVT_VARIANT for UInt64: first 8 bytes are the value (little-endian)
-        let record_count = u64::from_le_bytes(buffer[..8].try_into().unwrap_or([0; 8]));
-        gauge.set(record_count as f64);
-    }
+    // EVT_VARIANT for UInt64: first 8 bytes are the value (little-endian)
+    Some(u64::from_le_bytes(buffer[..8].try_into().ok()?))
 }
 
 /// Decode a UTF-16LE buffer (as returned by Windows EvtRender) into a String.
@@ -141,7 +242,7 @@ fn decode_utf16_buffer(buffer: &[u8], bytes_used: u32, decode_buf: &mut Vec<u16>
     if bytes_used == 0 || bytes_used as usize > buffer.len() {
         return String::new();
     }
-    if bytes_used < 2 || bytes_used % 2 != 0 {
+    if bytes_used < 2 || !bytes_used.is_multiple_of(2) {
         return String::new();
     }
 
