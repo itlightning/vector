@@ -278,6 +278,21 @@ pub(super) const fn classify_subscribe(code: u32, query_origin: QueryOrigin) -> 
     }
 }
 
+/// Whether a failed `EvtSubscribe` says nothing about the query: the stored
+/// position died, or the service could not be reached. The ladder and the
+/// backoff own these. Any other subscribe failure may be the query's, so a
+/// query this source composed falls back to a simpler one instead of charging
+/// the failure to the ladder.
+pub(super) const fn subscribe_failure_is_not_the_query(code: u32) -> bool {
+    matches!(
+        classify_subscribe(code, QueryOrigin::Operator),
+        SubscribeOutcome::BookmarkDead
+    ) || code == RPC_S_UNKNOWN_IF.0 as u32
+        || code == RPC_S_SERVER_UNAVAILABLE.0 as u32
+        || code == RPC_S_CALL_FAILED.0 as u32
+        || code == RPC_S_CALL_CANCELLED.0 as u32
+}
+
 /// Names for the codes we deliberately document, for log attribution.
 ///
 /// Purely descriptive: no behavior keys off it. Returning `None` for an unknown
@@ -507,6 +522,27 @@ mod tests {
     fn insufficient_buffer_cannot_express_a_rebuild() {
         let disposition = classify_render(ERROR_INSUFFICIENT_BUFFER.0);
         assert_eq!(disposition, RenderDisposition::GrowBuffer);
+    }
+
+    /// Bookmark death and the RPC family never make a composed query fall
+    /// back; anything else, named or not, may be the query's fault.
+    #[test]
+    fn only_position_and_service_failures_are_not_the_query() {
+        for code in [
+            1168u32,
+            15011,
+            15012,
+            INHERITED_UNDOCUMENTED_16953,
+            1717,
+            1722,
+            1726,
+            1818,
+        ] {
+            assert!(subscribe_failure_is_not_the_query(code), "{code}");
+        }
+        for code in [15001u32, 87, 5, 15000, 15007, 15009, 6, 60123] {
+            assert!(!subscribe_failure_is_not_the_query(code), "{code}");
+        }
     }
 
     #[test]
