@@ -279,24 +279,39 @@ pub(super) const fn classify_subscribe(code: u32, query_origin: QueryOrigin) -> 
 }
 
 /// Whether a failed `EvtSubscribe` says nothing about the query: the stored
-/// position died, the service could not be reached, or the channel is absent,
-/// unreadable or not subscribable. The ladder, the backoff and the channel skip
-/// own these. Any other subscribe failure may be the query's, so a query this
-/// source composed falls back to a simpler one instead of charging the failure
-/// to the ladder.
+/// position died, the service could not be reached, the handle was torn down
+/// under the call, or the channel is absent, unreadable or not subscribable.
+/// The ladder, the backoff and the channel skip own these. Any other subscribe
+/// failure may be the query's, so a query this source composed falls back to a
+/// simpler one instead of charging the failure to the ladder.
+///
+/// The whole 1700..=1999 block is taken, not the codes seen so far: it is the
+/// RPC runtime and endpoint mapper block (1722 server unavailable, 1723 too
+/// busy, 1727 failed and did not execute, 1753 no endpoints), and the service
+/// reports those about the transport, never about XPath. The printer, trust and
+/// account codes interleaved in it cannot describe a query either. A new
+/// transport fault then never costs the suppression for the rest of the process.
 pub(super) const fn subscribe_failure_is_not_the_query(code: u32) -> bool {
     matches!(
         classify_subscribe(code, QueryOrigin::Operator),
         SubscribeOutcome::BookmarkDead
-    ) || code == ERROR_ACCESS_DENIED.0
+    ) || matches!(code, RPC_STATUS_FIRST..=RPC_STATUS_LAST)
+        || code == ERROR_INVALID_HANDLE.0
+        || code == ERROR_CANCELLED.0
+        || code == ERROR_ACCESS_DENIED.0
         || code == ERROR_EVT_INVALID_CHANNEL_PATH.0
         || code == ERROR_EVT_CHANNEL_NOT_FOUND.0
         || code == ERROR_EVT_SUBSCRIPTION_TO_DIRECT_CHANNEL.0
-        || code == RPC_S_UNKNOWN_IF.0 as u32
-        || code == RPC_S_SERVER_UNAVAILABLE.0 as u32
-        || code == RPC_S_CALL_FAILED.0 as u32
-        || code == RPC_S_CALL_CANCELLED.0 as u32
 }
+
+/// The Win32 code block holding RPC runtime and endpoint mapper status.
+///
+/// PROVENANCE: Microsoft Learn "System Error Codes (1700-3999)" (WinError.h),
+/// read 2026-09-29: `RPC_S_INVALID_STRING_BINDING` 1700 opens the block,
+/// `RPC_S_GRP_ELT_NOT_REMOVED` 1929 is the last RPC entry, and 2000 opens the
+/// next block (`ERROR_INVALID_PIXEL_FORMAT`).
+const RPC_STATUS_FIRST: u32 = 1700;
+const RPC_STATUS_LAST: u32 = 1999;
 
 /// Names for the codes we deliberately document, for log attribution.
 ///
@@ -529,8 +544,9 @@ mod tests {
         assert_eq!(disposition, RenderDisposition::GrowBuffer);
     }
 
-    /// Bookmark death, the RPC family and channel faults never make a composed
-    /// query fall back; anything else, named or not, may be the query's fault.
+    /// Bookmark death, the RPC block, handle churn and channel faults never make
+    /// a composed query fall back; anything else, named or not, may be the
+    /// query's fault.
     #[test]
     fn only_position_and_service_failures_are_not_the_query() {
         for code in [
@@ -538,10 +554,17 @@ mod tests {
             15011,
             15012,
             INHERITED_UNDOCUMENTED_16953,
+            1700,
             1717,
             1722,
+            1723,
             1726,
+            1727,
+            1753,
             1818,
+            1999,
+            6,
+            1223,
             5,
             15000,
             15007,
@@ -549,7 +572,7 @@ mod tests {
         ] {
             assert!(subscribe_failure_is_not_the_query(code), "{code}");
         }
-        for code in [15001u32, 87, 6, 1223, 60123] {
+        for code in [15001u32, 87, 1699, 2000, 60123] {
             assert!(!subscribe_failure_is_not_the_query(code), "{code}");
         }
     }
