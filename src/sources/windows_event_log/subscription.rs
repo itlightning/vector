@@ -251,9 +251,10 @@ pub(super) struct SubscriptionFactory {
     /// This channel's suppress rules, each provider's ids deduplicated.
     suppress_rules: Vec<SuppressRule>,
     /// Whether queries carry `suppress_rules`. False with no rules or a
-    /// structured operator query, and latched false for the process once the
-    /// service rejects a query carrying them: the same query would be rejected
-    /// again.
+    /// structured operator query. Latched false for the process once a query
+    /// without them has replaced one the service rejected: the same query would
+    /// be rejected again. Never on a refusal alone, because a failed step-down
+    /// can leave the id-bearing subscription live, and gap detection reads this.
     suppress_active: bool,
 }
 
@@ -366,7 +367,12 @@ impl SubscriptionFactory {
     /// With suppress ids active every rung composes a structured query; see
     /// [`Self::suppress_query`].
     pub(super) fn query_for(&self, resume: &ResumeState) -> (String, QueryOrigin) {
-        if self.suppress_active {
+        self.query_with(resume, self.suppress_active)
+    }
+
+    /// [`Self::query_for`], with or without the suppress ids.
+    fn query_with(&self, resume: &ResumeState, with_ids: bool) -> (String, QueryOrigin) {
+        if with_ids {
             let stamp = match resume.rung {
                 Rung::TimeAdvance(_) => resume.time_floor(),
                 _ => None,
@@ -467,8 +473,11 @@ impl SubscriptionFactory {
     /// to the ladder, an RPC failure to the backoff, and a channel fault to the
     /// channel skip. Dropping the ids over any of them would lose suppression
     /// for the process over a fault that is not ours.
+    ///
+    /// Stepping down from the ids does not latch them off: `build` does that
+    /// once a query without them is accepted.
     fn fallback_after(
-        &mut self,
+        &self,
         origin: QueryOrigin,
         query: &str,
         resume: &ResumeState,
@@ -479,8 +488,7 @@ impl SubscriptionFactory {
             return None;
         }
         if origin == QueryOrigin::Suppressed {
-            self.drop_suppress_ids(code);
-            return Some(self.query_for(resume));
+            return Some(self.query_with(resume, false));
         }
         if origin == QueryOrigin::Generated && query.trim_start().starts_with('<') {
             warn!(
@@ -519,6 +527,10 @@ impl SubscriptionFactory {
         resume: &ResumeState,
     ) -> Result<(EVT_HANDLE, QueryOrigin), (windows::core::Error, QueryOrigin)> {
         let (mut query, mut origin) = self.query_for(resume);
+        // The code that refused the ids, held until a query without them is
+        // accepted: the caller swaps every accepted handle in, so that is when
+        // the ids stop being live.
+        let mut ids_refused = None;
         let channel_hstring = HSTRING::from(self.channel.as_str());
 
         // A freshly created bookmark has a valid, non-null handle but marks no
@@ -562,9 +574,19 @@ impl SubscriptionFactory {
                 use_bookmark,
                 flags,
             ) {
-                Ok(handle) => return Ok((handle, origin)),
+                Ok(handle) => {
+                    if let Some(code) = ids_refused {
+                        self.drop_suppress_ids(code);
+                    }
+                    return Ok((handle, origin));
+                }
                 Err(e) => match self.fallback_after(origin, &query, resume, &e) {
-                    Some((next, next_origin)) => (query, origin) = (next, next_origin),
+                    Some((next, next_origin)) => {
+                        if origin == QueryOrigin::Suppressed {
+                            ids_refused = Some(win32_code(&e));
+                        }
+                        (query, origin) = (next, next_origin);
+                    }
                     None => return Err((e, origin)),
                 },
             }
@@ -5812,7 +5834,8 @@ mod tests {
     }
 
     /// The rejection chain: a refusal steps down ids plus floor, then the floor
-    /// alone, then the base query, without moving the rung. A bookmark death,
+    /// alone, then the base query, without moving the rung. The ids latch off
+    /// only when a query without them is accepted. A bookmark death,
     /// an RPC failure or a channel fault leaves the ids in place and goes to
     /// the ordinary classification, so none of them ever costs the suppression.
     #[tokio::test]
@@ -5853,12 +5876,12 @@ mod tests {
                 skipped: None,
             },
             Row {
-                name: "ids and the operator query rejected: the operator query is at fault",
+                name: "ids and the operator query rejected: the query is at fault, ids stay",
                 event_query: OPERATOR,
                 time_rung: false,
                 script: &[15001, 15001],
                 live_with: None,
-                suppress_active: false,
+                suppress_active: true,
                 rung_kept: true,
                 skipped: Some(SkipReason::OperatorQueryInvalid),
             },
@@ -5893,22 +5916,22 @@ mod tests {
                 skipped: None,
             },
             Row {
-                name: "time rung: every step rejected, the operator query is at fault",
+                name: "time rung: every step rejected, the query is at fault, ids stay",
                 event_query: OPERATOR,
                 time_rung: true,
                 script: &[15001, 15001, 15001],
                 live_with: None,
-                suppress_active: false,
+                suppress_active: true,
                 rung_kept: true,
                 skipped: Some(SkipReason::OperatorQueryInvalid),
             },
             Row {
-                name: "time rung: our own floor predicate rejected advances the ladder as before",
+                name: "time rung: our floor predicate rejected advances the ladder, ids stay",
                 event_query: None,
                 time_rung: true,
                 script: &[15001, 15001],
                 live_with: None,
-                suppress_active: false,
+                suppress_active: true,
                 rung_kept: false,
                 skipped: None,
             },
@@ -5937,6 +5960,46 @@ mod tests {
                 event_query: None,
                 time_rung: false,
                 script: &[1722],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "an endpoint mapper failure keeps the ids and the rung",
+                event_query: None,
+                time_rung: false,
+                script: &[1753],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "a call that failed and did not execute keeps the ids and the rung",
+                event_query: None,
+                time_rung: false,
+                script: &[1727],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "handle churn keeps the ids and the rung",
+                event_query: None,
+                time_rung: false,
+                script: &[6],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "a service-side cancel keeps the ids and the rung",
+                event_query: None,
+                time_rung: false,
+                script: &[1223],
                 live_with: None,
                 suppress_active: true,
                 rung_kept: true,
@@ -6046,6 +6109,39 @@ mod tests {
             .filter(|(level, code)| level == "WARN" && code == "suppress_query_rejected")
             .count();
         assert_eq!(rejected, 1, "logged once, when the ids were dropped");
+    }
+
+    /// A proactive rebuild whose step-down fails keeps the id-bearing
+    /// subscription live, so the ids still filter the channel: gap detection
+    /// and the status file must keep saying so until a query without them is
+    /// the one being read.
+    #[tokio::test]
+    async fn a_failed_step_down_keeps_the_ids_while_their_subscription_is_live() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = positioned_suppress_subscription(&_seams, None, false).await;
+        {
+            // The ids are refused, then the query without them hits an RPC
+            // failure, which says nothing about the query.
+            let _guard = SubscribeScriptGuard::install(&_seams, &[87, 1722]);
+            subscription.force_proactive_rebuild_all();
+        }
+        let channel = &subscription.channels[0];
+        assert!(channel.is_live(), "the proactive rebuild kept the live one");
+        assert_eq!(channel.active_query_origin, QueryOrigin::Suppressed);
+        assert!(channel.factory.suppress_active());
+        assert!(channel.query_filters(), "the live query still suppresses");
+        assert!(channel.status(None).suppress_active);
+
+        {
+            let _guard = SubscribeScriptGuard::install(&_seams, &[87]);
+            subscription.force_proactive_rebuild_all();
+        }
+        let channel = &subscription.channels[0];
+        assert!(channel.is_live());
+        assert_eq!(channel.active_query_origin, QueryOrigin::Generated);
+        assert!(!channel.factory.suppress_active());
+        assert!(!channel.query_filters(), "the base query filters nothing");
+        assert!(!channel.status(None).suppress_active);
     }
 
     /// 15001 at `EvtNext` on a query carrying ids resubscribes at once without
@@ -7006,6 +7102,118 @@ mod tests {
             "without a composed structured query there is nothing to fall back \
              to; if this is live the fallback is firing on the wrong path"
         );
+    }
+
+    /// With no suppress ids, a composed floor refused by a fault that says
+    /// nothing about the query stays on the ladder: it does not fall back to
+    /// the operator query, which would re-read the channel from the oldest
+    /// record. An RPC failure keeps the rung; a bookmark death moves it
+    /// forward one time window, never back to the oldest record.
+    #[tokio::test]
+    async fn a_composed_floor_is_not_dropped_for_a_fault_that_is_not_the_query() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let _seams = SeamSession::acquire();
+        for (code, rung_kept) in [(1722u32, true), (1168, false)] {
+            let config = WindowsEventLogConfig {
+                event_query: Some("*[System[Level<=4]]".to_string()),
+                ..application_config()
+            };
+            let mut subscription = subscription_from(&config).await;
+            assert_eq!(
+                subscription.pull_events(1).unwrap_or_default().len(),
+                1,
+                "a stored time is the premise"
+            );
+            {
+                let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
+                subscription.force_rebuild_all();
+            }
+            assert!(subscription.first_channel_resumes_by_time(), "premise");
+            assert!(
+                !subscription.channels[0].factory.suppress_active(),
+                "premise"
+            );
+            let rung_before = subscription.channels[0].resume.rung;
+
+            let capture = ErrorCodeCapture::default();
+            let collector = tracing_subscriber::registry().with(capture.clone());
+            tracing::subscriber::with_default(collector, || {
+                let _guard = SubscribeScriptGuard::install(&_seams, &[code]);
+                subscription.force_rebuild_all();
+            });
+
+            let channel = &subscription.channels[0];
+            assert!(
+                channel.subscription_handle.is_none(),
+                "{code}: the operator query must not be subscribed in its place"
+            );
+            assert!(
+                subscription.first_channel_resumes_by_time(),
+                "{code}: still by time"
+            );
+            assert_eq!(
+                channel.resume.rung == rung_before,
+                rung_kept,
+                "{code}: rung {:?} from {rung_before:?}",
+                channel.resume.rung
+            );
+            assert!(
+                !capture
+                    .seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, slug)| slug == "resume_query_rejected"),
+                "{code}: no fallback was attempted"
+            );
+        }
+    }
+
+    /// Suppress ids over a structured operator query are not composed, and the
+    /// operator hears about it once for the channel, not once per build.
+    #[test]
+    fn suppress_ids_over_a_structured_query_warn_once() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let structured = "<QueryList><Query Id=\"0\"><Select>*</Select></Query></QueryList>";
+        let capture = ErrorCodeCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
+        let factory = tracing::subscriber::with_default(collector, || {
+            let factory = SubscriptionFactory::new(
+                "Security".to_string(),
+                structured.to_string(),
+                QueryOrigin::Operator,
+                true,
+                vec![rule("Unit-Suppress-Provider", &[2])],
+            );
+            let resume = ResumeState::new(true);
+            for _ in 0..3 {
+                assert_eq!(
+                    factory.query_for(&resume),
+                    (structured.to_string(), QueryOrigin::Operator)
+                );
+            }
+            // Control: ids over a plain query compose and say nothing.
+            _ = SubscriptionFactory::new(
+                "Security".to_string(),
+                "*".to_string(),
+                QueryOrigin::Generated,
+                true,
+                vec![rule("Unit-Suppress-Provider", &[2])],
+            );
+            factory
+        });
+
+        assert!(!factory.suppress_active());
+        let warned = capture
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, slug)| level == "WARN" && slug == "suppress_not_composable")
+            .count();
+        assert_eq!(warned, 1);
     }
 
     /// A restart with a bookmark that marks no position falls back to the
