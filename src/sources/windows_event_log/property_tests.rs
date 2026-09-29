@@ -666,8 +666,9 @@ fn backoff_is_bounded_monotonic_and_jittered() {
 }
 
 /// Upper bound on a composed suppress query. The service's own limit is
-/// undocumented; this is the bound the worst case is held to, and the
-/// integration tests prove `EvtSubscribe` accepts that worst case.
+/// undocumented; this is the bound the worst case is held to. The lab
+/// integration test subscribes the same id and provider shape on a short
+/// channel name, so `EvtSubscribe` accepting a query this long is not proven.
 const MAX_SUPPRESS_QUERY_CHARS: usize = 3072;
 
 /// Channel names at the longest `validate` accepts, from characters real

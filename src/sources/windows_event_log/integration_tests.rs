@@ -1769,7 +1769,7 @@ mod suppress_lab {
     fn write(event_id: u16, count: u32) {
         let before = record_count();
         // PROVENANCE: the lab manifest's provider GUID (the agent repo's
-        // `xtask/src/wel_lab.rs` `PROVIDER_GUID`); channel 16, level 4 and
+        // `xtask/src/wel_channel.rs` `PROVIDER_GUID`); channel 16, level 4 and
         // keyword 0x8000000000000000 as `wevtutil qe` rendered a `New-WinEvent`
         // record of that manifest on 2026-09-29 (mc.exe numbers a manifest's
         // first channel 16).
@@ -1910,10 +1910,13 @@ mod suppress_lab {
         assert_eq!(status(&subscription).records_read, 3);
     }
 
-    /// The largest query `validate` allows, with the time floor beside it, is
-    /// accepted by `EvtSubscribe` and still suppresses.
+    /// Sixty-four ids over four providers, three of them at the longest name
+    /// allowed, with the time floor beside them, are accepted by `EvtSubscribe`
+    /// on the lab channel and still suppress. With the lab channel's short name
+    /// the query is about 2,080 characters; the channel-name worst case is
+    /// longer and is bounded by the property tests, not subscribed here.
     #[tokio::test]
-    async fn the_worst_case_suppress_query_is_accepted_and_honored() {
+    async fn sixty_four_ids_over_four_providers_are_accepted_and_honored() {
         let _seams = SeamSession::acquire();
         clear();
         write(KEPT_ID, 3);
@@ -1939,7 +1942,7 @@ mod suppress_lab {
             ..Default::default()
         }
         .validate()
-        .expect("the worst case is inside the bounds");
+        .expect("the rules are inside the bounds");
 
         let mut resume = ResumeState::new(true);
         resume.observe_event(chrono::Utc::now() - chrono::Duration::hours(1), 1);
@@ -1974,7 +1977,7 @@ mod suppress_lab {
         }
         .unwrap_or_else(|e| {
             panic!(
-                "EvtSubscribe rejected the {}-char worst case: {e}\n{query}",
+                "EvtSubscribe rejected the {}-char query: {e}\n{query}",
                 query.len()
             )
         });
