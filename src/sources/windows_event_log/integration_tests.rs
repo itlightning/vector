@@ -1721,13 +1721,12 @@ mod suppress_lab {
     const LAB_PROVIDER: &str = "SparkLogs-WelLab";
     const KEPT_ID: u16 = 1;
     const SUPPRESSED_ID: u16 = 2;
-    const GRANT_SCRIPT: &str = "research/scratch/wel-suppress/grant-lab-channel.ps1";
 
     fn missing_lab(detail: &str) -> ! {
         panic!(
             "the lab channel {LAB_CHANNEL} is not usable ({detail}). Register it and grant \
-             this account read, write and clear once, from an elevated PowerShell in the \
-             workspace: {GRANT_SCRIPT}"
+             this account read, write and clear once from an elevated PowerShell (the agent \
+             repo's wel-lab tooling documents the grant)"
         )
     }
 
@@ -1769,7 +1768,7 @@ mod suppress_lab {
     /// a wrong descriptor fails here rather than as a missing event later.
     fn write(event_id: u16, count: u32) {
         let before = record_count();
-        // PROVENANCE: the lab manifest's provider GUID (itl-agent
+        // PROVENANCE: the lab manifest's provider GUID (the agent repo's
         // `xtask/src/wel_lab.rs` `PROVIDER_GUID`); channel 16, level 4 and
         // keyword 0x8000000000000000 as `wevtutil qe` rendered a `New-WinEvent`
         // record of that manifest on 2026-09-29 (mc.exe numbers a manifest's
