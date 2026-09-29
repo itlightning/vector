@@ -1,5 +1,6 @@
 //! Property tests for the pure decision layer: the `(API call, code)`
-//! classifier, the resume ladder, and the backoff schedule.
+//! classifier, the resume ladder, the backoff schedule, and the composed
+//! suppress query.
 //!
 //! # Why properties rather than more cases
 //!
@@ -33,7 +34,12 @@ use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestError, TestRng, TestRunner};
 
+use super::config::{
+    MAX_CHANNEL_NAME_LENGTH, MAX_SUPPRESS_IDS_PER_CHANNEL, MAX_SUPPRESS_PROVIDERS_PER_CHANNEL,
+    SuppressRule, WindowsEventLogConfig,
+};
 use super::recovery::{Backoff, ResumeState, Rung, TimeRung};
+use super::subscription::SubscriptionFactory;
 use super::win32_errors::{
     DrainOutcome, INHERITED_UNDOCUMENTED_16953, QueryOrigin, RenderDisposition, SubscribeOutcome,
     classify_evt_next, classify_render, classify_subscribe,
@@ -161,7 +167,11 @@ fn call_site() -> impl Strategy<Value = CallSite> {
 }
 
 fn query_origin() -> impl Strategy<Value = QueryOrigin> {
-    prop_oneof![Just(QueryOrigin::Operator), Just(QueryOrigin::Generated)]
+    prop_oneof![
+        Just(QueryOrigin::Operator),
+        Just(QueryOrigin::Generated),
+        Just(QueryOrigin::Suppressed),
+    ]
 }
 
 /// Codes biased toward the interesting neighborhoods (EVT 15000s, RPC 1700s,
@@ -206,6 +216,8 @@ const fn reuses_the_same_handle(outcome: DrainOutcome) -> bool {
         // Reopens from the bookmark with a smaller batch.
         DrainOutcome::ReduceBatch => false,
         DrainOutcome::Rebuild => false,
+        // Resubscribes without the ids.
+        DrainOutcome::DropSuppressIds => false,
     }
 }
 
@@ -651,4 +663,210 @@ fn backoff_is_bounded_monotonic_and_jittered() {
             Ok(())
         },
     );
+}
+
+/// Upper bound on a composed suppress query. The service's own limit is
+/// undocumented; this is the bound the worst case is held to, and the
+/// integration tests prove `EvtSubscribe` accepts that worst case.
+const MAX_SUPPRESS_QUERY_CHARS: usize = 3072;
+
+/// Channel names at the longest `validate` accepts, from characters real
+/// channel names use.
+fn max_length_channel() -> impl Strategy<Value = String> {
+    proptest::string::string_regex(&format!("[A-Za-z0-9 ./_-]{{{MAX_CHANNEL_NAME_LENGTH}}}"))
+        .expect("valid regex")
+}
+
+fn suppress_provider() -> impl Strategy<Value = String> {
+    proptest::string::string_regex("[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}").expect("valid regex")
+}
+
+/// Rule sets inside the `validate` bounds: one to four providers distinct
+/// ignoring case, at least one id each and at most 64 in all.
+fn suppress_rules() -> impl Strategy<Value = Vec<SuppressRule>> {
+    (
+        prop::collection::vec(suppress_provider(), 1..=MAX_SUPPRESS_PROVIDERS_PER_CHANNEL),
+        prop::collection::vec(any::<u16>(), MAX_SUPPRESS_IDS_PER_CHANNEL),
+        prop::collection::vec(
+            1usize..=MAX_SUPPRESS_IDS_PER_CHANNEL,
+            MAX_SUPPRESS_PROVIDERS_PER_CHANNEL,
+        ),
+    )
+        .prop_map(|(mut providers, ids, sizes)| {
+            let mut seen = std::collections::HashSet::new();
+            providers.retain(|p| seen.insert(p.to_ascii_lowercase()));
+            let mut ids = ids.into_iter();
+            let mut budget = MAX_SUPPRESS_IDS_PER_CHANNEL;
+            let count = providers.len();
+            providers
+                .into_iter()
+                .enumerate()
+                .map(|(index, provider)| {
+                    let take = sizes[index].min(budget - (count - index - 1)).max(1);
+                    budget -= take;
+                    SuppressRule {
+                        provider,
+                        event_ids: ids.by_ref().take(take).collect(),
+                    }
+                })
+                .collect()
+        })
+}
+
+/// Checks one composed query: well-formed XML, under the length bound, and
+/// each provider's distinct ids exactly once under that provider.
+fn check_suppress_query(query: &str, rules: &[SuppressRule]) -> Result<(), TestCaseError> {
+    use quick_xml::{Reader, events::Event};
+
+    prop_assert!(
+        query.len() < MAX_SUPPRESS_QUERY_CHARS,
+        "{} chars: {query}",
+        query.len()
+    );
+
+    let mut reader = Reader::from_str(query);
+    reader.check_end_names(true);
+    let mut depth = 0usize;
+    let mut in_suppress = false;
+    let mut clauses = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                in_suppress = e.name().as_ref() == b"Suppress";
+            }
+            Ok(Event::End(_)) => {
+                depth -= 1;
+                in_suppress = false;
+            }
+            Ok(Event::Text(text)) if in_suppress => {
+                clauses.push(text.unescape().expect("text unescapes").into_owned());
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => return Err(TestCaseError::fail(format!("malformed XML: {e}: {query}"))),
+        }
+    }
+    prop_assert_eq!(depth, 0, "unbalanced: {}", query);
+
+    let mut found: std::collections::HashMap<String, Vec<u16>> = std::collections::HashMap::new();
+    for clause in clauses {
+        let Some(rest) = clause.strip_prefix("*[System[Provider[@Name='") else {
+            // The time floor.
+            prop_assert!(
+                clause.contains("TimeCreated"),
+                "unexpected clause {}",
+                clause
+            );
+            continue;
+        };
+        let (provider, rest) = rest.split_once("'] and (").expect("provider clause shape");
+        let terms = rest.strip_suffix(")]]").expect("clause closes");
+        let ids = found.entry(provider.to_string()).or_default();
+        for term in terms.split(" or ") {
+            ids.push(
+                term.strip_prefix("EventID=")
+                    .expect("id term")
+                    .parse()
+                    .expect("u16 id"),
+            );
+        }
+    }
+    prop_assert_eq!(found.len(), rules.len());
+    for rule in rules {
+        let mut expected = rule.event_ids.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        let mut actual = found.get(&rule.provider).cloned().unwrap_or_default();
+        actual.sort_unstable();
+        prop_assert_eq!(actual, expected, "ids under {}", rule.provider);
+    }
+    Ok(())
+}
+
+fn floor_resume() -> ResumeState {
+    let mut resume = ResumeState::new(true);
+    resume.observe_event(a_time(), 1);
+    resume.rung = Rung::TimeAdvance(TimeRung::ThirtyMinutes);
+    resume
+}
+
+/// Any rule set `validate` accepts composes into a query the service can
+/// parse and that suppresses exactly what was asked, with the floor beside it
+/// and the channel name at its longest.
+#[test]
+fn suppress_queries_are_well_formed_bounded_and_exact() {
+    check(
+        "suppress_queries_are_well_formed_bounded_and_exact",
+        (max_length_channel(), suppress_rules()),
+        |(channel, rules)| {
+            let config = WindowsEventLogConfig {
+                channels: vec![channel.clone()],
+                suppress_ids: std::collections::BTreeMap::from([(channel.clone(), rules.clone())]),
+                ..Default::default()
+            };
+            prop_assert!(config.validate().is_ok(), "{:?}", config.validate());
+
+            let factory = SubscriptionFactory::new(
+                channel,
+                "*".to_string(),
+                QueryOrigin::Generated,
+                true,
+                rules.clone(),
+            );
+            let (query, origin) = factory.query_for(&floor_resume());
+            prop_assert_eq!(origin, QueryOrigin::Suppressed);
+            check_suppress_query(&query, &rules)
+        },
+    );
+}
+
+/// The worst case by construction, which random generation rarely reaches:
+/// longest channel and provider names, 64 five-digit ids split so the
+/// element count is largest, and the floor.
+#[test]
+fn the_worst_case_suppress_query_stays_under_the_bound() {
+    let channel = "C".repeat(MAX_CHANNEL_NAME_LENGTH);
+    let provider = |tag: char| format!("{tag}{}", "p".repeat(127));
+    let rules = vec![
+        SuppressRule {
+            provider: provider('A'),
+            event_ids: (65_475..=65_535).collect(),
+        },
+        SuppressRule {
+            provider: provider('B'),
+            event_ids: vec![10_000],
+        },
+        SuppressRule {
+            provider: provider('C'),
+            event_ids: vec![10_001],
+        },
+        SuppressRule {
+            provider: provider('D'),
+            event_ids: vec![10_002],
+        },
+    ];
+    let config = WindowsEventLogConfig {
+        channels: vec![channel.clone()],
+        suppress_ids: std::collections::BTreeMap::from([(channel.clone(), rules.clone())]),
+        ..Default::default()
+    };
+    assert!(config.validate().is_ok(), "{:?}", config.validate());
+
+    let factory = SubscriptionFactory::new(
+        channel,
+        "*".to_string(),
+        QueryOrigin::Generated,
+        true,
+        rules.clone(),
+    );
+    let (query, _) = factory.query_for(&floor_resume());
+    assert_eq!(
+        query.matches("<Suppress>").count(),
+        8,
+        "seven id elements and the floor"
+    );
+    if let Err(failure) = check_suppress_query(&query, &rules) {
+        panic!("{failure}");
+    }
 }

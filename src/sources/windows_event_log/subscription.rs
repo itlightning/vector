@@ -10,7 +10,9 @@ use vector_lib::{
     counter, gauge,
     internal_event::{CounterName, GaugeName, error_type},
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_EVT_INVALID_QUERY, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EvtClose, EvtNext, EvtOpenChannelConfig, EvtSubscribe,
     EvtSubscribeStartAfterBookmark, EvtSubscribeStartAtOldestRecord, EvtSubscribeStrict,
@@ -24,7 +26,7 @@ use windows::core::HSTRING;
 use super::{
     bookmark::BookmarkManager,
     checkpoint::{ChannelPosition, Checkpointer},
-    config::WindowsEventLogConfig,
+    config::{SuppressRule, WindowsEventLogConfig},
     error::*,
     metadata,
     recovery::{
@@ -237,7 +239,7 @@ enum RetryPacing {
 /// recovery, and error classification is demoted from load-bearing to an
 /// optimization. A missed error code then costs one extra rebuild instead of a
 /// permanent wedge.
-struct SubscriptionFactory {
+pub(super) struct SubscriptionFactory {
     channel: String,
     /// The query as configured: either the operator's `event_query` or one we
     /// generated from `only_event_ids`.
@@ -248,7 +250,18 @@ struct SubscriptionFactory {
     /// the query.
     base_origin: QueryOrigin,
     read_existing_events: bool,
+    /// This channel's suppress rules, each provider's ids deduplicated.
+    suppress_rules: Vec<SuppressRule>,
+    /// Whether queries carry `suppress_rules`. False with no rules or a
+    /// structured operator query, and latched false for the process once the
+    /// service rejects a query carrying them: the same query would be rejected
+    /// again.
+    suppress_active: bool,
 }
+
+/// Ids per suppress element. The service rejects one element with 23 ids for
+/// one provider, and elements compose freely, so chunks keep a margin under that.
+const SUPPRESS_IDS_PER_ELEMENT: usize = 16;
 
 /// Escape for XML text content.
 ///
@@ -273,6 +286,66 @@ fn escape_xml_attr(raw: &str) -> String {
 }
 
 impl SubscriptionFactory {
+    pub(super) fn new(
+        channel: String,
+        base_query: String,
+        base_origin: QueryOrigin,
+        read_existing_events: bool,
+        mut suppress_rules: Vec<SuppressRule>,
+    ) -> Self {
+        for rule in &mut suppress_rules {
+            let mut seen = std::collections::BTreeSet::new();
+            rule.event_ids.retain(|id| seen.insert(*id));
+        }
+        let structured = base_query.trim_start().starts_with('<');
+        if structured && !suppress_rules.is_empty() {
+            warn!(
+                message = format!(
+                    "Windows Event Log suppress ids cannot be composed onto a structured \
+                     event_query; the channel is read without them (channel={channel})."
+                ),
+                error_code = "suppress_not_composable",
+                error_type = error_type::CONFIGURATION_FAILED,
+                channel = %channel,
+                internal_log_rate_limit = false,
+            );
+        }
+        Self {
+            suppress_active: !structured && !suppress_rules.is_empty(),
+            channel,
+            base_query,
+            base_origin,
+            read_existing_events,
+            suppress_rules,
+        }
+    }
+
+    /// Whether queries built from now on carry the suppress ids.
+    pub(super) const fn suppress_active(&self) -> bool {
+        self.suppress_active
+    }
+
+    /// Stop composing the suppress ids for the rest of the process, logging the
+    /// first time only.
+    fn drop_suppress_ids(&mut self, code: u32) {
+        if !self.suppress_active {
+            return;
+        }
+        self.suppress_active = false;
+        warn!(
+            message = format!(
+                "Windows Event Log rejected the query carrying suppress ids; reading the \
+                 channel without them for the rest of this process (channel={}).",
+                self.channel
+            ),
+            error_code = "suppress_query_rejected",
+            error_type = error_type::REQUEST_FAILED,
+            channel = %self.channel,
+            win32_error = code,
+            internal_log_rate_limit = false,
+        );
+    }
+
     /// The query to subscribe with at this ladder rung, and its origin.
     ///
     /// Two shapes carry the floor, chosen by what the operator configured.
@@ -291,7 +364,21 @@ impl SubscriptionFactory {
     /// Nothing trims the over-delivery that remains. The in-process
     /// `(TimeCreated, RecordId)` boundary that used to do it discarded real
     /// events and was deleted.
-    fn query_for(&self, resume: &ResumeState) -> (String, QueryOrigin) {
+    ///
+    /// With suppress ids active every rung composes a structured query; see
+    /// [`Self::suppress_query`].
+    pub(super) fn query_for(&self, resume: &ResumeState) -> (String, QueryOrigin) {
+        if self.suppress_active {
+            let stamp = match resume.rung {
+                Rung::TimeAdvance(_) => resume.time_floor(),
+                _ => None,
+            }
+            .map(|floor| floor.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
+            return (
+                self.suppress_query(stamp.as_deref()),
+                QueryOrigin::Suppressed,
+            );
+        }
         let Some(floor) = resume.time_floor() else {
             return (self.base_query.clone(), self.base_origin);
         };
@@ -330,20 +417,109 @@ impl SubscriptionFactory {
         )
     }
 
+    /// The structured query carrying the suppress ids: one `Suppress` element
+    /// per provider per [`SUPPRESS_IDS_PER_ELEMENT`] ids, then the time floor
+    /// when there is one.
+    ///
+    /// Only `Query` names the channel: `Select` and `Suppress` inherit it, and
+    /// repeating a 256-character channel name in every element is what would
+    /// push the worst case past the length the property tests hold it to.
+    fn suppress_query(&self, floor: Option<&str>) -> String {
+        use std::fmt::Write as _;
+
+        let mut query = format!(
+            "<QueryList><Query Id=\"0\" Path=\"{}\"><Select>{}</Select>",
+            escape_xml_attr(&self.channel),
+            escape_xml_text(&self.base_query),
+        );
+        for rule in &self.suppress_rules {
+            let provider = escape_xml_text(&rule.provider);
+            for chunk in rule.event_ids.chunks(SUPPRESS_IDS_PER_ELEMENT) {
+                let terms = chunk
+                    .iter()
+                    .map(|id| format!("EventID={id}"))
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                _ = write!(
+                    query,
+                    "<Suppress>*[System[Provider[@Name='{provider}'] and ({terms})]]</Suppress>"
+                );
+            }
+        }
+        if let Some(stamp) = floor {
+            _ = write!(
+                query,
+                "<Suppress>*[System[TimeCreated[@SystemTime&lt;'{stamp}']]]</Suppress>"
+            );
+        }
+        query.push_str("</Query></QueryList>");
+        query
+    }
+
+    /// What to subscribe with after the service rejected `origin`'s query as
+    /// invalid (15001), or `None` when nothing is left to try.
+    ///
+    /// Keyed on 15001 alone. Any other failure says nothing about the query, and
+    /// retrying without the ids on a bookmark death or an RPC blip would drop
+    /// suppression for the generation over a fault that is not ours.
+    ///
+    /// The chain is ids plus floor, then the floor alone, then the base query.
+    /// A composed floor is OURS, so its rejection must not be charged to the
+    /// ladder: every rung would compose the same shape, fail the same way, and
+    /// walk to `FutureOnly`, discarding the backlog over a query we wrote.
+    fn fallback_after(
+        &mut self,
+        origin: QueryOrigin,
+        query: &str,
+        resume: &ResumeState,
+        error: &windows::core::Error,
+    ) -> Option<(String, QueryOrigin)> {
+        let code = win32_code(error);
+        if code != ERROR_EVT_INVALID_QUERY.0 {
+            return None;
+        }
+        if origin == QueryOrigin::Suppressed {
+            self.drop_suppress_ids(code);
+            return Some(self.query_for(resume));
+        }
+        if origin == QueryOrigin::Generated && query.trim_start().starts_with('<') {
+            warn!(
+                message = format!(
+                    "Composed Windows Event Log resume query was rejected; \
+                     falling back to the operator query and reading from \
+                     the oldest record (channel={}).",
+                    self.channel
+                ),
+                // Structured key so consumers never have to match this
+                // sentence. Message text is prose for humans and will
+                // keep being improved; this is the stable handle.
+                // `error_code` carries our slug and `error_type` stays
+                // Vector's fixed taxonomy, as the component spec
+                // requires; the same split as the internal events.
+                error_code = "resume_query_rejected",
+                error_type = error_type::REQUEST_FAILED,
+                channel = %self.channel,
+                win32_error = error.code().0,
+                error = %error,
+            );
+            return Some((self.base_query.clone(), self.base_origin));
+        }
+        None
+    }
+
     /// Create a subscription handle. Never closes anything: the caller swaps
     /// the new handle in and only then closes the old one, so a failed
     /// `EvtSubscribe` cannot strand a channel with nothing (Fluent Bit's
     /// ordering).
     fn build(
-        &self,
+        &mut self,
         signal_event: HANDLE,
         bookmark: &BookmarkManager,
         bookmark_positioned: bool,
         resume: &ResumeState,
     ) -> Result<(EVT_HANDLE, QueryOrigin), (windows::core::Error, QueryOrigin)> {
-        let (query, origin) = self.query_for(resume);
+        let (mut query, mut origin) = self.query_for(resume);
         let channel_hstring = HSTRING::from(self.channel.as_str());
-        let query_hstring = HSTRING::from(query.as_str());
 
         // A freshly created bookmark has a valid, non-null handle but marks no
         // position. Subscribing StartAfterBookmark|Strict against it fails with
@@ -377,67 +553,28 @@ impl SubscriptionFactory {
             log.push(flags);
         }
 
-        let result = self.subscribe_with(
-            &channel_hstring,
-            &query_hstring,
-            signal_event,
-            bookmark_handle,
-            use_bookmark,
-            flags,
-        );
-
-        match result {
-            Ok(handle) => Ok((handle, origin)),
-            Err(e) => {
-                // Composition safety valve. A composed structured query is
-                // OURS, so a rejection must not be charged to the ladder: every
-                // rung would compose the same shape, fail the same way, and
-                // walk to `FutureOnly`, discarding the backlog over a query we
-                // wrote. Retry once with the operator's query alone, which is
-                // the behavior from before composition existed (a full
-                // re-read), and let the ladder judge that instead.
-                if origin == QueryOrigin::Generated && query.trim_start().starts_with('<') {
-                    warn!(
-                        message = format!(
-                            "Composed Windows Event Log resume query was rejected; \
-                             falling back to the operator query and reading from \
-                             the oldest record (channel={}).",
-                            self.channel
-                        ),
-                        // Structured key so consumers never have to match this
-                        // sentence. Message text is prose for humans and will
-                        // keep being improved; this is the stable handle.
-                        // `error_code` carries our slug and `error_type` stays
-                        // Vector's fixed taxonomy, as the component spec
-                        // requires; the same split as the internal events.
-                        error_code = "resume_query_rejected",
-                        error_type = error_type::REQUEST_FAILED,
-                        channel = %self.channel,
-                        win32_error = e.code().0,
-                        error = %e,
-                    );
-                    let plain = HSTRING::from(self.base_query.as_str());
-                    return match self.subscribe_with(
-                        &channel_hstring,
-                        &plain,
-                        signal_event,
-                        bookmark_handle,
-                        use_bookmark,
-                        flags,
-                    ) {
-                        Ok(handle) => Ok((handle, self.base_origin)),
-                        Err(e) => Err((e, self.base_origin)),
-                    };
-                }
-                Err((e, origin))
+        loop {
+            match self.subscribe_with(
+                &channel_hstring,
+                &HSTRING::from(query.as_str()),
+                signal_event,
+                bookmark_handle,
+                use_bookmark,
+                flags,
+            ) {
+                Ok(handle) => return Ok((handle, origin)),
+                Err(e) => match self.fallback_after(origin, &query, resume, &e) {
+                    Some((next, next_origin)) => (query, origin) = (next, next_origin),
+                    None => return Err((e, origin)),
+                },
             }
         }
     }
 
     /// One `EvtSubscribe` attempt.
     ///
-    /// Split out so the composed-query fallback can make a second attempt with a
-    /// different query without duplicating the fault-injection seam.
+    /// Split out so the rejected-query chain can retry with a different query
+    /// without duplicating the fault-injection seam.
     fn subscribe_with(
         &self,
         channel: &HSTRING,
@@ -553,9 +690,12 @@ struct ChannelSubscription {
     /// Reported alongside, because how long a channel has been down and what
     /// is wrong with it are two different questions.
     last_error: Option<u32>,
-    /// The active query filters events, so record ids skip by construction and
-    /// gap detection cannot mean anything on this channel.
-    query_filters: bool,
+    /// The configured query filters events. See [`Self::query_filters`].
+    base_query_filters: bool,
+    /// Records `EvtNext` handed back on this channel since the process
+    /// started, counted where `events_read_counter` is. Suppressed records are
+    /// never handed back, so they are not in it.
+    records_read: u64,
     /// Times a name was absent from the publisher table and the per-event
     /// fallback ran. Internal diagnostics, copied onto the status file.
     name_table_misses: u64,
@@ -610,6 +750,13 @@ unsafe impl Send for ChannelSubscription {}
 unsafe impl Sync for ChannelSubscription {}
 
 impl ChannelSubscription {
+    /// Whether the active query filters events, so record ids skip by
+    /// construction and gap detection cannot mean anything on this channel:
+    /// the configured query filters, or the suppress ids are in force.
+    const fn query_filters(&self) -> bool {
+        self.base_query_filters || self.factory.suppress_active()
+    }
+
     /// Whether this channel is currently readable.
     const fn is_live(&self) -> bool {
         self.subscription_handle.is_some() && self.skipped_this_generation.is_none()
@@ -1092,7 +1239,9 @@ impl ChannelSubscription {
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             last_record_id: self.resume.last_record_id,
             newest_record_id: newest_record_estimate(stats, self.resume.last_record_id),
-            query_filters: self.query_filters,
+            query_filters: self.query_filters(),
+            suppress_active: self.factory.suppress_active(),
+            records_read: self.records_read,
             bookmark_positioned: self.bookmark_positioned,
             unavailable_since: self
                 .unavailable_since
@@ -1112,7 +1261,7 @@ impl ChannelSubscription {
     /// Gap-detection applicability for this channel.
     const fn gap_detection(&self) -> GapDetection {
         GapDetection {
-            query_filters: self.query_filters,
+            query_filters: self.query_filters(),
             rendered_delivery: self.rendered_delivery_seen,
         }
     }
@@ -1237,7 +1386,7 @@ impl EventLogSubscription {
         };
         // A filtering query skips record ids by construction, so gap detection
         // has nothing to say on it.
-        let query_filters = base_query != "*";
+        let base_query_filters = base_query != "*";
 
         for channel in &config.channels {
             // Initialize bookmark and resume position from the checkpoint.
@@ -1312,12 +1461,17 @@ impl EventLogSubscription {
                 })?
             };
 
-            let factory = SubscriptionFactory {
-                channel: channel.clone(),
-                base_query: base_query.clone(),
+            let factory = SubscriptionFactory::new(
+                channel.clone(),
+                base_query.clone(),
                 base_origin,
-                read_existing_events: config.read_existing_events,
-            };
+                config.read_existing_events,
+                config
+                    .suppress_ids
+                    .get(channel)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
 
             debug!(
                 message = "Creating pull-mode subscription.",
@@ -1363,7 +1517,8 @@ impl EventLogSubscription {
                 last_budget_poll_at: None,
                 unavailable_since: None,
                 last_error: None,
-                query_filters,
+                base_query_filters,
+                records_read: 0,
                 name_table_misses: 0,
                 gaps: std::collections::VecDeque::new(),
                 #[cfg(test)]
@@ -1781,6 +1936,16 @@ impl EventLogSubscription {
                             channel_drained = true;
                             break;
                         }
+                        DrainOutcome::DropSuppressIds => {
+                            // Not a poison position, so the ladder stays put;
+                            // the rebuild without the ids is the whole fix.
+                            channel_sub.factory.drop_suppress_ids(code);
+                            channel_sub.close_current();
+                            channel_sub.subscription_active_gauge.set(0.0);
+                            channel_sub.rebuild("suppress_query_rejected", RebuildKind::FromDead);
+                            channel_drained = true;
+                            break;
+                        }
                         DrainOutcome::Rebuild => {
                             // Discard, tear down, resubscribe from the last
                             // persisted checkpoint. Unknown codes land here on
@@ -1846,6 +2011,7 @@ impl EventLogSubscription {
                 }
 
                 channel_sub.events_read_counter.increment(returned as u64);
+                channel_sub.records_read += u64::from(returned);
                 channel_sub
                     .last_event_timestamp_gauge
                     .set(chrono::Utc::now().timestamp() as f64);
@@ -5171,12 +5337,13 @@ mod tests {
         use chrono::TimeZone;
 
         fn factory(base: &str) -> SubscriptionFactory {
-            SubscriptionFactory {
-                channel: "Application".to_string(),
-                base_query: base.to_string(),
-                base_origin: QueryOrigin::Operator,
-                read_existing_events: true,
-            }
+            SubscriptionFactory::new(
+                "Application".to_string(),
+                base.to_string(),
+                QueryOrigin::Operator,
+                true,
+                Vec::new(),
+            )
         }
 
         const OPERATOR_QUERY: &str = "*[System[EventID=4624]]";
@@ -5245,12 +5412,13 @@ mod tests {
         resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
 
         let quoted = "*[System[Provider[@Name='Microsoft-Windows-Security-Auditing']]]";
-        let factory = SubscriptionFactory {
-            channel: "Application".to_string(),
-            base_query: quoted.to_string(),
-            base_origin: QueryOrigin::Operator,
-            read_existing_events: true,
-        };
+        let factory = SubscriptionFactory::new(
+            "Application".to_string(),
+            quoted.to_string(),
+            QueryOrigin::Operator,
+            true,
+            Vec::new(),
+        );
         let (composed, _) = factory.query_for(&resume);
         assert!(
             composed.contains(quoted),
@@ -5260,12 +5428,13 @@ mod tests {
         // Markup characters, by contrast, MUST be escaped or the document is
         // malformed. `Level<=3` is an ordinary thing to configure.
         let markup = "*[System[Level<=3]]";
-        let factory = SubscriptionFactory {
-            channel: "Application".to_string(),
-            base_query: markup.to_string(),
-            base_origin: QueryOrigin::Operator,
-            read_existing_events: true,
-        };
+        let factory = SubscriptionFactory::new(
+            "Application".to_string(),
+            markup.to_string(),
+            QueryOrigin::Operator,
+            true,
+            Vec::new(),
+        );
         let (composed, _) = factory.query_for(&resume);
         assert!(
             composed.contains("*[System[Level&lt;=3]]"),
@@ -5287,12 +5456,13 @@ mod tests {
         resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
 
         let structured = "<QueryList><Query Id=\"0\"><Select>*</Select></Query></QueryList>";
-        let factory = SubscriptionFactory {
-            channel: "Application".to_string(),
-            base_query: structured.to_string(),
-            base_origin: QueryOrigin::Operator,
-            read_existing_events: true,
-        };
+        let factory = SubscriptionFactory::new(
+            "Application".to_string(),
+            structured.to_string(),
+            QueryOrigin::Operator,
+            true,
+            Vec::new(),
+        );
         assert_eq!(
             factory.query_for(&resume),
             (structured.to_string(), QueryOrigin::Operator),
@@ -5316,12 +5486,13 @@ mod tests {
         resume.observe_event(chrono::Utc::now() - chrono::Duration::hours(1), 1);
         resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
 
-        let factory = SubscriptionFactory {
-            channel: "Application".to_string(),
-            base_query: "*[System[Level=4]]".to_string(),
-            base_origin: QueryOrigin::Operator,
-            read_existing_events: true,
-        };
+        let mut factory = SubscriptionFactory::new(
+            "Application".to_string(),
+            "*[System[Level=4]]".to_string(),
+            QueryOrigin::Operator,
+            true,
+            Vec::new(),
+        );
 
         let (composed, _) = factory.query_for(&resume);
         assert!(composed.starts_with("<QueryList>"), "precondition");
@@ -5357,12 +5528,13 @@ mod tests {
         fn drain(query: &str) -> usize {
             let signal = unsafe { CreateEventW(None, true, false, None) }.expect("event handle");
             let bookmark = BookmarkManager::new("Application").expect("bookmark");
-            let factory = SubscriptionFactory {
-                channel: "Application".to_string(),
-                base_query: query.to_string(),
-                base_origin: QueryOrigin::Operator,
-                read_existing_events: true,
-            };
+            let mut factory = SubscriptionFactory::new(
+                "Application".to_string(),
+                query.to_string(),
+                QueryOrigin::Operator,
+                true,
+                Vec::new(),
+            );
             let resume = ResumeState::new(true);
             let (handle, _) = factory
                 .build(signal, &bookmark, false, &resume)
@@ -5404,6 +5576,478 @@ mod tests {
              event; {unfiltered} came back unfiltered but {suppressed} survived \
              the floor, so Suppress is being ignored and the composed floor \
              does not work"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Suppress ids.
+    // ---------------------------------------------------------------------
+
+    fn rule(provider: &str, event_ids: &[u16]) -> SuppressRule {
+        SuppressRule {
+            provider: provider.to_string(),
+            event_ids: event_ids.to_vec(),
+        }
+    }
+
+    fn suppress_factory(
+        channel: &str,
+        base: &str,
+        rules: Vec<SuppressRule>,
+    ) -> SubscriptionFactory {
+        SubscriptionFactory::new(
+            channel.to_string(),
+            base.to_string(),
+            QueryOrigin::Generated,
+            true,
+            rules,
+        )
+    }
+
+    fn time_rung_resume() -> ResumeState {
+        use chrono::TimeZone;
+
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(
+            chrono::Utc.with_ymd_and_hms(2026, 8, 7, 12, 0, 0).unwrap(),
+            42,
+        );
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+        resume
+    }
+
+    /// The composed query, row by row. Without rules nothing changes by a byte;
+    /// with rules every rung composes a structured query that names the
+    /// channel once and suppresses each provider's ids in chunks of 16.
+    #[test]
+    fn suppress_composition_table() {
+        const OPEN: &str = "<QueryList><Query Id=\"0\" Path=\"Security\"><Select>*</Select>";
+        const CLOSE: &str = "</Query></QueryList>";
+        const FLOOR: &str = "<Suppress>*[System[TimeCreated[@SystemTime&lt;'2026-08-07T12:00:00.000Z']]]</Suppress>";
+        let auditing = "Microsoft-Windows-Security-Auditing";
+        let bookmark = ResumeState::new(true);
+        let time = time_rung_resume();
+        let seventeen: Vec<u16> = (1..=17).collect();
+        let first_sixteen = (1..=16)
+            .map(|id| format!("EventID={id}"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+
+        let rows: Vec<(&str, SubscriptionFactory, &ResumeState, String, QueryOrigin)> = vec![
+            (
+                "no rules, bookmark rung: the base query, unchanged",
+                suppress_factory("Security", "*", Vec::new()),
+                &bookmark,
+                "*".to_string(),
+                QueryOrigin::Generated,
+            ),
+            (
+                "no rules, time rung: today's floor predicate, unchanged",
+                suppress_factory("Security", "*", Vec::new()),
+                &time,
+                "*[System[TimeCreated[@SystemTime>='2026-08-07T12:00:00.000Z']]]".to_string(),
+                QueryOrigin::Generated,
+            ),
+            (
+                "one provider, two ids",
+                suppress_factory("Security", "*", vec![rule(auditing, &[4658, 4690])]),
+                &bookmark,
+                format!(
+                    "{OPEN}<Suppress>*[System[Provider[@Name='{auditing}'] and \
+                     (EventID=4658 or EventID=4690)]]</Suppress>{CLOSE}"
+                ),
+                QueryOrigin::Suppressed,
+            ),
+            (
+                "two providers, one element each, in configured order",
+                suppress_factory(
+                    "Security",
+                    "*",
+                    vec![
+                        rule(auditing, &[4658]),
+                        rule("Microsoft-Windows-Eventlog", &[1100]),
+                    ],
+                ),
+                &bookmark,
+                format!(
+                    "{OPEN}<Suppress>*[System[Provider[@Name='{auditing}'] and (EventID=4658)]]</Suppress>\
+                     <Suppress>*[System[Provider[@Name='Microsoft-Windows-Eventlog'] and (EventID=1100)]]</Suppress>{CLOSE}"
+                ),
+                QueryOrigin::Suppressed,
+            ),
+            (
+                "seventeen ids chunk into sixteen and one",
+                suppress_factory("Security", "*", vec![rule(auditing, &seventeen)]),
+                &bookmark,
+                format!(
+                    "{OPEN}<Suppress>*[System[Provider[@Name='{auditing}'] and ({first_sixteen})]]</Suppress>\
+                     <Suppress>*[System[Provider[@Name='{auditing}'] and (EventID=17)]]</Suppress>{CLOSE}"
+                ),
+                QueryOrigin::Suppressed,
+            ),
+            (
+                "time rung: the floor rides after the ids",
+                suppress_factory("Security", "*", vec![rule(auditing, &[4658])]),
+                &time,
+                format!(
+                    "{OPEN}<Suppress>*[System[Provider[@Name='{auditing}'] and (EventID=4658)]]</Suppress>\
+                     {FLOOR}{CLOSE}"
+                ),
+                QueryOrigin::Suppressed,
+            ),
+            (
+                "a repeated id is composed once",
+                suppress_factory("Security", "*", vec![rule(auditing, &[4658, 4658, 4690])]),
+                &bookmark,
+                format!(
+                    "{OPEN}<Suppress>*[System[Provider[@Name='{auditing}'] and \
+                     (EventID=4658 or EventID=4690)]]</Suppress>{CLOSE}"
+                ),
+                QueryOrigin::Suppressed,
+            ),
+            (
+                "an XPath base rides as the Select body, escaped",
+                suppress_factory(
+                    "Security",
+                    "*[System[Level<=3]]",
+                    vec![rule(auditing, &[4658])],
+                ),
+                &bookmark,
+                format!(
+                    "<QueryList><Query Id=\"0\" Path=\"Security\"><Select>*[System[Level&lt;=3]]</Select>\
+                     <Suppress>*[System[Provider[@Name='{auditing}'] and (EventID=4658)]]</Suppress>{CLOSE}"
+                ),
+                QueryOrigin::Suppressed,
+            ),
+            (
+                "markup in the channel and provider is escaped",
+                suppress_factory("Lab&\"Ops\"", "*", vec![rule("P&Q<R>", &[1])]),
+                &bookmark,
+                format!(
+                    "<QueryList><Query Id=\"0\" Path=\"Lab&amp;&quot;Ops&quot;\"><Select>*</Select>\
+                     <Suppress>*[System[Provider[@Name='P&amp;Q&lt;R&gt;'] and (EventID=1)]]</Suppress>{CLOSE}"
+                ),
+                QueryOrigin::Suppressed,
+            ),
+            (
+                "a structured operator query is passed through without ids",
+                SubscriptionFactory::new(
+                    "Security".to_string(),
+                    "<QueryList><Query Id=\"0\"><Select>*</Select></Query></QueryList>".to_string(),
+                    QueryOrigin::Operator,
+                    true,
+                    vec![rule(auditing, &[4658])],
+                ),
+                &bookmark,
+                "<QueryList><Query Id=\"0\"><Select>*</Select></Query></QueryList>".to_string(),
+                QueryOrigin::Operator,
+            ),
+        ];
+
+        for (name, factory, resume, query, origin) in rows {
+            assert_eq!(factory.query_for(resume), (query, origin), "{name}");
+        }
+    }
+
+    /// Rules are per channel: a channel without an entry subscribes exactly as
+    /// it did before suppress ids existed, beside one that has them.
+    #[tokio::test]
+    async fn rules_for_another_channel_are_ignored() {
+        let _seams = SeamSession::acquire();
+        let mut config = application_config();
+        config.channels = vec!["Application".to_string(), "System".to_string()];
+        config.suppress_ids.insert(
+            "System".to_string(),
+            vec![rule("Unit-Suppress-Provider", &[2])],
+        );
+        let subscription = subscription_from(&config).await;
+
+        let application = &subscription.channels[0];
+        assert!(!application.factory.suppress_active());
+        assert_eq!(
+            application.factory.query_for(&ResumeState::new(true)),
+            ("*".to_string(), QueryOrigin::Generated)
+        );
+        assert!(!application.query_filters());
+
+        let system = &subscription.channels[1];
+        assert!(system.factory.suppress_active());
+        assert!(system.query_filters(), "suppression filters the channel");
+        assert_eq!(system.active_query_origin, QueryOrigin::Suppressed);
+    }
+
+    fn suppress_config(event_query: Option<&str>) -> WindowsEventLogConfig {
+        let mut config = application_config();
+        config.event_query = event_query.map(str::to_string);
+        config.suppress_ids.insert(
+            "Application".to_string(),
+            vec![rule("Unit-Suppress-Provider", &[2])],
+        );
+        config
+    }
+
+    /// A live, positioned subscription with suppress ids, on the bookmark rung
+    /// or moved to the first time rung by a bookmark death.
+    async fn positioned_suppress_subscription(
+        seams: &SeamSession,
+        event_query: Option<&str>,
+        time_rung: bool,
+    ) -> EventLogSubscription {
+        let mut subscription = subscription_from(&suppress_config(event_query)).await;
+        assert_eq!(
+            subscription.pull_events(1).unwrap_or_default().len(),
+            1,
+            "a stored position is the premise"
+        );
+        if time_rung {
+            let _guard = SubscribeScriptGuard::install(seams, &[15011]);
+            subscription.force_rebuild_all();
+            assert!(subscription.first_channel_resumes_by_time(), "premise");
+        }
+        assert!(
+            subscription.channels[0].factory.suppress_active(),
+            "premise"
+        );
+        subscription
+    }
+
+    /// The rejection chain: 15001 steps down ids plus floor, then the floor
+    /// alone, then the base query, without moving the rung. Any other code
+    /// leaves the ids in place and goes to the ordinary classification, so a
+    /// bookmark death or an RPC blip never costs the suppression.
+    #[tokio::test]
+    async fn the_suppress_rejection_chain_steps_down_on_15001_only() {
+        const OPERATOR: Option<&str> = Some("*[System[Level<=4]]");
+        let _seams = SeamSession::acquire();
+
+        struct Row {
+            name: &'static str,
+            event_query: Option<&'static str>,
+            time_rung: bool,
+            script: &'static [u32],
+            live_with: Option<QueryOrigin>,
+            suppress_active: bool,
+            rung_kept: bool,
+            skipped: Option<SkipReason>,
+        }
+
+        let rows = [
+            Row {
+                name: "ids rejected, the base query is accepted",
+                event_query: None,
+                time_rung: false,
+                script: &[15001],
+                live_with: Some(QueryOrigin::Generated),
+                suppress_active: false,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "ids rejected over an operator query, the operator query is accepted",
+                event_query: OPERATOR,
+                time_rung: false,
+                script: &[15001],
+                live_with: Some(QueryOrigin::Operator),
+                suppress_active: false,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "ids and the operator query rejected: the operator query is at fault",
+                event_query: OPERATOR,
+                time_rung: false,
+                script: &[15001, 15001],
+                live_with: None,
+                suppress_active: false,
+                rung_kept: true,
+                skipped: Some(SkipReason::OperatorQueryInvalid),
+            },
+            Row {
+                name: "time rung: ids and floor rejected, the floor predicate is accepted",
+                event_query: None,
+                time_rung: true,
+                script: &[15001],
+                live_with: Some(QueryOrigin::Generated),
+                suppress_active: false,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "time rung: ids and floor rejected, the composed floor is accepted",
+                event_query: OPERATOR,
+                time_rung: true,
+                script: &[15001],
+                live_with: Some(QueryOrigin::Generated),
+                suppress_active: false,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "time rung: the composed floor rejected too, the operator query is accepted",
+                event_query: OPERATOR,
+                time_rung: true,
+                script: &[15001, 15001],
+                live_with: Some(QueryOrigin::Operator),
+                suppress_active: false,
+                rung_kept: true,
+                skipped: None,
+            },
+            Row {
+                name: "time rung: every step rejected, the operator query is at fault",
+                event_query: OPERATOR,
+                time_rung: true,
+                script: &[15001, 15001, 15001],
+                live_with: None,
+                suppress_active: false,
+                rung_kept: true,
+                skipped: Some(SkipReason::OperatorQueryInvalid),
+            },
+            Row {
+                name: "time rung: our own floor predicate rejected advances the ladder as before",
+                event_query: None,
+                time_rung: true,
+                script: &[15001, 15001],
+                live_with: None,
+                suppress_active: false,
+                rung_kept: false,
+                skipped: None,
+            },
+            Row {
+                name: "bookmark death keeps the ids",
+                event_query: None,
+                time_rung: false,
+                script: &[1168],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: false,
+                skipped: None,
+            },
+            Row {
+                name: "stale query result keeps the ids",
+                event_query: None,
+                time_rung: false,
+                script: &[15011],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: false,
+                skipped: None,
+            },
+            Row {
+                name: "an RPC failure keeps the ids and the rung",
+                event_query: None,
+                time_rung: false,
+                script: &[1722],
+                live_with: None,
+                suppress_active: true,
+                rung_kept: true,
+                skipped: None,
+            },
+        ];
+
+        for row in rows {
+            let mut subscription =
+                positioned_suppress_subscription(&_seams, row.event_query, row.time_rung).await;
+            let rung_before = subscription.channels[0].resume.rung;
+            {
+                let _guard = SubscribeScriptGuard::install(&_seams, row.script);
+                subscription.force_rebuild_all();
+            }
+            let channel = &subscription.channels[0];
+            let name = row.name;
+            assert_eq!(
+                channel
+                    .subscription_handle
+                    .is_some()
+                    .then_some(channel.active_query_origin),
+                row.live_with,
+                "{name}: live, and with which query"
+            );
+            assert_eq!(
+                channel.factory.suppress_active(),
+                row.suppress_active,
+                "{name}: ids"
+            );
+            assert_eq!(
+                channel.resume.rung == rung_before,
+                row.rung_kept,
+                "{name}: rung {:?} from {rung_before:?}",
+                channel.resume.rung
+            );
+            assert_eq!(channel.skipped_this_generation, row.skipped, "{name}: skip");
+            assert_eq!(
+                channel.status(None).suppress_active,
+                row.suppress_active,
+                "{name}: the status file says what the query does"
+            );
+        }
+    }
+
+    /// The ids are dropped for the rest of the process, and the operator hears
+    /// about it once.
+    #[tokio::test]
+    async fn a_rejected_suppress_query_latches_off_and_logs_once() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let _seams = SeamSession::acquire();
+        let mut subscription = positioned_suppress_subscription(&_seams, None, false).await;
+
+        let capture = ErrorCodeCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(collector, || {
+            {
+                let _guard = SubscribeScriptGuard::install(&_seams, &[15001]);
+                subscription.force_rebuild_all();
+            }
+            // Every later build composes without the ids, and a second
+            // rejection report has nothing left to drop.
+            subscription.force_rebuild_all();
+            subscription.channels[0].factory.drop_suppress_ids(15001);
+        });
+
+        let channel = &subscription.channels[0];
+        assert!(channel.is_live());
+        assert!(!channel.factory.suppress_active());
+        assert_eq!(channel.active_query_origin, QueryOrigin::Generated);
+        let rejected = capture
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, code)| level == "WARN" && code == "suppress_query_rejected")
+            .count();
+        assert_eq!(rejected, 1, "logged once, when the ids were dropped");
+    }
+
+    /// 15001 at `EvtNext` on a query carrying ids resubscribes at once without
+    /// them, on the same rung. Without ids the same code is a ladder rebuild
+    /// that waits out its backoff.
+    #[tokio::test]
+    async fn an_invalid_query_at_evt_next_drops_the_ids_and_keeps_the_rung() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = positioned_suppress_subscription(&_seams, None, true).await;
+        let rung_before = subscription.channels[0].resume.rung;
+        {
+            let _guard = ScriptGuard::install(&_seams, &[(15001, 0)]);
+            _ = subscription.pull_events(10);
+        }
+        let channel = &subscription.channels[0];
+        assert!(!channel.factory.suppress_active());
+        assert!(
+            channel.is_live(),
+            "resubscribed at once, not after a backoff"
+        );
+        assert_eq!(channel.resume.rung, rung_before, "the ladder did not move");
+        assert_eq!(channel.active_query_origin, QueryOrigin::Generated);
+
+        // Control: the same code on a query without ids is a ladder rebuild.
+        let mut plain = subscription_from(&application_config()).await;
+        {
+            let _guard = ScriptGuard::install(&_seams, &[(15001, 0)]);
+            _ = plain.pull_events(10);
+        }
+        assert!(
+            !plain.first_channel_is_live(),
+            "rebuilt through the backoff"
         );
     }
 

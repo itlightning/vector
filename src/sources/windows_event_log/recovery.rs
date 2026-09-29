@@ -528,7 +528,8 @@ pub(super) enum GapVerdict {
 /// Reasons gap detection is off for a channel.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GapDetection {
-    /// Operator-supplied filtering queries skip record ids by construction.
+    /// A filtering query, configured or carrying suppress ids, skips record
+    /// ids by construction.
     pub(super) query_filters: bool,
     /// Forwarded channels interleave record ids from many originating machines
     /// and are not monotonic at all. Driven by the same per-event
