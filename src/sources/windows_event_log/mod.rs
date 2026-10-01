@@ -510,13 +510,11 @@ impl WindowsEventLogSource {
             // durably recorded.
             apply_ready_acks(&mut ack_stream, &checkpointer).await;
 
-            // The status file runs on its own cadence and refreshes channel
-            // metadata itself. It deliberately does not reuse what the pull
-            // loop maintains: that refresh is skipped for channels that
-            // returned no events, and a quiet channel is exactly the case a
-            // reader has to tell apart from a wedged one. Both the metadata
-            // queries and the file write are blocking, so they ride the same
-            // blocking thread as the subscription.
+            // The status file runs on its own cadence and reads each channel's
+            // newest record itself, so a quiet channel, which the pull loop
+            // never touches, still reports one. Both the reads and the file
+            // write are blocking, so they ride the same blocking thread as the
+            // subscription.
             if status_writer.is_due(std::time::Instant::now()) {
                 let mut writer = status_writer;
                 let (returned_sub, returned_writer) =

@@ -100,20 +100,25 @@ pub(super) struct ChannelStatus {
     /// "no more items" even if it also returned events: both say the queue was
     /// empty at that instant. Never earned by a full batch or a budget stop.
     ///
-    /// Exact, unlike [`Self::newest_record_id`], and it is the fact a reader
-    /// should decide on: a queue the service reports empty IS caught up, with
-    /// no arithmetic and no approximation. It has to be stamped here because the
-    /// source reads far more often than anything polling this file, so a busy
-    /// channel can reach the head many times between two samples and be caught
-    /// mid-batch by both of them.
+    /// The fact a reader should decide on: a queue the service reports empty
+    /// IS caught up, with no arithmetic, filtered or not. It has to be stamped
+    /// here because the source reads far more often than anything polling this
+    /// file, so a busy channel can reach the head many times between two
+    /// samples and be caught mid-batch by both of them.
     pub(super) last_drained_at: Option<String>,
     /// `EventRecordID` of the most recent event delivered from this channel.
     pub(super) last_record_id: Option<u64>,
-    /// Estimated newest record id present in the channel. Reported for a human
-    /// reading the file; it decides nothing, because it undershoots on a
-    /// channel whose record ids have holes and so is biased toward calling a
-    /// behind channel caught up. See [`newest_record_estimate`] for what makes
-    /// it an estimate and when it is withheld entirely.
+    /// `EventRecordID` of the newest record in the channel, read off that
+    /// record at write time. Reported, not decided on.
+    ///
+    /// `null` when the channel is empty or the read failed. Never derived from
+    /// the oldest record number and the count: that undershoots whenever the id
+    /// range has holes, and after a clear restarts the oldest number.
+    ///
+    /// Not stale against [`Self::last_record_id`]: the write and the reads run
+    /// in turn on one thread, so every delivered record was in the channel when
+    /// this was read. A value below it means the channel's ids went backward
+    /// under the source, and is reported as read.
     pub(super) newest_record_id: Option<u64>,
     /// Whether the active query selects a subset of events: the configured
     /// query filters, or [`Self::suppress_active`] is true.
@@ -216,48 +221,6 @@ impl StatusSnapshot {
             channels: BTreeMap::new(),
         }
     }
-}
-
-/// Record counts read straight from the channel, not from anything the source
-/// has been keeping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ChannelRecordStats {
-    pub(super) count: u64,
-    pub(super) oldest: u64,
-}
-
-/// Estimate the newest record id in a channel from its oldest record id and its
-/// record count.
-///
-/// The estimate is approximate by construction: record ids are monotonic per
-/// channel but are not guaranteed contiguous, so a channel that lost records to
-/// anything other than retention reports a newest id above this value.
-///
-/// It is withheld rather than corrected in two cases. An empty channel has no
-/// newest record. And an estimate that lands below a record this source has
-/// already delivered is not credible, so it is dropped: clamping it up to the
-/// delivered id would report the channel as caught up, which is the single
-/// wrong answer a reader cannot recover from. Absent is honest; zero lag is not.
-pub(super) const fn newest_record_estimate(
-    stats: Option<ChannelRecordStats>,
-    last_record_id: Option<u64>,
-) -> Option<u64> {
-    let Some(stats) = stats else {
-        return None;
-    };
-    if stats.count == 0 {
-        return None;
-    }
-    let newest = match stats.oldest.checked_add(stats.count) {
-        Some(sum) => sum - 1,
-        None => return None,
-    };
-    if let Some(delivered) = last_record_id
-        && newest < delivered
-    {
-        return None;
-    }
-    Some(newest)
 }
 
 /// Whether landing on this ladder step loses data, and whether the loss is
@@ -444,40 +407,6 @@ mod tests {
 
     fn ts(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(secs, 0).unwrap()
-    }
-
-    fn stats(count: u64, oldest: u64) -> Option<ChannelRecordStats> {
-        Some(ChannelRecordStats { count, oldest })
-    }
-
-    /// The estimate itself: a channel holding `count` records starting at
-    /// `oldest` has its newest record at `oldest + count - 1`.
-    #[test]
-    fn newest_record_is_oldest_plus_count_minus_one() {
-        assert_eq!(newest_record_estimate(stats(100, 1), None), Some(100));
-        assert_eq!(newest_record_estimate(stats(50, 951), None), Some(1_000));
-        // A channel holding exactly one record: newest is that record.
-        assert_eq!(newest_record_estimate(stats(1, 42), None), Some(42));
-    }
-
-    /// The one wrong answer that matters. An estimate below a record already
-    /// delivered would compute as zero or negative lag, and a reader treats
-    /// zero lag as "caught up". Absent is the honest answer.
-    #[test]
-    fn an_estimate_behind_the_delivered_record_is_withheld_not_clamped() {
-        // The channel was cleared and refilled, so its ids restarted low while
-        // this source still holds a high delivered id.
-        assert_eq!(newest_record_estimate(stats(10, 1), Some(9_000)), None);
-        // Exactly equal is caught up, and that is a real answer.
-        assert_eq!(newest_record_estimate(stats(10, 1), Some(10)), Some(10));
-    }
-
-    #[test]
-    fn an_empty_or_unavailable_channel_has_no_newest_record() {
-        assert_eq!(newest_record_estimate(stats(0, 1), Some(5)), None);
-        assert_eq!(newest_record_estimate(None, Some(5)), None);
-        // Arithmetic that would wrap is unavailable, never a wrapped number.
-        assert_eq!(newest_record_estimate(stats(u64::MAX, 5), None), None);
     }
 
     /// The lossless steps must produce nothing. A reported hole that does not

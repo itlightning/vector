@@ -219,7 +219,7 @@ pub struct WindowsEventLogConfig {
     ///
     /// The source rewrites this file on a fixed interval with per channel
     /// facts: whether a subscription exists, the last event time and record id
-    /// it delivered, an estimate of the newest record in the channel, the
+    /// it delivered, the id of the newest record in the channel, the
     /// current resume position, and any gaps the resume ladder created. Another
     /// process can poll it to decide whether collection is keeping up.
     ///
