@@ -32,7 +32,7 @@ use super::{
         Rung, evaluate_gap, jitter_seed,
     },
     sid_resolver::SidResolver,
-    status::{ChannelStatus, GapRecord, StatusSnapshot, gap_for_rung, newest_record_estimate},
+    status::{ChannelStatus, GapRecord, StatusSnapshot, gap_for_rung},
     win32_errors::{
         DrainOutcome, QueryOrigin, SkipReason, SubscribeOutcome, classify_evt_next,
         classify_subscribe, describe, subscribe_failure_is_not_the_query, win32_code,
@@ -1242,11 +1242,8 @@ impl ChannelSubscription {
 
     /// Everything the status file says about this channel.
     ///
-    /// `stats` is read fresh by the caller rather than taken from anything the
-    /// pull loop maintains: the record-count refresh is deliberately skipped on
-    /// idle channels, and an idle channel is exactly the case a reader has to
-    /// tell apart from a wedged one.
-    fn status(&self, stats: Option<super::status::ChannelRecordStats>) -> ChannelStatus {
+    /// `newest_record_id` is read fresh by the caller, off the channel itself.
+    fn status(&self, newest_record_id: Option<u64>) -> ChannelStatus {
         ChannelStatus {
             subscribed: self.subscription_handle.is_some(),
             skipped_reason: self
@@ -1260,7 +1257,7 @@ impl ChannelSubscription {
                 .last_drained_at
                 .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             last_record_id: self.resume.last_record_id,
-            newest_record_id: newest_record_estimate(stats, self.resume.last_record_id),
+            newest_record_id,
             query_filters: self.query_filters(),
             suppress_active: self.factory.suppress_active(),
             records_read: self.records_read,
@@ -2516,21 +2513,18 @@ impl EventLogSubscription {
 
     /// Collect the per-channel facts for the status file.
     ///
-    /// Queries every configured channel's record count and oldest record id
-    /// directly, which is what makes the file useful on an idle host: the pull
-    /// loop skips that refresh for channels that returned nothing, and a quiet
-    /// channel is precisely the case a reader must be able to tell apart from a
-    /// wedged one.
+    /// Reads every configured channel's newest record directly, so the figure
+    /// holds on an idle host too, where the pull loop reads nothing.
     ///
     /// Blocking Win32 calls, so this runs on a blocking thread with the rest of
-    /// the subscription.
+    /// the subscription, never beside a pull.
     pub(super) fn status_snapshot(&self) -> StatusSnapshot {
         let mut snapshot = StatusSnapshot::new(chrono::Utc::now());
         for channel_sub in &self.channels {
-            let stats = super::render::channel_record_stats(&channel_sub.channel);
+            let newest = super::render::newest_record_id(&channel_sub.channel);
             snapshot
                 .channels
-                .insert(channel_sub.channel.clone(), channel_sub.status(stats));
+                .insert(channel_sub.channel.clone(), channel_sub.status(newest));
         }
         snapshot
     }
@@ -7555,13 +7549,10 @@ mod tests {
     }
 
     /// The snapshot describes every configured channel with the facts a reader
-    /// needs, and the newest-record estimate has to be consistent with what the
-    /// source actually delivered.
+    /// needs, and the newest record id agrees with what the source delivered.
     ///
-    /// Run against a real channel because the estimate is
-    /// `oldest + count - 1` off two Win32 properties, and whether those two
-    /// agree with the record ids the API hands the drain is precisely the thing
-    /// no unit test can settle.
+    /// Run against a real channel because the newest id is read off the
+    /// channel through a reverse query, which no unit test can stand in for.
     #[tokio::test]
     async fn the_status_snapshot_reports_live_per_channel_facts() {
         let _seams = SeamSession::acquire();
@@ -7597,12 +7588,22 @@ mod tests {
         );
 
         // Read to exhaustion: now an empty return really did happen.
-        drain_all(&mut subscription);
+        let rest = drain_all(&mut subscription);
         let drained = subscription.status_snapshot();
+        let drained = &drained.channels["Application"];
         assert!(
-            drained.channels["Application"].last_drained_at.is_some(),
+            drained.last_drained_at.is_some(),
             "a read that came back empty is the exact statement that the \
              subscription reached the head"
+        );
+        let head = *rest.last().unwrap_or(&delivered.last().unwrap().record_id);
+        assert!(
+            drained
+                .newest_record_id
+                .is_some_and(|newest| newest >= head),
+            "the newest record read off the channel ({:?}) must be present and \
+             at or past the last record delivered ({head})",
+            drained.newest_record_id
         );
 
         let last = channel
@@ -7613,18 +7614,14 @@ mod tests {
             delivered.last().unwrap().record_id,
             "the reported position must be the last record actually delivered"
         );
-        // The estimate is approximate, so the assertion is the one property a
-        // reader depends on: it never reports the source as further along than
-        // the channel. Absent is allowed; below the delivered record is not,
-        // because that computes as caught up.
-        if let Some(newest) = channel.newest_record_id {
-            assert!(
-                newest >= last,
-                "the newest-record estimate ({newest}) fell below the record \
-                 already delivered ({last}); that reads as caught up when the \
-                 source may not be"
-            );
-        }
+        let newest = channel
+            .newest_record_id
+            .expect("a channel with a backlog has a newest record");
+        assert!(
+            newest > last,
+            "the read stopped on the budget with a backlog left, so the newest \
+             record ({newest}) must be past the last one delivered ({last})"
+        );
     }
 
     fn application_status(subscription: &EventLogSubscription) -> ChannelStatus {

@@ -5,14 +5,15 @@
 
 use metrics::Gauge;
 use windows::Win32::System::EventLog::{
-    EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords,
-    EvtLogOldestRecordNumber, EvtOpenLog, EvtRender, EvtRenderEventXml,
+    EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords, EvtNext,
+    EvtOpenLog, EvtQuery, EvtQueryChannelPath, EvtQueryReverseDirection, EvtRender,
+    EvtRenderEventXml,
 };
-use windows::core::HSTRING;
+use windows::core::{HSTRING, w};
 
 use super::error::WindowsEventLogError;
-use super::status::ChannelRecordStats;
 use super::win32_errors::{RenderDisposition, classify_render, win32_code};
+use super::xml_parser;
 
 /// Test-only rewrite of the rendered XML, applied to the string this function
 /// is about to return.
@@ -161,7 +162,7 @@ fn shrink_decode_buffer(decode_buffer: &mut Vec<u16>) {
     }
 }
 
-/// Test-only count of channel metadata queries, whoever asked for them.
+/// Test-only count of `update_channel_records` calls.
 ///
 /// The whole point of the speculative-pull flag is to avoid steady
 /// `EvtOpenLog`/`EvtGetLogInfo` churn on an idle host, so "was the metadata
@@ -174,43 +175,18 @@ pub(super) static CHANNEL_RECORDS_UPDATES: std::sync::atomic::AtomicUsize =
 /// `rate(events_read_total)` to detect ingestion lag.
 /// Best-effort: if any API call fails, the gauge is left unchanged.
 pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
-    if let Some(stats) = channel_record_stats(channel) {
-        gauge.set(stats.count as f64);
-    }
-}
-
-/// Read the record count and the oldest record id of a channel in one open.
-///
-/// Both properties come off the same log handle, so the pair costs one
-/// `EvtOpenLog` and two `EvtGetLogInfo` calls. Returns `None` if the channel
-/// cannot be opened or either property is unavailable: a partial answer would
-/// let a caller compute a record position out of one real number and one
-/// invented one.
-pub(super) fn channel_record_stats(channel: &str) -> Option<ChannelRecordStats> {
     #[cfg(test)]
     CHANNEL_RECORDS_UPDATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let channel_hstring = HSTRING::from(channel);
     let log_handle = unsafe {
         // EvtOpenChannelPath = 1
-        EvtOpenLog(None, &channel_hstring, 1).ok()?
+        match EvtOpenLog(None, &channel_hstring, 1) {
+            Ok(h) => h,
+            Err(_) => return,
+        }
     };
 
-    let count = log_info_u64(log_handle, EvtLogNumberOfLogRecords.0);
-    let oldest = log_info_u64(log_handle, EvtLogOldestRecordNumber.0);
-
-    unsafe {
-        _ = EvtClose(log_handle);
-    }
-
-    Some(ChannelRecordStats {
-        count: count?,
-        oldest: oldest?,
-    })
-}
-
-/// Read one `UInt64` log property off an open log handle.
-fn log_info_u64(log_handle: EVT_HANDLE, property: i32) -> Option<u64> {
     // EVT_VARIANT is 16 bytes: 8 bytes value + 4 bytes count + 4 bytes type
     let mut buffer = [0u8; 16];
     let mut buffer_used = 0u32;
@@ -218,18 +194,88 @@ fn log_info_u64(log_handle: EVT_HANDLE, property: i32) -> Option<u64> {
     let result = unsafe {
         EvtGetLogInfo(
             log_handle,
-            EVT_LOG_PROPERTY_ID(property),
+            EVT_LOG_PROPERTY_ID(EvtLogNumberOfLogRecords.0),
             buffer.len() as u32,
             Some(buffer.as_mut_ptr() as *mut _),
             &mut buffer_used,
         )
     };
 
-    if result.is_err() {
-        return None;
+    unsafe {
+        _ = EvtClose(log_handle);
     }
-    // EVT_VARIANT for UInt64: first 8 bytes are the value (little-endian)
-    Some(u64::from_le_bytes(buffer[..8].try_into().ok()?))
+
+    if result.is_ok() {
+        // EVT_VARIANT for UInt64: first 8 bytes are the value (little-endian)
+        let record_count = u64::from_le_bytes(buffer[..8].try_into().unwrap_or([0; 8]));
+        gauge.set(record_count as f64);
+    }
+}
+
+/// Longest `EvtNext` wait for the newest record. The caller holds the
+/// subscription's blocking thread, so a stalled read must not hold it longer.
+const NEWEST_RECORD_TIMEOUT_MS: u32 = 1_000;
+
+/// `EventRecordID` of the newest record in a channel, read off that record.
+///
+/// One reverse-direction query, one `EvtNext` for a single handle, then the
+/// render and System parse the drain uses. Every handle opened here is closed
+/// before returning.
+///
+/// `None` when the channel is empty or any step fails, including a channel
+/// that refuses a reverse read (analytic and debug logs).
+pub(super) fn newest_record_id(channel: &str) -> Option<u64> {
+    let channel_hstring = HSTRING::from(channel);
+    let query = unsafe {
+        EvtQuery(
+            None,
+            &channel_hstring,
+            w!("*"),
+            EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
+        )
+    }
+    .ok()?;
+
+    let mut handles = [0isize; 1];
+    let mut returned = 0u32;
+    let next = unsafe {
+        EvtNext(
+            query,
+            &mut handles,
+            NEWEST_RECORD_TIMEOUT_MS,
+            0,
+            &mut returned,
+        )
+    };
+    let returned = (returned as usize).min(handles.len());
+
+    let newest = if next.is_ok() && returned == 1 {
+        // Both buffers are sized by the first render.
+        let (mut render_buffer, mut decode_buffer) = (Vec::new(), Vec::new());
+        render_event_xml(
+            &mut render_buffer,
+            &mut decode_buffer,
+            EVT_HANDLE(handles[0]),
+        )
+        .ok()
+        .map(|xml| xml_parser::parse_system_section(&xml).record_id)
+        .filter(|&id| id != 0)
+    } else {
+        None
+    };
+
+    // `EvtNext` can fail with a handle already populated.
+    for &raw in &handles[..returned] {
+        if raw != 0 {
+            unsafe {
+                _ = EvtClose(EVT_HANDLE(raw));
+            }
+        }
+    }
+    unsafe {
+        _ = EvtClose(query);
+    }
+    newest
 }
 
 /// Decode a UTF-16LE buffer (as returned by Windows EvtRender) into a String.
