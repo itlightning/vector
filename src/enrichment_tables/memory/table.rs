@@ -511,12 +511,13 @@ impl StreamSink<Event> for Memory {
     async fn run(mut self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
         let events_sent = register!(EventsSent::from(Output(None)));
         let bytes_sent = register!(BytesSent::from(Protocol("memory_enrichment_table".into(),)));
-        let mut flush_interval = IntervalStream::new(interval(
-            self.config
-                .flush_interval
-                .map(Duration::from_secs)
-                .unwrap_or(Duration::MAX),
-        ));
+        // No interval at all when unset: a `Duration::MAX` period panics on overflow once
+        // its first tick is polled more than 5 ms late, which a slow first scan or
+        // persistence write causes.
+        let mut flush_interval = self
+            .config
+            .flush_interval
+            .map(|secs| IntervalStream::new(interval(Duration::from_secs(secs))));
         let mut scan_interval = IntervalStream::new(interval(Duration::from_secs(
             self.config.scan_interval.into(),
         )));
@@ -545,7 +546,12 @@ impl StreamSink<Event> for Memory {
                     bytes_sent.emit(ByteSize(event_byte_size.get()));
                 }
 
-                Some(_) = flush_interval.next() => {
+                Some(_) = async {
+                    match flush_interval.as_mut() {
+                        Some(flush_interval) => flush_interval.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     let writer = self.write_handle.lock().expect("mutex poisoned");
                     self.flush(writer);
                 }
