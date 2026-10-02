@@ -1471,6 +1471,42 @@ mod tests {
     }
 
     #[test]
+    fn evict_oldest_with_a_flush_interval_counts_unpublished_writes() {
+        let with_interval = |max_byte_size| {
+            Memory::new(build_memory_config(|c| {
+                c.on_full = OnFull::EvictOldest;
+                c.max_byte_size = max_byte_size;
+                c.flush_interval = Some(3600);
+            }))
+        };
+        let write_40 = |memory: &Memory| {
+            for i in 0..40 {
+                memory.handle_value(ObjectMap::from([(
+                    format!("key_{i:02}").into(),
+                    Value::from(5),
+                )]));
+            }
+        };
+        // The cap is what 40 unpublished writes add up to, so the next write is over it.
+        let probe = with_interval(None);
+        write_40(&probe);
+        let cap = probe.write_handle.lock().unwrap().metadata.byte_size;
+        let memory = with_interval(Some(cap));
+        write_40(&memory);
+        assert_eq!(memory.get_read_handle().len(), 0);
+
+        // Eviction must publish the pending writes to find anything to evict.
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(5))]));
+
+        let evicted = evictions_total(&memory) as usize;
+        assert!(evicted >= 2, "evicted {evicted}");
+        memory.flush(memory.write_handle.lock().unwrap());
+        assert!(find(&memory, "key_new").is_some());
+        assert_eq!(memory.get_read_handle().len(), 41 - evicted);
+        assert!(memory.write_handle.lock().unwrap().metadata.byte_size <= cap);
+    }
+
+    #[test]
     fn evict_oldest_rejects_an_entry_larger_than_the_table() {
         let memory = Memory::new(build_memory_config(|c| {
             c.on_full = OnFull::EvictOldest;
