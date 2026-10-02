@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{FutureExt, future};
@@ -56,6 +56,15 @@ pub struct MemoryConfig {
     #[configurable(derived)]
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
     pub on_full: OnFull,
+    /// File that keeps the table's rows across restarts.
+    ///
+    /// Rows written since the previous scan are appended on every `scan_interval` tick,
+    /// and the file is loaded when the table is built. A status snapshot is written
+    /// beside it at `<persist_path>.status.json` on the same tick.
+    ///
+    /// By default, the table is not persisted.
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub persist_path: Option<PathBuf>,
     /// The namespace to use for logs. This overrides the global setting.
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
@@ -141,6 +150,7 @@ impl PartialEq for MemoryConfig {
             && self.scan_interval == other.scan_interval
             && self.flush_interval == other.flush_interval
             && self.on_full == other.on_full
+            && self.persist_path == other.persist_path
     }
 }
 impl Eq for MemoryConfig {}
@@ -154,6 +164,7 @@ impl Default for MemoryConfig {
             memory: Arc::new(Mutex::new(None)),
             max_byte_size: None,
             on_full: OnFull::default(),
+            persist_path: None,
             log_namespace: None,
             source_config: None,
             internal_metrics: InternalMetricsConfig::default(),
@@ -297,6 +308,7 @@ impl std::fmt::Debug for MemoryConfig {
             .field("flush_interval", &self.flush_interval)
             .field("max_byte_size", &self.max_byte_size)
             .field("on_full", &self.on_full)
+            .field("persist_path", &self.persist_path)
             .finish()
     }
 }
