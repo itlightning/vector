@@ -471,9 +471,9 @@ impl Memory {
         }
     }
 
-    /// Collects this tick's persistence write: the rows written since the last tick, or
-    /// every live row when the log is due for compaction.
-    fn persist_job(&self) -> Option<(Arc<Mutex<Persistence>>, PersistJob)> {
+    /// Collects this tick's persistence write: the rows written since the last tick, plus
+    /// every live row when `may_compact` and the log is due for compaction.
+    fn persist_job(&self, may_compact: bool) -> Option<(Arc<Mutex<Persistence>>, PersistJob)> {
         let persistence = Arc::clone(self.persistence.as_ref()?);
         let mut writer = self.write_handle.lock().expect("mutex poisoned");
         // Publishes pending writes, and a map that was never published reads as None.
@@ -499,10 +499,11 @@ impl Memory {
             .map(|r| line_estimate(&r.key, &r.value))
             .sum();
 
-        let compact = persistence
-            .lock()
-            .expect("mutex poisoned")
-            .should_compact(append_bytes, live_bytes);
+        let compact = may_compact
+            && persistence
+                .lock()
+                .expect("mutex poisoned")
+                .should_compact(append_bytes, live_bytes);
         let compact_rows = compact.then(|| {
             reader
                 .iter()
@@ -533,8 +534,8 @@ impl Memory {
     }
 
     /// One persistence tick, with the file I/O off the async runtime.
-    async fn persist_tick(&self) {
-        let Some((persistence, job)) = self.persist_job() else {
+    async fn persist_tick(&self, may_compact: bool) {
+        let Some((persistence, job)) = self.persist_job(may_compact) else {
             return;
         };
         let requeue = tokio::task::spawn_blocking(move || {
@@ -736,10 +737,13 @@ impl StreamSink<Event> for Memory {
                     let writer = self.write_handle.lock().expect("mutex poisoned");
                     self.scan(writer);
                     // The first tick fires at startup, so an oversized log is compacted then.
-                    self.persist_tick().await;
+                    self.persist_tick(true).await;
                 }
             }
         }
+        // Rows written since the last tick, append only: compaction waits for the next
+        // startup so stopping stays fast.
+        self.persist_tick(false).await;
         Ok(())
     }
 }
@@ -1507,7 +1511,7 @@ mod tests {
 
     /// One tick's persistence write, run inline.
     fn persist_now(memory: &Memory) {
-        let (persistence, job) = memory.persist_job().unwrap();
+        let (persistence, job) = memory.persist_job(true).unwrap();
         let requeue = persistence.lock().unwrap().write(job);
         memory.requeue_dirty(requeue);
     }
@@ -1890,6 +1894,52 @@ mod tests {
         let memory = Memory::new(config);
         assert_eq!(find(&memory, "test_key").unwrap()["value"], Value::from(5));
         assert!(persist::status_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn sink_appends_rows_written_after_the_last_tick_at_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let config = build_memory_config(|c| {
+            c.persist_path = Some(path.clone());
+            c.scan_interval = NonZeroU64::new(3600).unwrap();
+        });
+        // The event arrives after the startup tick and the input ends before the next.
+        let event = stream::once(async {
+            time::sleep(Duration::from_millis(200)).await;
+            Event::Log(LogEvent::from(ObjectMap::from([(
+                "late_key".into(),
+                Value::from(5),
+            )])))
+        });
+
+        VectorSink::from_event_streamsink(Memory::new(config.clone()))
+            .run(event.map(Into::into))
+            .await
+            .unwrap();
+
+        let memory = Memory::new(config);
+        assert_eq!(find(&memory, "late_key").unwrap()["value"], Value::from(5));
+    }
+
+    #[test]
+    fn the_stop_tick_appends_without_compacting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        let lines: String = (0..10)
+            .map(|i| format!("{{\"k\":\"a\",\"v\":{i},\"exp\":{exp}}}\n"))
+            .collect();
+        std::fs::write(&path, &lines).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
+        let (persistence, job) = memory.persist_job(false).unwrap();
+        persistence.lock().unwrap().write(job);
+
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(&lines));
+        assert_eq!(log_lines(&path), 11);
+        assert_eq!(failed_ticks(&memory), 0);
     }
 
     #[test]
