@@ -517,8 +517,14 @@ fn parse_section(
     named_data: &mut HashMap<String, String>,
     inserts: &mut Vec<String>,
 ) {
+    // No trimming: Data values must stay verbatim, because a value split across
+    // events (PowerShell 4104 ScriptBlockText) can end in whitespace that the
+    // joined text needs. Whitespace between elements is outside any Data
+    // element and never reaches a value.
+    // PROVENANCE: OBSERVED fleet data 2026-10-01, merged 4104 blocks lost the
+    // space or newline at each fragment seam.
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    reader.trim_text(false);
 
     let mut buf = Vec::new();
     let mut inside_section = false;
@@ -1422,5 +1428,66 @@ mod tests {
         // UserData leaf did not leak into event_data.
         assert!(!result.structured_data.contains_key("Leaf"));
         assert_eq!(result.user_data.get("Leaf").map(String::as_str), Some("v"));
+    }
+
+    fn script_block_text(xml: &str) -> String {
+        let config = WindowsEventLogConfig::default();
+        extract_event_data(xml, &config)
+            .structured_data
+            .get("ScriptBlockText")
+            .cloned()
+            .expect("ScriptBlockText present")
+    }
+
+    fn script_block_event(text: &str) -> String {
+        format!(
+            "<Event><EventData><Data Name=\"ScriptBlockText\">{text}</Data></EventData></Event>"
+        )
+    }
+
+    #[test]
+    fn test_event_data_keeps_edge_whitespace() {
+        for value in ["present ", "line\n", "\nline", "\r\n  indented\r\n", "   "] {
+            assert_eq!(script_block_text(&script_block_event(value)), value);
+        }
+    }
+
+    #[test]
+    fn test_event_data_ignores_whitespace_between_elements() {
+        let xml = "<Event>\n  <EventData>\n    <Data Name=\"A\">a</Data>\n    \
+                   <Data>first</Data>\n    <Data>second </Data>\n  </EventData>\n\
+                   \n  <UserData>\n    <Data Name=\"U\"> u</Data>\n  </UserData>\n</Event>";
+        let config = WindowsEventLogConfig::default();
+        let result = extract_event_data(xml, &config);
+
+        assert_eq!(result.structured_data.len(), 1);
+        assert_eq!(result.structured_data.get("A").map(String::as_str), Some("a"));
+        assert_eq!(result.string_inserts, vec!["first", "second "]);
+        assert_eq!(result.user_data.len(), 1);
+        assert_eq!(result.user_data.get("U").map(String::as_str), Some(" u"));
+    }
+
+    /// A script logged as two 4104 fragments joins back to the original text,
+    /// whether the seam falls after a space or after a newline. Synthetic
+    /// fixture in the 4104 EventData shape.
+    #[test]
+    fn test_split_script_block_round_trips() {
+        let script = "Write-Output 'present in'\r\nStart-Sleep -Milliseconds 10\r\n\
+                      $ProcessTimeout = 5\r\n";
+        let fragment = |n: usize, text: &str| {
+            format!(
+                "<Event><System><EventID>4104</EventID></System><EventData>\
+                 <Data Name=\"MessageNumber\">{n}</Data>\
+                 <Data Name=\"MessageTotal\">2</Data>\
+                 <Data Name=\"ScriptBlockText\">{text}</Data>\
+                 <Data Name=\"ScriptBlockId\">00000000-0000-0000-0000-000000000000</Data>\
+                 <Data Name=\"Path\"></Data></EventData></Event>"
+            )
+        };
+        for seam in [script.find("in'").unwrap(), script.find('$').unwrap()] {
+            let first = script_block_text(&fragment(1, &script[..seam]));
+            let second = script_block_text(&fragment(2, &script[seam..]));
+            assert_eq!(first + &second, script, "seam at byte {seam}");
+        }
     }
 }
