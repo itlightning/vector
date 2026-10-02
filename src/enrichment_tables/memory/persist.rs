@@ -128,6 +128,11 @@ impl Persistence {
 
     /// Reads the log at `path` and returns the live rows it holds.
     pub(super) fn open(path: &Path) -> (Self, Vec<LoadedRow>) {
+        Self::open_at(path, unix_now())
+    }
+
+    /// [`Self::open`] with `now` as the wall-clock time in unix seconds.
+    pub(super) fn open_at(path: &Path, now: u64) -> (Self, Vec<LoadedRow>) {
         let mut this = Self::new(path);
         let content = match fs::read(path) {
             Ok(content) => content,
@@ -169,7 +174,6 @@ impl Persistence {
             this.compaction_blocked = latest.is_empty();
         }
 
-        let now = unix_now();
         let rows = latest
             .into_iter()
             .filter(|(_, (_, exp))| *exp > now)

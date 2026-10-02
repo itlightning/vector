@@ -185,13 +185,15 @@ impl Memory {
     fn restore(&self, rows: Vec<persist::LoadedRow>) {
         let mut writer = self.write_handle.lock().expect("mutex poisoned");
         let now = Instant::now();
+        let ttl = self.config.ttl;
         for row in rows {
-            // Back-date the write so the remaining lifetime is right and older rows stay
-            // older for eviction.
-            let ttl = self.config.ttl.max(row.remaining_secs);
+            // Clamped, so a wall clock stepped back since the write cannot outlive the TTL.
+            let remaining = row.remaining_secs.min(ttl);
+            // Back-dated so the remaining lifetime is right, which restores rows in expiry
+            // order. Early in boot `checked_sub` can fail and flatten that order; accepted.
             let (update_time, ttl) = now
-                .checked_sub(Duration::from_secs(ttl - row.remaining_secs))
-                .map_or((now, row.remaining_secs), |t| (t, ttl));
+                .checked_sub(Duration::from_secs(ttl - remaining))
+                .map_or((now, remaining), |t| (t, ttl));
             writer.write_handle.update(
                 row.key,
                 MemoryEntry {
@@ -1586,6 +1588,32 @@ mod tests {
             memory.write_handle.lock().unwrap().metadata.byte_size,
             memory.live_byte_size()
         );
+    }
+
+    #[test]
+    fn load_clamps_a_far_future_expiry_to_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 1_000_000_000;
+        std::fs::write(&path, format!("{{\"k\":\"a\",\"v\":1,\"exp\":{exp}}}\n")).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+
+        assert_eq!(ttl_of(&memory, "a"), 100);
+    }
+
+    #[test]
+    fn load_with_the_clock_at_the_epoch_clamps_to_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        std::fs::write(&path, format!("{{\"k\":\"a\",\"v\":1,\"exp\":{exp}}}\n")).unwrap();
+
+        let (_, rows) = Persistence::open_at(&path, 0);
+        let memory = Memory::new(build_memory_config(|c| c.ttl = 100));
+        memory.restore(rows);
+
+        assert_eq!(ttl_of(&memory, "a"), 100);
     }
 
     #[test]
