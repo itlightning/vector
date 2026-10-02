@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -493,11 +493,8 @@ impl Memory {
             .map(|r| line_estimate(&r.key, &r.value))
             .sum();
 
-        let compact = may_compact
-            && persistence
-                .lock()
-                .expect("mutex poisoned")
-                .should_compact(append_bytes, live_bytes);
+        let compact =
+            may_compact && lock_persistence(&persistence).should_compact(append_bytes, live_bytes);
         let compact_rows = compact.then(|| {
             reader
                 .iter()
@@ -532,11 +529,10 @@ impl Memory {
         let Some((persistence, job)) = self.persist_job(may_compact) else {
             return;
         };
-        let requeue = tokio::task::spawn_blocking(move || {
-            persistence.lock().expect("mutex poisoned").write(job)
-        })
-        .await
-        .unwrap_or_default();
+        let requeue =
+            tokio::task::spawn_blocking(move || lock_persistence(&persistence).write(job))
+                .await
+                .unwrap_or_default();
         self.requeue_dirty(requeue);
     }
 
@@ -572,6 +568,12 @@ impl Clone for Memory {
 /// A published row's share of `byte_size`.
 fn row_byte_size(key: &String, entry: Option<&MemoryEntry>) -> u64 {
     (key.size_of() + entry.size_of()) as u64
+}
+
+/// Persistence is a cache, so a panic during one write must not take the table down
+/// with it: the next tick takes the lock as it was left and carries on.
+fn lock_persistence(persistence: &Mutex<Persistence>) -> MutexGuard<'_, Persistence> {
+    persistence.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 const fn line_estimate(key: &str, value: &str) -> u64 {
@@ -1547,18 +1549,12 @@ mod tests {
     /// One tick's persistence write, run inline.
     fn persist_now(memory: &Memory) {
         let (persistence, job) = memory.persist_job(true).unwrap();
-        let requeue = persistence.lock().unwrap().write(job);
+        let requeue = lock_persistence(&persistence).write(job);
         memory.requeue_dirty(requeue);
     }
 
     fn failed_ticks(memory: &Memory) -> u64 {
-        memory
-            .persistence
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .failed_ticks()
+        lock_persistence(memory.persistence.as_ref().unwrap()).failed_ticks()
     }
 
     fn log_lines(path: &std::path::Path) -> usize {
@@ -1993,11 +1989,115 @@ mod tests {
         let memory = Memory::new(persist_config(&path));
         memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
         let (persistence, job) = memory.persist_job(false).unwrap();
-        persistence.lock().unwrap().write(job);
+        lock_persistence(&persistence).write(job);
 
         assert!(std::fs::read_to_string(&path).unwrap().starts_with(&lines));
         assert_eq!(log_lines(&path), 11);
         assert_eq!(failed_ticks(&memory), 0);
+    }
+
+    fn log_event(key: &str, ttl: i64) -> Event {
+        Event::Log(LogEvent::from(ObjectMap::from([(
+            key.into(),
+            Value::from(ObjectMap::from([("ttl".into(), Value::from(ttl))])),
+        )])))
+    }
+
+    /// Runs a sink over `events`, each sent after `delay_ms`, then idles `tail_ms`
+    /// before the input ends.
+    async fn run_sink(memory: Memory, events: Vec<(u64, Event)>, tail_ms: u64) {
+        let input = stream::iter(events)
+            .then(|(delay_ms, event)| async move {
+                time::sleep(Duration::from_millis(delay_ms)).await;
+                event
+            })
+            .chain(
+                stream::once(time::sleep(Duration::from_millis(tail_ms)))
+                    .filter_map(|()| ready(None)),
+            );
+        VectorSink::from_event_streamsink(memory)
+            .run(input.map(Into::into))
+            .await
+            .expect("the sink must not fail");
+    }
+
+    #[tokio::test]
+    async fn restart_after_a_stop_append_compacts_and_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let config = build_memory_config(|c| {
+            c.ttl = 3600;
+            c.ttl_field = OptionalValuePath::new("ttl");
+            c.flush_interval = Some(1);
+            c.scan_interval = NonZeroU64::new(1).unwrap();
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(1 << 20);
+            c.persist_path = Some(path.clone());
+        });
+
+        // First run: every row lands at stop, and most of them expire before the restart.
+        let mut events: Vec<_> = (0..20)
+            .map(|i| (0, log_event(&format!("short_{i}"), 1)))
+            .collect();
+        events.insert(0, (200, log_event("long", 3600)));
+        run_sink(Memory::new(config.clone()), events, 0).await;
+        assert_eq!(log_lines(&path), 21);
+        time::sleep(Duration::from_millis(2100)).await;
+
+        // Second run: the startup tick rewrites the log, later ticks append to it.
+        let memory = Memory::new(config.clone());
+        assert!(find(&memory, "long").is_some());
+        let table = memory.clone();
+        run_sink(memory, vec![(1500, log_event("new", 3600))], 1200).await;
+
+        assert!(find(&table, "new").is_some());
+        assert_eq!(failed_ticks(&table), 0);
+        assert_eq!(log_lines(&path), 2);
+        let reloaded = Memory::new(config);
+        assert!(find(&reloaded, "long").is_some());
+        assert!(find(&reloaded, "new").is_some());
+    }
+
+    #[tokio::test]
+    async fn persistence_errors_do_not_end_the_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("table.ndjson");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.scan_interval = NonZeroU64::new(1).unwrap();
+            c.persist_path = Some(path.clone());
+        }));
+        let table = memory.clone();
+
+        run_sink(
+            memory,
+            vec![(0, log_event("a", 3600)), (1200, log_event("b", 3600))],
+            1200,
+        )
+        .await;
+
+        assert!(find(&table, "a").is_some());
+        assert!(find(&table, "b").is_some());
+        assert!(failed_ticks(&table) >= 2);
+    }
+
+    #[test]
+    fn a_panic_during_a_write_does_not_stop_later_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let memory = Memory::new(persist_config(&path));
+        let persistence = Arc::clone(memory.persistence.as_ref().unwrap());
+        _ = std::thread::spawn(move || {
+            let _guard = persistence.lock().unwrap();
+            panic!("a write panicked");
+        })
+        .join();
+        assert!(memory.persistence.as_ref().unwrap().is_poisoned());
+
+        memory.handle_value(ObjectMap::from([("a".into(), Value::from(1))]));
+        persist_now(&memory);
+
+        assert_eq!(failed_ticks(&memory), 0);
+        assert_eq!(log_lines(&path), 1);
     }
 
     #[test]
