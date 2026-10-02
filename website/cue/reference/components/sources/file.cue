@@ -429,12 +429,14 @@ components: sources: file: {
 	}
 
 	telemetry: metrics: {
-		checkpoints_total:     components.sources.internal_metrics.output.metrics.checkpoints_total
-		checksum_errors_total: components.sources.internal_metrics.output.metrics.checksum_errors_total
-		files_added_total:     components.sources.internal_metrics.output.metrics.files_added_total
-		files_deleted_total:   components.sources.internal_metrics.output.metrics.files_deleted_total
-		files_resumed_total:   components.sources.internal_metrics.output.metrics.files_resumed_total
-		files_unwatched_total: components.sources.internal_metrics.output.metrics.files_unwatched_total
-		open_files:            components.sources.internal_metrics.output.metrics.open_files
+		checkpoints_total:            components.sources.internal_metrics.output.metrics.checkpoints_total
+		checksum_errors_total:        components.sources.internal_metrics.output.metrics.checksum_errors_total
+		file_encoding_detected_total: components.sources.internal_metrics.output.metrics.file_encoding_detected_total
+		file_encoding_rejected_total: components.sources.internal_metrics.output.metrics.file_encoding_rejected_total
+		files_added_total:            components.sources.internal_metrics.output.metrics.files_added_total
+		files_deleted_total:          components.sources.internal_metrics.output.metrics.files_deleted_total
+		files_resumed_total:          components.sources.internal_metrics.output.metrics.files_resumed_total
+		files_unwatched_total:        components.sources.internal_metrics.output.metrics.files_unwatched_total
+		open_files:                   components.sources.internal_metrics.output.metrics.open_files
 	}
 }

@@ -248,10 +248,36 @@ generated: configuration: {
 					max_byte_size: {
 						type: uint: {}
 						description: """
-														Maximum size of the table in bytes. All insertions that make
-														this table bigger than the maximum size are rejected.
+														Maximum size of the table in bytes. An insertion that would make
+														this table bigger than the maximum size is handled per `on_full`.
 
 														By default, there is no size limit.
+														"""
+						required:      false
+						relevant_when: "type = \"memory\""
+					}
+					on_full: {
+						type: string: {
+							enum: {
+								reject:       "Reject the insertion."
+								evict_oldest: "Remove the least recently written entries (about 5% of the table, more if needed), then insert."
+							}
+							default: "reject"
+						}
+						description:   "Behavior when an insertion would grow the table past `max_byte_size`."
+						required:      false
+						relevant_when: "type = \"memory\""
+					}
+					persist_path: {
+						type: string: {}
+						description: """
+														File that keeps the table's rows across restarts.
+
+														Rows written since the previous scan are appended on every `scan_interval` tick
+														and once more when the table stops, and the file is loaded when the table is built.
+														A status snapshot is written beside it at `<persist_path>.status.json` on each tick.
+
+														By default, the table is not persisted.
 														"""
 						required:      false
 						relevant_when: "type = \"memory\""
