@@ -93,6 +93,7 @@ pub enum CounterName {
     SqsS3EventRecordIgnoredTotal,
     ComponentAllocatedBytesTotal,
     ComponentDeallocatedBytesTotal,
+    MemoryEnrichmentTableEvictionsTotal,
     MemoryEnrichmentTableFailedInsertions,
     MemoryEnrichmentTableFailedReads,
     MemoryEnrichmentTableFlushesTotal,
@@ -358,6 +359,7 @@ impl CounterName {
             Self::SqsS3EventRecordIgnoredTotal => "sqs_s3_event_record_ignored_total",
             Self::ComponentAllocatedBytesTotal => "component_allocated_bytes_total",
             Self::ComponentDeallocatedBytesTotal => "component_deallocated_bytes_total",
+            Self::MemoryEnrichmentTableEvictionsTotal => "memory_enrichment_table_evictions_total",
             Self::MemoryEnrichmentTableFailedInsertions => {
                 "memory_enrichment_table_failed_insertions"
             }

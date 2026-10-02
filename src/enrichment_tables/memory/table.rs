@@ -36,11 +36,12 @@ use super::source::MemorySource;
 use crate::{
     SourceSender,
     enrichment_tables::memory::{
-        MemoryConfig,
+        MemoryConfig, OnFull,
         internal_events::{
-            MemoryEnrichmentTableFlushed, MemoryEnrichmentTableInsertFailed,
-            MemoryEnrichmentTableInserted, MemoryEnrichmentTableRead,
-            MemoryEnrichmentTableReadFailed, MemoryEnrichmentTableTtlExpired,
+            MemoryEnrichmentTableEvicted, MemoryEnrichmentTableFlushed,
+            MemoryEnrichmentTableInsertFailed, MemoryEnrichmentTableInserted,
+            MemoryEnrichmentTableRead, MemoryEnrichmentTableReadFailed,
+            MemoryEnrichmentTableTtlExpired,
         },
     },
 };
@@ -93,6 +94,7 @@ impl MemoryEntry {
 #[derive(Default)]
 struct MemoryMetadata {
     byte_size: u64,
+    evictions_total: u64,
 }
 
 /// [`MemoryEntry`] combined with its key
@@ -204,12 +206,22 @@ impl Memory {
                     .saturating_add(new_entry_size as u64)
                     > max_byte_size
             {
-                // Reject new entries
-                emit!(MemoryEnrichmentTableInsertFailed {
-                    key: &new_entry_key,
-                    include_key_metric_tag: self.config.internal_metrics.include_key_tag
-                });
-                continue;
+                let fits = match self.config.on_full {
+                    OnFull::Reject => false,
+                    OnFull::EvictOldest => self.make_room(
+                        &mut writer,
+                        Some(&new_entry_key),
+                        new_entry_size as u64,
+                        max_byte_size,
+                    ),
+                };
+                if !fits {
+                    emit!(MemoryEnrichmentTableInsertFailed {
+                        key: &new_entry_key,
+                        include_key_metric_tag: self.config.internal_metrics.include_key_tag
+                    });
+                    continue;
+                }
             }
             writer.metadata.byte_size = writer
                 .metadata
@@ -225,6 +237,60 @@ impl Memory {
         if self.config.flush_interval.is_none() {
             self.flush(writer);
         }
+    }
+
+    /// Makes room for `new_size` bytes under `key` by removing the least recently written
+    /// entries: about 5% of the table, more if the new entry needs it. Evicted entries are
+    /// not exported as expired. Returns false, evicting nothing, when the entry cannot fit
+    /// even in an otherwise empty table.
+    ///
+    /// Rejecting at the cap kept stale keys and refused new ones, so a full deduplicating
+    /// table stopped deduplicating.
+    /// PROVENANCE: OBSERVED fleet data 2026-10-01 (a 4 MiB table rejecting new keys).
+    fn make_room(
+        &self,
+        writer: &mut MutexGuard<'_, MemoryWriter>,
+        key: Option<&str>,
+        new_size: u64,
+        max_byte_size: u64,
+    ) -> bool {
+        // Publish pending writes so the sizes below are exact.
+        writer.write_handle.refresh();
+        let mut live = 0u64;
+        let mut replaced = 0u64;
+        let mut candidates = Vec::new();
+        if let Some(reader) = self.get_read_handle().read() {
+            candidates.reserve(reader.len());
+            for (k, v) in reader.iter() {
+                let size = (k.size_of() + v.get_one().size_of()) as u64;
+                live += size;
+                match v.get_one() {
+                    Some(_) if Some(k.as_str()) == key => replaced = size,
+                    Some(entry) => candidates.push((*entry.update_time, k.clone(), size)),
+                    None => {}
+                }
+            }
+        }
+        let needed = (live - replaced + new_size).saturating_sub(max_byte_size);
+        let (count, freed) = if needed == 0 {
+            (0, 0)
+        } else if let Some(selected) = select_oldest(&mut candidates, needed) {
+            selected
+        } else {
+            writer.metadata.byte_size = live;
+            return false;
+        };
+        if count > 0 {
+            for (_, k, _) in candidates.drain(..count) {
+                writer.write_handle.empty(k);
+            }
+            writer.write_handle.refresh();
+            writer.metadata.evictions_total += count as u64;
+            emit!(MemoryEnrichmentTableEvicted { count });
+        }
+        // The caller adds `new_size`, which replaces `replaced`.
+        writer.metadata.byte_size = live - replaced - freed;
+        true
     }
 
     fn scan_and_mark_for_deletion(&self, writer: &mut MutexGuard<'_, MemoryWriter>) -> bool {
@@ -334,6 +400,27 @@ impl Clone for Memory {
             expired_items_receiver: self.expired_items_sender.subscribe(),
         }
     }
+}
+
+/// Moves the oldest entries to the front of `candidates` and returns how many to evict
+/// and the bytes that frees: 5% of them (at least one), extended in age order until
+/// `needed` bytes are covered. None when all of them together are not enough.
+fn select_oldest(candidates: &mut [(Instant, String, u64)], needed: u64) -> Option<(usize, u64)> {
+    let n = candidates.len();
+    if n == 0 {
+        return None;
+    }
+    let mut count = (n / 20).max(1);
+    candidates.select_nth_unstable_by_key(count - 1, |c| c.0);
+    let mut freed: u64 = candidates[..count].iter().map(|c| c.2).sum();
+    if freed < needed {
+        candidates[count..].sort_unstable_by_key(|c| c.0);
+        while freed < needed && count < n {
+            freed += candidates[count].2;
+            count += 1;
+        }
+    }
+    (freed >= needed).then_some((count, freed))
 }
 
 impl Table for Memory {
@@ -1101,5 +1188,130 @@ mod tests {
         let log = event.as_log();
 
         assert!(!log.value().is_empty());
+    }
+
+    fn find(memory: &Memory, key: &str) -> Option<ObjectMap> {
+        memory
+            .find_table_rows(
+                Case::Sensitive,
+                &[Condition::Equals {
+                    field: "key",
+                    value: Value::from(key),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .pop()
+    }
+
+    /// Writes `count` entries aged `count - i` seconds, so `key_00` is the oldest, and
+    /// returns the table's byte size.
+    fn fill_aged(memory: &Memory, count: usize, value: &str) -> u64 {
+        let mut writer = memory.write_handle.lock().unwrap();
+        let now = Instant::now();
+        for i in 0..count {
+            writer.write_handle.update(
+                format!("key_{i:02}"),
+                MemoryEntry {
+                    value: value.to_string(),
+                    update_time: (now - Duration::from_secs((count - i) as u64)).into(),
+                    ttl: 1000,
+                },
+            );
+        }
+        writer.write_handle.refresh();
+        let size = memory.get_read_handle().read().map_or(0, |reader| {
+            reader
+                .iter()
+                .map(|(k, v)| (k.size_of() + v.get_one().size_of()) as u64)
+                .sum()
+        });
+        writer.metadata.byte_size = size;
+        size
+    }
+
+    fn evictions_total(memory: &Memory) -> u64 {
+        memory.write_handle.lock().unwrap().metadata.evictions_total
+    }
+
+    #[test]
+    fn evict_oldest_removes_oldest_five_percent_to_fit() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        }));
+        fill_aged(&memory, 40, "5");
+
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(5))]));
+
+        assert!(find(&memory, "key_00").is_none());
+        assert!(find(&memory, "key_01").is_none());
+        for i in 2..40 {
+            assert!(
+                find(&memory, &format!("key_{i:02}")).is_some(),
+                "key_{i:02}"
+            );
+        }
+        assert!(find(&memory, "key_new").is_some());
+        assert_eq!(evictions_total(&memory), 2);
+    }
+
+    #[test]
+    fn evict_oldest_removes_enough_for_a_large_entry() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        }));
+        fill_aged(&memory, 40, "5");
+
+        let large = "x".repeat(400);
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(large))]));
+
+        assert!(find(&memory, "key_new").is_some());
+        let evicted = evictions_total(&memory) as usize;
+        assert!(evicted > 2, "evicted {evicted}");
+        for i in 0..40 {
+            let present = find(&memory, &format!("key_{i:02}")).is_some();
+            assert_eq!(present, i >= evicted, "key_{i:02}");
+        }
+        assert!(memory.write_handle.lock().unwrap().metadata.byte_size <= full);
+    }
+
+    #[test]
+    fn evict_oldest_rejects_an_entry_larger_than_the_table() {
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(150);
+        }));
+        memory.handle_value(ObjectMap::from([("small".into(), Value::from(5))]));
+        let large = "x".repeat(400);
+        memory.handle_value(ObjectMap::from([("large".into(), Value::from(large))]));
+
+        assert!(find(&memory, "small").is_some());
+        assert!(find(&memory, "large").is_none());
+        assert_eq!(evictions_total(&memory), 0);
+    }
+
+    #[test]
+    fn reject_keeps_old_entries_at_the_cap() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::Reject;
+            c.max_byte_size = Some(full);
+        }));
+        fill_aged(&memory, 40, "5");
+
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(5))]));
+
+        assert!(find(&memory, "key_new").is_none());
+        assert!(find(&memory, "key_00").is_some());
+        assert_eq!(evictions_total(&memory), 0);
     }
 }
