@@ -204,6 +204,14 @@ impl Persistence {
 
     /// Writes one tick and the status file. Returns the keys to retry on the next tick.
     pub(super) fn write(&mut self, job: PersistJob) -> Vec<String> {
+        if job.compact_rows.is_none() && job.rows.is_empty() {
+            // Nothing to write proves nothing: a failure stands until a write succeeds.
+            if self.failed_ticks == 0 {
+                self.last_snapshot_unix = Some(unix_now());
+            }
+            self.write_status(job.status);
+            return Vec::new();
+        }
         let mut appended = false;
         let result = match &job.compact_rows {
             Some(all) => self.compact(all).inspect_err(|_| {
@@ -211,7 +219,6 @@ impl Persistence {
                 // rewrite is retried next tick.
                 appended = job.rows.is_empty() || self.append(&job.rows).is_ok();
             }),
-            None if job.rows.is_empty() => Ok(()),
             None => self.append(&job.rows),
         };
         let requeue = match result {

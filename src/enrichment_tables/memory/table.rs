@@ -1804,6 +1804,29 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_tick_keeps_the_failure_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("table.ndjson");
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("a".into(), Value::from(1))]));
+        persist_now(&memory);
+        // As if the retried row had since been evicted: the next tick has nothing to write.
+        memory.write_handle.lock().unwrap().metadata.dirty.clear();
+        std::fs::create_dir(dir.path().join("missing")).unwrap();
+        persist_now(&memory);
+
+        assert_eq!(failed_ticks(&memory), 1);
+        let status = read_status(&path);
+        assert!(status.persist_failing);
+        assert_eq!(status.last_snapshot_unix, None);
+
+        memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
+        persist_now(&memory);
+        assert_eq!(failed_ticks(&memory), 0);
+        assert!(read_status(&path).last_snapshot_unix.is_some());
+    }
+
+    #[test]
     fn missing_directory_fails_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing").join("table.ndjson");
