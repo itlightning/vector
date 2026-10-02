@@ -58,9 +58,9 @@ pub struct MemoryConfig {
     pub on_full: OnFull,
     /// File that keeps the table's rows across restarts.
     ///
-    /// Rows written since the previous scan are appended on every `scan_interval` tick,
-    /// and the file is loaded when the table is built. A status snapshot is written
-    /// beside it at `<persist_path>.status.json` on the same tick.
+    /// Rows written since the previous scan are appended on every `scan_interval` tick
+    /// and once more when the table stops, and the file is loaded when the table is built.
+    /// A status snapshot is written beside it at `<persist_path>.status.json` on each tick.
     ///
     /// By default, the table is not persisted.
     #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
@@ -110,8 +110,7 @@ pub enum OnFull {
     /// Reject the insertion.
     #[default]
     Reject,
-    /// Remove the least recently written entries, about 5% of the table and at least
-    /// enough to fit the new entry, then insert.
+    /// Remove the least recently written entries (about 5% of the table, more if needed), then insert.
     EvictOldest,
 }
 

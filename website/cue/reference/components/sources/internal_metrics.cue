@@ -815,6 +815,12 @@ components: sources: internal_metrics: {
 			default_namespace: "vector"
 			tags:              _internal_metrics_tags
 		}
+		memory_enrichment_table_evictions_total: {
+			description:       "The total number of entries a memory enrichment table removed to make room under `on_full: evict_oldest`."
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
+		}
 		metadata_refresh_failed_total: {
 			description:       "The total number of failed efforts to refresh AWS EC2 metadata."
 			type:              "counter"
