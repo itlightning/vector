@@ -46,9 +46,10 @@ pub(super) struct TableStatus {
 
 /// One tick's write.
 pub(super) struct PersistJob {
-    /// Every live row when `compact`, otherwise the rows written since the last tick.
+    /// Rows written since the last tick.
     pub(super) rows: Vec<PersistRow>,
-    pub(super) compact: bool,
+    /// Every live row, when the log is due for a rewrite.
+    pub(super) compact_rows: Option<Vec<PersistRow>>,
     /// Keys handed back to the table when the write fails, so the next tick retries them.
     pub(super) dirty_keys: Vec<String>,
     pub(super) status: TableStatus,
@@ -200,12 +201,15 @@ impl Persistence {
 
     /// Writes one tick and the status file. Returns the keys to retry on the next tick.
     pub(super) fn write(&mut self, job: PersistJob) -> Vec<String> {
-        let result = if job.compact {
-            self.compact(&job.rows)
-        } else if job.rows.is_empty() {
-            Ok(())
-        } else {
-            self.append(&job.rows)
+        let mut appended = false;
+        let result = match &job.compact_rows {
+            Some(all) => self.compact(all).inspect_err(|_| {
+                // The old log is still in place, so this tick's rows go on it and the
+                // rewrite is retried next tick.
+                appended = job.rows.is_empty() || self.append(&job.rows).is_ok();
+            }),
+            None if job.rows.is_empty() => Ok(()),
+            None => self.append(&job.rows),
         };
         let requeue = match result {
             Ok(()) => {
@@ -229,7 +233,7 @@ impl Persistence {
                     );
                 }
                 self.failed_ticks += 1;
-                job.dirty_keys
+                if appended { Vec::new() } else { job.dirty_keys }
             }
         };
         self.write_status(job.status);

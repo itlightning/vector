@@ -152,6 +152,9 @@ impl Memory {
         // publishing will not happen either, because the lock would be held, so this buffer is not
         // that important
         let (expired_tx, expired_rx) = tokio::sync::broadcast::channel(5);
+        // On a reload that does not preserve state, the outgoing table keeps writing this
+        // file until its sink stops, up to one tick. Accepted: every line stays valid, and a
+        // stale value can win on the next load once, which a cache tolerates.
         let (persistence, loaded) = match &config.persist_path {
             Some(path) => {
                 let (persistence, rows) = Persistence::open(path);
@@ -495,14 +498,12 @@ impl Memory {
             .lock()
             .expect("mutex poisoned")
             .should_compact(append_bytes, live_bytes);
-        let rows = if compact {
+        let compact_rows = compact.then(|| {
             reader
                 .iter()
                 .filter_map(|(k, v)| v.get_one()?.persist_row(k, now, now_unix))
                 .collect()
-        } else {
-            dirty_rows
-        };
+        });
         let status = TableStatus {
             entries: reader.len(),
             bytes: writer.metadata.byte_size,
@@ -512,8 +513,8 @@ impl Memory {
         Some((
             persistence,
             PersistJob {
-                rows,
-                compact,
+                rows: dirty_rows,
+                compact_rows,
                 dirty_keys,
                 status,
             },
@@ -1772,6 +1773,40 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), lines);
         assert_eq!(failed_ticks(&memory), 1);
+    }
+
+    #[test]
+    fn failed_compaction_still_appends_the_tick_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        let lines: String = (0..10)
+            .map(|i| format!("{{\"k\":\"a\",\"v\":{i},\"exp\":{exp}}}\n"))
+            .collect();
+        std::fs::write(&path, &lines).unwrap();
+        std::fs::create_dir(dir.path().join("table.ndjson.tmp")).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
+        persist_now(&memory);
+
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.starts_with(&lines));
+        assert_eq!(log_lines(&path), 11);
+        assert!(read_status(&path).persist_failing);
+        // The appended row is not queued again.
+        assert!(
+            memory
+                .write_handle
+                .lock()
+                .unwrap()
+                .metadata
+                .dirty
+                .is_empty()
+        );
+        let memory = Memory::new(persist_config(&path));
+        assert_eq!(find(&memory, "b").unwrap()["value"], Value::from(2));
+        assert_eq!(find(&memory, "a").unwrap()["value"], Value::from(9));
     }
 
     #[tokio::test]
