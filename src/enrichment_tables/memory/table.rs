@@ -66,9 +66,7 @@ impl ByteSizeOf for MemoryEntry {
 
 impl MemoryEntry {
     pub(super) fn as_object_map(&self, now: Instant, key: &str) -> Result<ObjectMap, Error> {
-        let ttl = self
-            .ttl
-            .saturating_sub(now.duration_since(*self.update_time).as_secs());
+        let ttl = self.remaining_ttl(now);
         Ok(ObjectMap::from([
             (
                 KeyString::from("key"),
@@ -90,6 +88,11 @@ impl MemoryEntry {
         ]))
     }
 
+    fn remaining_ttl(&self, now: Instant) -> u64 {
+        self.ttl
+            .saturating_sub(now.duration_since(*self.update_time).as_secs())
+    }
+
     fn expired(&self, now: Instant) -> bool {
         now.duration_since(*self.update_time).as_secs() > self.ttl
     }
@@ -98,13 +101,10 @@ impl MemoryEntry {
         if self.expired(now) {
             return None;
         }
-        let remaining = self
-            .ttl
-            .saturating_sub(now.duration_since(*self.update_time).as_secs());
         Some(PersistRow {
             key: key.to_owned(),
             value: self.value.clone(),
-            exp_unix: now_unix.saturating_add(remaining),
+            exp_unix: now_unix.saturating_add(self.remaining_ttl(now)),
         })
     }
 }
@@ -216,7 +216,7 @@ impl Memory {
         self.get_read_handle().read().map_or(0, |reader| {
             reader
                 .iter()
-                .map(|(k, v)| (k.size_of() + v.get_one().size_of()) as u64)
+                .map(|(k, v)| row_byte_size(k, v.get_one()))
                 .sum()
         })
     }
@@ -341,9 +341,8 @@ impl Memory {
     /// not exported as expired. Returns false, evicting nothing, when the entry cannot fit
     /// even in an otherwise empty table.
     ///
-    /// Rejecting at the cap kept stale keys and refused new ones, so a full deduplicating
-    /// table stopped deduplicating.
-    /// PROVENANCE: OBSERVED fleet data 2026-10-01 (a 4 MiB table rejecting new keys).
+    /// Rejecting at the cap kept stale keys and refused new ones: a 4 MiB table rejecting
+    /// new keys left hosts shipping every PowerShell block in full, 2026-10-01.
     fn make_room(
         &self,
         writer: &mut MutexGuard<'_, MemoryWriter>,
@@ -359,7 +358,7 @@ impl Memory {
         if let Some(reader) = self.get_read_handle().read() {
             candidates.reserve(reader.len());
             for (k, v) in reader.iter() {
-                let size = (k.size_of() + v.get_one().size_of()) as u64;
+                let size = row_byte_size(k, v.get_one());
                 live += size;
                 match v.get_one() {
                     Some(_) if Some(k.as_str()) == key => replaced = size,
@@ -458,17 +457,12 @@ impl Memory {
         }
 
         writer.write_handle.refresh();
-        if let Some(reader) = self.get_read_handle().read() {
-            let mut byte_size = 0;
-            for (k, v) in reader.iter() {
-                byte_size += k.size_of() + v.get_one().size_of();
-            }
-            writer.metadata.byte_size = byte_size as u64;
-            emit!(MemoryEnrichmentTableFlushed {
-                new_objects_count: reader.len(),
-                new_byte_size: byte_size
-            });
-        }
+        let byte_size = self.live_byte_size();
+        writer.metadata.byte_size = byte_size;
+        emit!(MemoryEnrichmentTableFlushed {
+            new_objects_count: self.get_read_handle().len(),
+            new_byte_size: byte_size as usize
+        });
     }
 
     /// Collects this tick's persistence write: the rows written since the last tick, plus
@@ -573,6 +567,11 @@ impl Clone for Memory {
             persistence: self.persistence.clone(),
         }
     }
+}
+
+/// A published row's share of `byte_size`.
+fn row_byte_size(key: &String, entry: Option<&MemoryEntry>) -> u64 {
+    (key.size_of() + entry.size_of()) as u64
 }
 
 const fn line_estimate(key: &str, value: &str) -> u64 {
