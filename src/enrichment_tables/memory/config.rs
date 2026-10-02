@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use futures::{FutureExt, future};
@@ -46,12 +46,25 @@ pub struct MemoryConfig {
     /// By default, all writes are made visible immediately.
     #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
     pub flush_interval: Option<u64>,
-    /// Maximum size of the table in bytes. All insertions that make
-    /// this table bigger than the maximum size are rejected.
+    /// Maximum size of the table in bytes. An insertion that would make
+    /// this table bigger than the maximum size is handled per `on_full`.
     ///
     /// By default, there is no size limit.
     #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
     pub max_byte_size: Option<u64>,
+    /// Behavior when an insertion would grow the table past `max_byte_size`.
+    #[configurable(derived)]
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub on_full: OnFull,
+    /// File that keeps the table's rows across restarts.
+    ///
+    /// Rows written since the previous scan are appended on every `scan_interval` tick
+    /// and once more when the table stops, and the file is loaded when the table is built.
+    /// A status snapshot is written beside it at `<persist_path>.status.json` on each tick.
+    ///
+    /// By default, the table is not persisted.
+    #[serde(default, skip_serializing_if = "vector_lib::serde::is_default")]
+    pub persist_path: Option<PathBuf>,
     /// The namespace to use for logs. This overrides the global setting.
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
@@ -89,6 +102,18 @@ pub enum ReloadBehavior {
     PreserveState,
 }
 
+/// Behavior of the memory enrichment table when an insertion would exceed `max_byte_size`.
+#[configurable_component]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFull {
+    /// Reject the insertion.
+    #[default]
+    Reject,
+    /// Remove the least recently written entries (about 5% of the table, more if needed), then insert.
+    EvictOldest,
+}
+
 /// Configuration for memory enrichment table source functionality.
 #[configurable_component]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +148,8 @@ impl PartialEq for MemoryConfig {
         self.ttl == other.ttl
             && self.scan_interval == other.scan_interval
             && self.flush_interval == other.flush_interval
+            && self.on_full == other.on_full
+            && self.persist_path == other.persist_path
     }
 }
 impl Eq for MemoryConfig {}
@@ -135,6 +162,8 @@ impl Default for MemoryConfig {
             flush_interval: None,
             memory: Arc::new(Mutex::new(None)),
             max_byte_size: None,
+            on_full: OnFull::default(),
+            persist_path: None,
             log_namespace: None,
             source_config: None,
             internal_metrics: InternalMetricsConfig::default(),
@@ -277,6 +306,8 @@ impl std::fmt::Debug for MemoryConfig {
             .field("scan_interval", &self.scan_interval)
             .field("flush_interval", &self.flush_interval)
             .field("max_byte_size", &self.max_byte_size)
+            .field("on_full", &self.on_full)
+            .field("persist_path", &self.persist_path)
             .finish()
     }
 }
