@@ -484,10 +484,13 @@ impl Memory {
             .iter()
             .filter_map(|(k, v)| v.get_one().map(|e| line_estimate(k, &e.value)))
             .sum();
-        let dirty_keys: Vec<String> = writer.metadata.dirty.drain().collect();
-        let dirty_rows: Vec<PersistRow> = dirty_keys
-            .iter()
-            .filter_map(|k| reader.get_one(k)?.persist_row(k, now, now_unix))
+        // Keys evicted or expired since their write are dropped here, so a failing log
+        // cannot grow the dirty set past the table.
+        let dirty_rows: Vec<PersistRow> = writer
+            .metadata
+            .dirty
+            .drain()
+            .filter_map(|k| reader.get_one(&k)?.persist_row(&k, now, now_unix))
             .collect();
         let append_bytes: u64 = dirty_rows
             .iter()
@@ -515,7 +518,6 @@ impl Memory {
             PersistJob {
                 rows: dirty_rows,
                 compact_rows,
-                dirty_keys,
                 status,
             },
         ))
@@ -1740,6 +1742,33 @@ mod tests {
         assert!(!read_status(&path).persist_failing);
         let memory = Memory::new(persist_config(&path));
         assert_eq!(find(&memory, "b").unwrap()["value"], Value::from(2));
+    }
+
+    #[test]
+    fn failing_writes_keep_the_dirty_set_within_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("table.ndjson");
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.persist_path = Some(path.clone());
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        }));
+
+        for i in 0..400 {
+            memory.handle_value(ObjectMap::from([(
+                format!("w_{i:03}").into(),
+                Value::from(5),
+            )]));
+            if i % 10 == 9 {
+                persist_now(&memory);
+                let live = memory.get_read_handle().len();
+                let dirty = memory.write_handle.lock().unwrap().metadata.dirty.len();
+                assert!(dirty <= live, "dirty {dirty} > live {live}");
+            }
+        }
+        assert_eq!(failed_ticks(&memory), 40);
     }
 
     #[test]

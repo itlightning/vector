@@ -46,12 +46,11 @@ pub(super) struct TableStatus {
 
 /// One tick's write.
 pub(super) struct PersistJob {
-    /// Rows written since the last tick.
+    /// Rows written since the last tick that are still in the table. Their keys go back
+    /// to the table when the write fails, so the next tick retries them.
     pub(super) rows: Vec<PersistRow>,
     /// Every live row, when the log is due for a rewrite.
     pub(super) compact_rows: Option<Vec<PersistRow>>,
-    /// Keys handed back to the table when the write fails, so the next tick retries them.
-    pub(super) dirty_keys: Vec<String>,
     pub(super) status: TableStatus,
 }
 
@@ -233,7 +232,11 @@ impl Persistence {
                     );
                 }
                 self.failed_ticks += 1;
-                if appended { Vec::new() } else { job.dirty_keys }
+                if appended {
+                    Vec::new()
+                } else {
+                    job.rows.into_iter().map(|row| row.key).collect()
+                }
             }
         };
         self.write_status(job.status);
