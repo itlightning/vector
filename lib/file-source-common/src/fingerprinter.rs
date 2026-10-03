@@ -16,6 +16,7 @@ use vector_common::constants::GZIP_MAGIC;
 
 use crate::{
     AsyncFileInfo, internal_events::FileSourceInternalEvents, metadata_ext::PortableFileExt,
+    status::ReadFailure,
 };
 
 const FINGERPRINT_CRC: Crc<u64> = Crc::<u64>::new(&crc::CRC_64_ECMA_182);
@@ -202,45 +203,61 @@ impl Fingerprinter {
         known_small_files: &mut HashMap<PathBuf, time::Instant>,
         emitter: &impl FileSourceInternalEvents,
     ) -> Option<FileFingerprint> {
-        let metadata = match fs::metadata(path).await {
-            Ok(metadata) => {
-                if !metadata.is_dir() {
-                    self.fingerprint(path).await.map(Some)
-                } else {
-                    Ok(None)
-                }
-            }
+        self.try_fingerprint_or_emit(path, known_small_files, emitter)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// [`Self::fingerprint_or_emit`], keeping the read failure.
+    ///
+    /// `Ok(None)` is a path with nothing to report: a directory, a file without a
+    /// complete first line yet (tracked in `known_small_files`), or one that vanished
+    /// between the glob and the open. `Err` is any other failure, which is also emitted.
+    pub async fn try_fingerprint_or_emit(
+        &mut self,
+        path: &Path,
+        known_small_files: &mut HashMap<PathBuf, time::Instant>,
+        emitter: &impl FileSourceInternalEvents,
+    ) -> std::result::Result<Option<FileFingerprint>, ReadFailure> {
+        let result = match fs::metadata(path).await {
+            Ok(metadata) if metadata.is_dir() => Ok(None),
+            Ok(_) => self.fingerprint(path).await.map(Some),
             Err(e) => Err(e),
         };
 
-        metadata
-            .inspect(|_| {
+        let error = match result {
+            Ok(fingerprint) => {
                 // Drop the path from the small files map if we've got enough data to fingerprint it.
-                known_small_files.remove(&path.to_path_buf());
-            })
-            .map_err(|error| {
-                match error.kind() {
-                    ErrorKind::UnexpectedEof => {
-                        if !known_small_files.contains_key(path) {
-                            emitter.emit_file_checksum_failed(path);
-                            known_small_files.insert(path.to_path_buf(), time::Instant::now());
-                        }
-                        return;
-                    }
-                    ErrorKind::NotFound => {
-                        if !self.ignore_not_found {
-                            emitter.emit_file_fingerprint_read_error(path, error);
-                        }
-                    }
-                    _ => {
-                        emitter.emit_file_fingerprint_read_error(path, error);
-                    }
-                };
-                // For scenarios other than UnexpectedEOF, remove the path from the small files map.
-                known_small_files.remove(&path.to_path_buf());
-            })
-            .ok()
-            .flatten()
+                known_small_files.remove(path);
+                return Ok(fingerprint);
+            }
+            Err(error) => error,
+        };
+
+        let outcome = match error.kind() {
+            ErrorKind::UnexpectedEof => {
+                if !known_small_files.contains_key(path) {
+                    emitter.emit_file_checksum_failed(path);
+                    known_small_files.insert(path.to_path_buf(), time::Instant::now());
+                }
+                return Ok(None);
+            }
+            ErrorKind::NotFound => {
+                if !self.ignore_not_found {
+                    emitter.emit_file_fingerprint_read_error(path, error);
+                }
+                Ok(None)
+            }
+            _ => {
+                let failure = ReadFailure::of(&error);
+                emitter.emit_file_fingerprint_read_error(path, error);
+                Err(failure)
+            }
+        };
+        // For scenarios other than UnexpectedEOF, remove the path from the small files map.
+        known_small_files.remove(path);
+        outcome
     }
 }
 
@@ -284,6 +301,7 @@ mod test {
     use tempfile::{TempDir, tempdir};
 
     use super::{FileSourceInternalEvents, FingerprintStrategy, Fingerprinter};
+    use crate::status::{ReadErrorKind, ReadFailure};
 
     use tokio::io::AsyncReadExt;
 
@@ -654,6 +672,141 @@ mod test {
             smallest_byte_length = magic_header_bytes.len();
         }
     }
+
+    fn first_line_fingerprinter() -> Fingerprinter {
+        Fingerprinter::new(
+            FingerprintStrategy::FirstLinesChecksum {
+                ignored_header_bytes: 0,
+                lines: 1,
+            },
+            1024,
+            false,
+        )
+    }
+
+    /// A glob match gone before the open is not a read failure: nothing to report, so
+    /// the status file leaves it out.
+    #[tokio::test]
+    async fn a_path_gone_before_the_open_has_nothing_to_report() {
+        let target_dir = tempdir().unwrap();
+        let gone = target_dir.path().join("rotated-away.log");
+        let emitter = CountsReadErrors::default();
+
+        let outcome = first_line_fingerprinter()
+            .try_fingerprint_or_emit(&gone, &mut HashMap::new(), &emitter)
+            .await;
+
+        assert_eq!(outcome, Ok(None));
+        // Emission is unchanged: the source still logs it unless told to ignore it.
+        assert_eq!(emitter.read_errors(), 1);
+    }
+
+    /// A file held open by another process without read sharing is a sharing violation,
+    /// carried with its Win32 code, and still emitted once.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_sharing_violation_is_unreadable_with_its_code() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let target_dir = tempdir().unwrap();
+        let path = target_dir.path().join("locked.log");
+        fs::write(
+            &path,
+            b"first line
+",
+        )
+        .unwrap();
+        let _held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let emitter = CountsReadErrors::default();
+
+        let outcome = first_line_fingerprinter()
+            .try_fingerprint_or_emit(&path, &mut HashMap::new(), &emitter)
+            .await;
+
+        assert_eq!(
+            outcome,
+            Err(ReadFailure {
+                kind: ReadErrorKind::SharingViolation,
+                os_error_code: Some(32),
+            })
+        );
+        assert_eq!(emitter.read_errors(), 1);
+    }
+
+    /// A file the process may not read is unreadable with `permission_denied` and the
+    /// errno, and still emitted once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_permission_failure_is_unreadable_with_its_code() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let target_dir = tempdir().unwrap();
+        let path = target_dir.path().join("denied.log");
+        fs::write(
+            &path,
+            b"first line
+",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&path).is_ok() {
+            // Running as root: permissions do not bind, so there is nothing to observe.
+            return;
+        }
+        let emitter = CountsReadErrors::default();
+
+        let outcome = first_line_fingerprinter()
+            .try_fingerprint_or_emit(&path, &mut HashMap::new(), &emitter)
+            .await;
+
+        assert_eq!(
+            outcome,
+            Err(ReadFailure {
+                kind: ReadErrorKind::PermissionDenied,
+                // EACCES on Linux and macOS.
+                os_error_code: Some(13),
+            })
+        );
+        assert_eq!(emitter.read_errors(), 1);
+    }
+
+    /// Counts fingerprint read errors; every other event is ignored.
+    #[derive(Clone, Default)]
+    struct CountsReadErrors {
+        read_errors: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountsReadErrors {
+        fn read_errors(&self) -> usize {
+            self.read_errors.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl FileSourceInternalEvents for CountsReadErrors {
+        fn emit_file_added(&self, _: &Path) {}
+        fn emit_file_resumed(&self, _: &Path, _: u64) {}
+        fn emit_file_watch_error(&self, _: &Path, _: Error) {}
+        fn emit_file_unwatched(&self, _: &Path, _: bool) {}
+        fn emit_file_deleted(&self, _: &Path) {}
+        fn emit_file_delete_error(&self, _: &Path, _: Error) {}
+        fn emit_file_fingerprint_read_error(&self, _: &Path, _: Error) {
+            self.read_errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn emit_file_checkpointed(&self, _: usize, _: Duration) {}
+        fn emit_file_checksum_failed(&self, _: &Path) {}
+        fn emit_file_checkpoint_write_error(&self, _: Error) {}
+        fn emit_files_open(&self, _: usize) {}
+        fn emit_path_globbing_failed(&self, _: &Path, _: &Error) {}
+        fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {}
+        fn emit_file_encoding_detected(&self, _: &Path, _: &str, _: &str) {}
+        fn emit_file_encoding_rejected(&self, _: &Path, _: &str, _: f64) {}
+    }
+
     #[derive(Clone)]
     struct NoErrors;
 
@@ -697,5 +850,9 @@ mod test {
         fn emit_file_line_too_long(&self, _: &BytesMut, _: usize, _: usize) {
             panic!()
         }
+
+        fn emit_file_encoding_detected(&self, _: &Path, _: &str, _: &str) {}
+
+        fn emit_file_encoding_rejected(&self, _: &Path, _: &str, _: f64) {}
     }
 }

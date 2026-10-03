@@ -1,7 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)] // TODO review ShallowCopy usage code and fix properly.
 
 use std::{
-    sync::{Arc, Mutex, MutexGuard},
+    collections::HashSet,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -32,15 +33,19 @@ use vector_lib::{
 };
 use vrl::value::{KeyString, ObjectMap, Value};
 
-use super::source::MemorySource;
+use super::{
+    persist::{self, LINE_OVERHEAD, PersistJob, PersistRow, Persistence, TableStatus},
+    source::MemorySource,
+};
 use crate::{
     SourceSender,
     enrichment_tables::memory::{
-        MemoryConfig,
+        MemoryConfig, OnFull,
         internal_events::{
-            MemoryEnrichmentTableFlushed, MemoryEnrichmentTableInsertFailed,
-            MemoryEnrichmentTableInserted, MemoryEnrichmentTableRead,
-            MemoryEnrichmentTableReadFailed, MemoryEnrichmentTableTtlExpired,
+            MemoryEnrichmentTableEvicted, MemoryEnrichmentTableFlushed,
+            MemoryEnrichmentTableInsertFailed, MemoryEnrichmentTableInserted,
+            MemoryEnrichmentTableRead, MemoryEnrichmentTableReadFailed,
+            MemoryEnrichmentTableTtlExpired,
         },
     },
 };
@@ -61,9 +66,7 @@ impl ByteSizeOf for MemoryEntry {
 
 impl MemoryEntry {
     pub(super) fn as_object_map(&self, now: Instant, key: &str) -> Result<ObjectMap, Error> {
-        let ttl = self
-            .ttl
-            .saturating_sub(now.duration_since(*self.update_time).as_secs());
+        let ttl = self.remaining_ttl(now);
         Ok(ObjectMap::from([
             (
                 KeyString::from("key"),
@@ -85,14 +88,33 @@ impl MemoryEntry {
         ]))
     }
 
+    fn remaining_ttl(&self, now: Instant) -> u64 {
+        self.ttl
+            .saturating_sub(now.duration_since(*self.update_time).as_secs())
+    }
+
     fn expired(&self, now: Instant) -> bool {
         now.duration_since(*self.update_time).as_secs() > self.ttl
+    }
+
+    fn persist_row(&self, key: &str, now: Instant, now_unix: u64) -> Option<PersistRow> {
+        if self.expired(now) {
+            return None;
+        }
+        Some(PersistRow {
+            key: key.to_owned(),
+            value: self.value.clone(),
+            exp_unix: now_unix.saturating_add(self.remaining_ttl(now)),
+        })
     }
 }
 
 #[derive(Default)]
 struct MemoryMetadata {
     byte_size: u64,
+    evictions_total: u64,
+    /// Keys written since the last persistence tick; only tracked when persisting.
+    dirty: HashSet<String>,
 }
 
 /// [`MemoryEntry`] combined with its key
@@ -119,17 +141,28 @@ pub struct Memory {
     #[allow(dead_code)]
     expired_items_receiver: Receiver<Vec<MemoryEntryPair>>,
     expired_items_sender: Sender<Vec<MemoryEntryPair>>,
+    persistence: Option<Arc<Mutex<Persistence>>>,
 }
 
 impl Memory {
-    /// Creates a new [Memory] based on the provided config.
+    /// Creates a new [Memory] based on the provided config, loading `persist_path` when set.
     pub fn new(config: MemoryConfig) -> Self {
         let (read_handle, write_handle) = evmap::new();
         // Buffer could only be used if source is stuck exporting available items, but in that case,
         // publishing will not happen either, because the lock would be held, so this buffer is not
         // that important
         let (expired_tx, expired_rx) = tokio::sync::broadcast::channel(5);
-        Self {
+        // On a reload that does not preserve state, the outgoing table keeps writing this
+        // file until its sink stops, up to one tick. Accepted: every line stays valid, and a
+        // stale value can win on the next load once, which a cache tolerates.
+        let (persistence, loaded) = match &config.persist_path {
+            Some(path) => {
+                let (persistence, rows) = Persistence::open(path);
+                (Some(Arc::new(Mutex::new(persistence))), rows)
+            }
+            None => (None, Vec::new()),
+        };
+        let memory = Self {
             config,
             read_handle_factory: read_handle.factory(),
             read_handle: ThreadLocal::new(),
@@ -139,7 +172,53 @@ impl Memory {
             })),
             expired_items_sender: expired_tx,
             expired_items_receiver: expired_rx,
+            persistence,
+        };
+        if !loaded.is_empty() {
+            memory.restore(loaded);
         }
+        memory
+    }
+
+    /// Inserts rows read from the persistence log, then evicts the oldest if the result
+    /// is over `max_byte_size`.
+    fn restore(&self, rows: Vec<persist::LoadedRow>) {
+        let mut writer = self.write_handle.lock().expect("mutex poisoned");
+        let now = Instant::now();
+        let ttl = self.config.ttl;
+        for row in rows {
+            // Clamped, so a wall clock stepped back since the write cannot outlive the TTL.
+            let remaining = row.remaining_secs.min(ttl);
+            // Back-dated so the remaining lifetime is right, which restores rows in expiry
+            // order. Early in boot `checked_sub` can fail and flatten that order; accepted.
+            let (update_time, ttl) = now
+                .checked_sub(Duration::from_secs(ttl - remaining))
+                .map_or((now, remaining), |t| (t, ttl));
+            writer.write_handle.update(
+                row.key,
+                MemoryEntry {
+                    value: row.value,
+                    update_time: update_time.into(),
+                    ttl,
+                },
+            );
+        }
+        writer.write_handle.refresh();
+        writer.metadata.byte_size = self.live_byte_size();
+        if let Some(max_byte_size) = self.config.max_byte_size
+            && writer.metadata.byte_size > max_byte_size
+        {
+            self.make_room(&mut writer, None, 0, max_byte_size);
+        }
+    }
+
+    fn live_byte_size(&self) -> u64 {
+        self.get_read_handle().read().map_or(0, |reader| {
+            reader
+                .iter()
+                .map(|(k, v)| row_byte_size(k, v.get_one()))
+                .sum()
+        })
     }
 
     /// Creates a new [Memory] based on the provided config and previous state.
@@ -149,6 +228,7 @@ impl Memory {
     ) -> Self {
         if let Ok(prev_memory) = prev_state.downcast::<Memory>() {
             Self {
+                persistence: Self::resume_persistence(&config, &prev_memory.write_handle),
                 config,
                 read_handle_factory: prev_memory.read_handle_factory,
                 read_handle: prev_memory.read_handle,
@@ -159,6 +239,22 @@ impl Memory {
         } else {
             Self::new(config)
         }
+    }
+
+    /// The carried-over table is the source of truth, so its first tick rewrites the log.
+    fn resume_persistence(
+        config: &MemoryConfig,
+        write_handle: &Mutex<MemoryWriter>,
+    ) -> Option<Arc<Mutex<Persistence>>> {
+        let persistence = config
+            .persist_path
+            .as_deref()
+            .map(|path| Arc::new(Mutex::new(Persistence::resume(path))));
+        if persistence.is_none() {
+            let mut writer = write_handle.lock().expect("mutex poisoned");
+            writer.metadata.dirty.clear();
+        }
+        persistence
     }
 
     pub(super) fn get_read_handle(&self) -> &evmap::ReadHandle<String, MemoryEntry> {
@@ -204,12 +300,22 @@ impl Memory {
                     .saturating_add(new_entry_size as u64)
                     > max_byte_size
             {
-                // Reject new entries
-                emit!(MemoryEnrichmentTableInsertFailed {
-                    key: &new_entry_key,
-                    include_key_metric_tag: self.config.internal_metrics.include_key_tag
-                });
-                continue;
+                let fits = match self.config.on_full {
+                    OnFull::Reject => false,
+                    OnFull::EvictOldest => self.make_room(
+                        &mut writer,
+                        Some(&new_entry_key),
+                        new_entry_size as u64,
+                        max_byte_size,
+                    ),
+                };
+                if !fits {
+                    emit!(MemoryEnrichmentTableInsertFailed {
+                        key: &new_entry_key,
+                        include_key_metric_tag: self.config.internal_metrics.include_key_tag
+                    });
+                    continue;
+                }
             }
             writer.metadata.byte_size = writer
                 .metadata
@@ -219,12 +325,68 @@ impl Memory {
                 key: &new_entry_key,
                 include_key_metric_tag: self.config.internal_metrics.include_key_tag
             });
+            if self.persistence.is_some() {
+                writer.metadata.dirty.insert(new_entry_key.clone());
+            }
             writer.write_handle.update(new_entry_key, new_entry);
         }
 
         if self.config.flush_interval.is_none() {
             self.flush(writer);
         }
+    }
+
+    /// Makes room for `new_size` bytes under `key` by removing the least recently written
+    /// entries: about 5% of the table, more if the new entry needs it. Evicted entries are
+    /// not exported as expired. Returns false, evicting nothing, when the entry cannot fit
+    /// even in an otherwise empty table.
+    ///
+    /// Rejecting at the cap kept stale keys and refused new ones: a 4 MiB table rejecting
+    /// new keys left hosts shipping every PowerShell block in full, 2026-10-01.
+    fn make_room(
+        &self,
+        writer: &mut MutexGuard<'_, MemoryWriter>,
+        key: Option<&str>,
+        new_size: u64,
+        max_byte_size: u64,
+    ) -> bool {
+        // Publish pending writes so the sizes below are exact.
+        writer.write_handle.refresh();
+        let mut live = 0u64;
+        let mut replaced = 0u64;
+        let mut candidates = Vec::new();
+        if let Some(reader) = self.get_read_handle().read() {
+            candidates.reserve(reader.len());
+            for (k, v) in reader.iter() {
+                let size = row_byte_size(k, v.get_one());
+                live += size;
+                match v.get_one() {
+                    Some(_) if Some(k.as_str()) == key => replaced = size,
+                    Some(entry) => candidates.push((*entry.update_time, k.clone(), size)),
+                    None => {}
+                }
+            }
+        }
+        let needed = (live - replaced + new_size).saturating_sub(max_byte_size);
+        let (count, freed) = if needed == 0 {
+            (0, 0)
+        } else if let Some(selected) = select_oldest(&mut candidates, needed) {
+            selected
+        } else {
+            writer.metadata.byte_size = live;
+            return false;
+        };
+        if count > 0 {
+            for (_, k, _) in candidates.drain(..count) {
+                writer.write_handle.empty(k);
+            }
+            writer.write_handle.refresh();
+            writer.metadata.evictions_total += count as u64;
+            emit!(MemoryEnrichmentTableEvicted { count });
+        }
+        // The caller adds `new_size`, which replaces `replaced`.
+        writer.metadata.byte_size = live - replaced - freed;
+        true
     }
 
     fn scan_and_mark_for_deletion(&self, writer: &mut MutexGuard<'_, MemoryWriter>) -> bool {
@@ -295,17 +457,83 @@ impl Memory {
         }
 
         writer.write_handle.refresh();
-        if let Some(reader) = self.get_read_handle().read() {
-            let mut byte_size = 0;
-            for (k, v) in reader.iter() {
-                byte_size += k.size_of() + v.get_one().size_of();
-            }
-            writer.metadata.byte_size = byte_size as u64;
-            emit!(MemoryEnrichmentTableFlushed {
-                new_objects_count: reader.len(),
-                new_byte_size: byte_size
-            });
+        let byte_size = self.live_byte_size();
+        writer.metadata.byte_size = byte_size;
+        emit!(MemoryEnrichmentTableFlushed {
+            new_objects_count: self.get_read_handle().len(),
+            new_byte_size: byte_size as usize
+        });
+    }
+
+    /// Collects this tick's persistence write: the rows written since the last tick, plus
+    /// every live row when `may_compact` and the log is due for compaction.
+    fn persist_job(&self, may_compact: bool) -> Option<(Arc<Mutex<Persistence>>, PersistJob)> {
+        let persistence = Arc::clone(self.persistence.as_ref()?);
+        let mut writer = self.write_handle.lock().expect("mutex poisoned");
+        // Publishes pending writes, and a map that was never published reads as None.
+        writer.write_handle.refresh();
+        let reader = self.get_read_handle().read()?;
+        let now = Instant::now();
+        let now_unix = persist::unix_now();
+
+        let live_bytes: u64 = reader
+            .iter()
+            .filter_map(|(k, v)| v.get_one().map(|e| line_estimate(k, &e.value)))
+            .sum();
+        // Keys evicted or expired since their write are dropped here, so a failing log
+        // cannot grow the dirty set past the table.
+        let dirty_rows: Vec<PersistRow> = writer
+            .metadata
+            .dirty
+            .drain()
+            .filter_map(|k| reader.get_one(&k)?.persist_row(&k, now, now_unix))
+            .collect();
+        let append_bytes: u64 = dirty_rows
+            .iter()
+            .map(|r| line_estimate(&r.key, &r.value))
+            .sum();
+
+        let compact =
+            may_compact && lock_persistence(&persistence).should_compact(append_bytes, live_bytes);
+        let compact_rows = compact.then(|| {
+            reader
+                .iter()
+                .filter_map(|(k, v)| v.get_one()?.persist_row(k, now, now_unix))
+                .collect()
+        });
+        let status = TableStatus {
+            entries: reader.len(),
+            bytes: writer.metadata.byte_size,
+            max_bytes: self.config.max_byte_size,
+            evictions_total: writer.metadata.evictions_total,
+        };
+        Some((
+            persistence,
+            PersistJob {
+                rows: dirty_rows,
+                compact_rows,
+                status,
+            },
+        ))
+    }
+
+    fn requeue_dirty(&self, keys: Vec<String>) {
+        if !keys.is_empty() {
+            let mut writer = self.write_handle.lock().expect("mutex poisoned");
+            writer.metadata.dirty.extend(keys);
         }
+    }
+
+    /// One persistence tick, with the file I/O off the async runtime.
+    async fn persist_tick(&self, may_compact: bool) {
+        let Some((persistence, job)) = self.persist_job(may_compact) else {
+            return;
+        };
+        let requeue =
+            tokio::task::spawn_blocking(move || lock_persistence(&persistence).write(job))
+                .await
+                .unwrap_or_default();
+        self.requeue_dirty(requeue);
     }
 
     pub(crate) fn as_source(
@@ -332,8 +560,45 @@ impl Clone for Memory {
             config: self.config.clone(),
             expired_items_sender: self.expired_items_sender.clone(),
             expired_items_receiver: self.expired_items_sender.subscribe(),
+            persistence: self.persistence.clone(),
         }
     }
+}
+
+/// A published row's share of `byte_size`.
+fn row_byte_size(key: &String, entry: Option<&MemoryEntry>) -> u64 {
+    (key.size_of() + entry.size_of()) as u64
+}
+
+/// Persistence is a cache, so a panic during one write must not take the table down
+/// with it: the next tick takes the lock as it was left and carries on.
+fn lock_persistence(persistence: &Mutex<Persistence>) -> MutexGuard<'_, Persistence> {
+    persistence.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+const fn line_estimate(key: &str, value: &str) -> u64 {
+    (key.len() + value.len()) as u64 + LINE_OVERHEAD
+}
+
+/// Moves the oldest entries to the front of `candidates` and returns how many to evict
+/// and the bytes that frees: 5% of them (at least one), extended in age order until
+/// `needed` bytes are covered. None when all of them together are not enough.
+fn select_oldest(candidates: &mut [(Instant, String, u64)], needed: u64) -> Option<(usize, u64)> {
+    let n = candidates.len();
+    if n == 0 {
+        return None;
+    }
+    let mut count = (n / 20).max(1);
+    candidates.select_nth_unstable_by_key(count - 1, |c| c.0);
+    let mut freed: u64 = candidates[..count].iter().map(|c| c.2).sum();
+    if freed < needed {
+        candidates[count..].sort_unstable_by_key(|c| c.0);
+        while freed < needed && count < n {
+            freed += candidates[count].2;
+            count += 1;
+        }
+    }
+    (freed >= needed).then_some((count, freed))
 }
 
 impl Table for Memory {
@@ -424,12 +689,13 @@ impl StreamSink<Event> for Memory {
     async fn run(mut self: Box<Self>, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
         let events_sent = register!(EventsSent::from(Output(None)));
         let bytes_sent = register!(BytesSent::from(Protocol("memory_enrichment_table".into(),)));
-        let mut flush_interval = IntervalStream::new(interval(
-            self.config
-                .flush_interval
-                .map(Duration::from_secs)
-                .unwrap_or(Duration::MAX),
-        ));
+        // No interval at all when unset: a `Duration::MAX` period panics on overflow once
+        // its first tick is polled more than 5 ms late, which a slow first scan or
+        // persistence write causes.
+        let mut flush_interval = self
+            .config
+            .flush_interval
+            .map(|secs| IntervalStream::new(interval(Duration::from_secs(secs))));
         let mut scan_interval = IntervalStream::new(interval(Duration::from_secs(
             self.config.scan_interval.into(),
         )));
@@ -458,7 +724,12 @@ impl StreamSink<Event> for Memory {
                     bytes_sent.emit(ByteSize(event_byte_size.get()));
                 }
 
-                Some(_) = flush_interval.next() => {
+                Some(_) = async {
+                    match flush_interval.as_mut() {
+                        Some(flush_interval) => flush_interval.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     let writer = self.write_handle.lock().expect("mutex poisoned");
                     self.flush(writer);
                 }
@@ -466,9 +737,14 @@ impl StreamSink<Event> for Memory {
                 Some(_) = scan_interval.next() => {
                     let writer = self.write_handle.lock().expect("mutex poisoned");
                     self.scan(writer);
+                    // The first tick fires at startup, so an oversized log is compacted then.
+                    self.persist_tick(true).await;
                 }
             }
         }
+        // Rows written since the last tick, append only: compaction waits for the next
+        // startup so stopping stays fast.
+        self.persist_tick(false).await;
         Ok(())
     }
 }
@@ -1101,5 +1377,774 @@ mod tests {
         let log = event.as_log();
 
         assert!(!log.value().is_empty());
+    }
+
+    fn find(memory: &Memory, key: &str) -> Option<ObjectMap> {
+        memory
+            .find_table_rows(
+                Case::Sensitive,
+                &[Condition::Equals {
+                    field: "key",
+                    value: Value::from(key),
+                }],
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .pop()
+    }
+
+    fn ttl_of(memory: &Memory, key: &str) -> i64 {
+        find(memory, key).unwrap()["ttl"].as_integer().unwrap()
+    }
+
+    /// Writes `count` entries aged `count - i` seconds, so `key_00` is the oldest, and
+    /// returns the table's byte size.
+    fn fill_aged(memory: &Memory, count: usize, value: &str) -> u64 {
+        let mut writer = memory.write_handle.lock().unwrap();
+        let now = Instant::now();
+        for i in 0..count {
+            writer.write_handle.update(
+                format!("key_{i:02}"),
+                MemoryEntry {
+                    value: value.to_string(),
+                    update_time: (now - Duration::from_secs((count - i) as u64)).into(),
+                    ttl: 1000,
+                },
+            );
+        }
+        writer.write_handle.refresh();
+        let size = memory.live_byte_size();
+        writer.metadata.byte_size = size;
+        size
+    }
+
+    fn evictions_total(memory: &Memory) -> u64 {
+        memory.write_handle.lock().unwrap().metadata.evictions_total
+    }
+
+    #[test]
+    fn evict_oldest_removes_oldest_five_percent_to_fit() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        }));
+        fill_aged(&memory, 40, "5");
+
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(5))]));
+
+        assert!(find(&memory, "key_00").is_none());
+        assert!(find(&memory, "key_01").is_none());
+        for i in 2..40 {
+            assert!(
+                find(&memory, &format!("key_{i:02}")).is_some(),
+                "key_{i:02}"
+            );
+        }
+        assert!(find(&memory, "key_new").is_some());
+        assert_eq!(evictions_total(&memory), 2);
+    }
+
+    #[test]
+    fn evict_oldest_removes_enough_for_a_large_entry() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        }));
+        fill_aged(&memory, 40, "5");
+
+        let large = "x".repeat(400);
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(large))]));
+
+        assert!(find(&memory, "key_new").is_some());
+        let evicted = evictions_total(&memory) as usize;
+        assert!(evicted > 2, "evicted {evicted}");
+        for i in 0..40 {
+            let present = find(&memory, &format!("key_{i:02}")).is_some();
+            assert_eq!(present, i >= evicted, "key_{i:02}");
+        }
+        assert!(memory.write_handle.lock().unwrap().metadata.byte_size <= full);
+    }
+
+    #[test]
+    fn evict_oldest_with_a_flush_interval_counts_unpublished_writes() {
+        let with_interval = |max_byte_size| {
+            Memory::new(build_memory_config(|c| {
+                c.on_full = OnFull::EvictOldest;
+                c.max_byte_size = max_byte_size;
+                c.flush_interval = Some(3600);
+            }))
+        };
+        let write_40 = |memory: &Memory| {
+            for i in 0..40 {
+                memory.handle_value(ObjectMap::from([(
+                    format!("key_{i:02}").into(),
+                    Value::from(5),
+                )]));
+            }
+        };
+        // The cap is what 40 unpublished writes add up to, so the next write is over it.
+        let probe = with_interval(None);
+        write_40(&probe);
+        let cap = probe.write_handle.lock().unwrap().metadata.byte_size;
+        let memory = with_interval(Some(cap));
+        write_40(&memory);
+        assert_eq!(memory.get_read_handle().len(), 0);
+
+        // Eviction must publish the pending writes to find anything to evict.
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(5))]));
+
+        let evicted = evictions_total(&memory) as usize;
+        assert!(evicted >= 2, "evicted {evicted}");
+        memory.flush(memory.write_handle.lock().unwrap());
+        assert!(find(&memory, "key_new").is_some());
+        assert_eq!(memory.get_read_handle().len(), 41 - evicted);
+        assert!(memory.write_handle.lock().unwrap().metadata.byte_size <= cap);
+    }
+
+    #[test]
+    fn evict_oldest_rejects_an_entry_larger_than_the_table() {
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(150);
+        }));
+        memory.handle_value(ObjectMap::from([("small".into(), Value::from(5))]));
+        let large = "x".repeat(400);
+        memory.handle_value(ObjectMap::from([("large".into(), Value::from(large))]));
+
+        assert!(find(&memory, "small").is_some());
+        assert!(find(&memory, "large").is_none());
+        assert_eq!(evictions_total(&memory), 0);
+    }
+
+    #[test]
+    fn reject_keeps_old_entries_at_the_cap() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::Reject;
+            c.max_byte_size = Some(full);
+        }));
+        fill_aged(&memory, 40, "5");
+
+        memory.handle_value(ObjectMap::from([("key_new".into(), Value::from(5))]));
+
+        assert!(find(&memory, "key_new").is_none());
+        assert!(find(&memory, "key_00").is_some());
+        assert_eq!(evictions_total(&memory), 0);
+    }
+
+    fn persist_config(path: &std::path::Path) -> MemoryConfig {
+        build_memory_config(|c| {
+            c.ttl = 100;
+            c.persist_path = Some(path.to_path_buf());
+        })
+    }
+
+    /// One tick's persistence write, run inline.
+    fn persist_now(memory: &Memory) {
+        let (persistence, job) = memory.persist_job(true).unwrap();
+        let requeue = lock_persistence(&persistence).write(job);
+        memory.requeue_dirty(requeue);
+    }
+
+    fn failed_ticks(memory: &Memory) -> u64 {
+        lock_persistence(memory.persistence.as_ref().unwrap()).failed_ticks()
+    }
+
+    fn log_lines(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count()
+    }
+
+    fn read_status(path: &std::path::Path) -> persist::StatusFile {
+        serde_json::from_slice(&std::fs::read(persist::status_path(path)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn persistence_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let config = persist_config(&path);
+
+        let memory = Memory::new(config.clone());
+        memory.handle_value(ObjectMap::from([
+            ("fresh".into(), Value::from(5)),
+            (
+                "object".into(),
+                Value::from(ObjectMap::from([("a".into(), Value::from("b"))])),
+            ),
+        ]));
+        {
+            let mut writer = memory.write_handle.lock().unwrap();
+            writer.write_handle.update(
+                "aged".to_string(),
+                MemoryEntry {
+                    value: "7".to_string(),
+                    update_time: (Instant::now() - Duration::from_secs(30)).into(),
+                    ttl: 100,
+                },
+            );
+            writer.metadata.dirty.insert("aged".to_string());
+        }
+        persist_now(&memory);
+        drop(memory);
+
+        let expired = format!(
+            "{{\"k\":\"expired\",\"v\":1,\"exp\":{}}}\n",
+            persist::unix_now() - 10
+        );
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut log, expired.as_bytes()).unwrap();
+        drop(log);
+
+        let memory = Memory::new(config);
+        assert_eq!(find(&memory, "fresh").unwrap()["value"], Value::from(5));
+        assert_eq!(
+            find(&memory, "object").unwrap()["value"],
+            Value::from(ObjectMap::from([("a".into(), Value::from("b"))]))
+        );
+        assert_eq!(find(&memory, "aged").unwrap()["value"], Value::from(7));
+        assert!(find(&memory, "expired").is_none());
+        assert!((99..=100).contains(&ttl_of(&memory, "fresh")));
+        assert!((69..=70).contains(&ttl_of(&memory, "aged")));
+        assert_eq!(
+            memory.write_handle.lock().unwrap().metadata.byte_size,
+            memory.live_byte_size()
+        );
+    }
+
+    #[test]
+    fn load_clamps_a_far_future_expiry_to_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 1_000_000_000;
+        std::fs::write(&path, format!("{{\"k\":\"a\",\"v\":1,\"exp\":{exp}}}\n")).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+
+        assert_eq!(ttl_of(&memory, "a"), 100);
+    }
+
+    #[test]
+    fn load_with_the_clock_at_the_epoch_clamps_to_the_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        std::fs::write(&path, format!("{{\"k\":\"a\",\"v\":1,\"exp\":{exp}}}\n")).unwrap();
+
+        let (_, rows) = Persistence::open_at(&path, 0);
+        let memory = Memory::new(build_memory_config(|c| c.ttl = 100));
+        memory.restore(rows);
+
+        assert_eq!(ttl_of(&memory, "a"), 100);
+    }
+
+    #[test]
+    fn load_evicts_oldest_when_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let now = persist::unix_now();
+        let lines: String = (0..40)
+            .map(|i| {
+                format!(
+                    "{{\"k\":\"key_{i:02}\",\"v\":5,\"exp\":{}}}\n",
+                    now + 50 + i
+                )
+            })
+            .collect();
+        std::fs::write(&path, lines).unwrap();
+
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.ttl = 100;
+            c.persist_path = Some(path.clone());
+            c.max_byte_size = Some(full - 1);
+        }));
+
+        assert!(find(&memory, "key_00").is_none());
+        assert!(find(&memory, "key_02").is_some());
+        assert!(memory.write_handle.lock().unwrap().metadata.byte_size < full);
+    }
+
+    #[test]
+    fn compacts_an_oversized_log_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        let lines: String = (0..10)
+            .map(|i| format!("{{\"k\":\"a\",\"v\":{i},\"exp\":{exp}}}\n"))
+            .collect();
+        std::fs::write(&path, lines).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        assert_eq!(find(&memory, "a").unwrap()["value"], Value::from(9));
+        persist_now(&memory);
+
+        assert_eq!(log_lines(&path), 1);
+        let memory = Memory::new(persist_config(&path));
+        assert_eq!(find(&memory, "a").unwrap()["value"], Value::from(9));
+    }
+
+    #[test]
+    fn leaves_a_compact_log_alone_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        let lines: String = ["a", "b", "c"]
+            .iter()
+            .map(|k| format!("{{\"k\":\"{k}\",\"v\":1,\"exp\":{exp}}}\n"))
+            .collect();
+        std::fs::write(&path, &lines).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        persist_now(&memory);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), lines);
+    }
+
+    #[test]
+    fn compacts_at_a_tick_past_twice_the_live_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let memory = Memory::new(persist_config(&path));
+
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            memory.handle_value(ObjectMap::from([("a".into(), Value::from(5))]));
+            persist_now(&memory);
+            lines.push(log_lines(&path));
+        }
+
+        // Each tick appends one line for the one live row until the log would pass
+        // twice the live size; that tick rewrites it instead.
+        assert_eq!(lines, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn skips_corrupt_lines_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"k\":\"a\",\"v\":1,\"exp\":{exp}}}\nnot json\n{{\"k\":\"b\",\"v\":2,\"exp\":{exp}}}\n{{\"k\":\"torn\""
+            ),
+        )
+        .unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        assert!(find(&memory, "a").is_some());
+        assert!(find(&memory, "b").is_some());
+        assert!(find(&memory, "torn").is_none());
+
+        // The next append starts on a fresh line, so the torn tail does not swallow it.
+        memory.handle_value(ObjectMap::from([("c".into(), Value::from(3))]));
+        persist_now(&memory);
+        let memory = Memory::new(persist_config(&path));
+        assert_eq!(find(&memory, "c").unwrap()["value"], Value::from(3));
+        assert!(find(&memory, "a").is_some());
+    }
+
+    #[test]
+    fn a_log_with_no_readable_line_is_not_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        std::fs::write(&path, "not json\nstill not json\n").unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        persist_now(&memory);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "not json\nstill not json\n"
+        );
+    }
+
+    #[test]
+    fn failed_append_keeps_the_log_and_retries_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("a".into(), Value::from(1))]));
+        persist_now(&memory);
+        let before = std::fs::read(&path).unwrap();
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms.clone()).unwrap();
+        memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
+        persist_now(&memory);
+        persist_now(&memory);
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(failed_ticks(&memory), 2);
+        let status = read_status(&path);
+        assert!(status.persist_failing);
+        assert_eq!(status.failed_ticks, 2);
+
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&path, perms).unwrap();
+        persist_now(&memory);
+
+        assert_eq!(failed_ticks(&memory), 0);
+        assert!(!read_status(&path).persist_failing);
+        let memory = Memory::new(persist_config(&path));
+        assert_eq!(find(&memory, "b").unwrap()["value"], Value::from(2));
+    }
+
+    #[test]
+    fn failing_writes_keep_the_dirty_set_within_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("table.ndjson");
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.persist_path = Some(path.clone());
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        }));
+
+        for i in 0..400 {
+            memory.handle_value(ObjectMap::from([(
+                format!("w_{i:03}").into(),
+                Value::from(5),
+            )]));
+            if i % 10 == 9 {
+                persist_now(&memory);
+                let live = memory.get_read_handle().len();
+                let dirty = memory.write_handle.lock().unwrap().metadata.dirty.len();
+                assert!(dirty <= live, "dirty {dirty} > live {live}");
+            }
+        }
+        assert_eq!(failed_ticks(&memory), 40);
+    }
+
+    #[test]
+    fn an_idle_tick_keeps_the_failure_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("table.ndjson");
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("a".into(), Value::from(1))]));
+        persist_now(&memory);
+        // As if the retried row had since been evicted: the next tick has nothing to write.
+        memory.write_handle.lock().unwrap().metadata.dirty.clear();
+        std::fs::create_dir(dir.path().join("missing")).unwrap();
+        persist_now(&memory);
+
+        assert_eq!(failed_ticks(&memory), 1);
+        let status = read_status(&path);
+        assert!(status.persist_failing);
+        assert_eq!(status.last_snapshot_unix, None);
+
+        memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
+        persist_now(&memory);
+        assert_eq!(failed_ticks(&memory), 0);
+        assert!(read_status(&path).last_snapshot_unix.is_some());
+    }
+
+    #[test]
+    fn missing_directory_fails_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("table.ndjson");
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("a".into(), Value::from(1))]));
+        persist_now(&memory);
+        persist_now(&memory);
+
+        assert_eq!(failed_ticks(&memory), 2);
+        assert!(!path.exists());
+        assert!(find(&memory, "a").is_some());
+    }
+
+    #[test]
+    fn failed_compaction_keeps_the_old_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        let lines: String = (0..10)
+            .map(|i| format!("{{\"k\":\"a\",\"v\":{i},\"exp\":{exp}}}\n"))
+            .collect();
+        std::fs::write(&path, &lines).unwrap();
+        // A directory where the temporary file goes makes the rewrite fail.
+        std::fs::create_dir(dir.path().join("table.ndjson.tmp")).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        persist_now(&memory);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), lines);
+        assert_eq!(failed_ticks(&memory), 1);
+    }
+
+    #[test]
+    fn failed_compaction_still_appends_the_tick_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        let lines: String = (0..10)
+            .map(|i| format!("{{\"k\":\"a\",\"v\":{i},\"exp\":{exp}}}\n"))
+            .collect();
+        std::fs::write(&path, &lines).unwrap();
+        std::fs::create_dir(dir.path().join("table.ndjson.tmp")).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
+        persist_now(&memory);
+
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.starts_with(&lines));
+        assert_eq!(log_lines(&path), 11);
+        assert!(read_status(&path).persist_failing);
+        // The appended row is not queued again.
+        assert!(
+            memory
+                .write_handle
+                .lock()
+                .unwrap()
+                .metadata
+                .dirty
+                .is_empty()
+        );
+        let memory = Memory::new(persist_config(&path));
+        assert_eq!(find(&memory, "b").unwrap()["value"], Value::from(2));
+        assert_eq!(find(&memory, "a").unwrap()["value"], Value::from(9));
+    }
+
+    #[tokio::test]
+    async fn sink_persists_on_the_scan_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let config = build_memory_config(|c| {
+            c.persist_path = Some(path.clone());
+            c.scan_interval = NonZeroU64::new(1).unwrap();
+        });
+        let event = Event::Log(LogEvent::from(ObjectMap::from([(
+            "test_key".into(),
+            Value::from(5),
+        )])));
+        // Keep the sink running past one scan tick after the event.
+        let wait =
+            stream::once(time::sleep(Duration::from_millis(1500))).filter_map(|()| ready(None));
+
+        VectorSink::from_event_streamsink(Memory::new(config.clone()))
+            .run(stream::once(ready(event)).chain(wait).map(Into::into))
+            .await
+            .unwrap();
+
+        let memory = Memory::new(config);
+        assert_eq!(find(&memory, "test_key").unwrap()["value"], Value::from(5));
+        assert!(persist::status_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn sink_appends_rows_written_after_the_last_tick_at_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let config = build_memory_config(|c| {
+            c.persist_path = Some(path.clone());
+            c.scan_interval = NonZeroU64::new(3600).unwrap();
+        });
+        // The event arrives after the startup tick and the input ends before the next.
+        let event = stream::once(async {
+            time::sleep(Duration::from_millis(200)).await;
+            Event::Log(LogEvent::from(ObjectMap::from([(
+                "late_key".into(),
+                Value::from(5),
+            )])))
+        });
+
+        VectorSink::from_event_streamsink(Memory::new(config.clone()))
+            .run(event.map(Into::into))
+            .await
+            .unwrap();
+
+        let memory = Memory::new(config);
+        assert_eq!(find(&memory, "late_key").unwrap()["value"], Value::from(5));
+    }
+
+    #[test]
+    fn the_stop_tick_appends_without_compacting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let exp = persist::unix_now() + 50;
+        let lines: String = (0..10)
+            .map(|i| format!("{{\"k\":\"a\",\"v\":{i},\"exp\":{exp}}}\n"))
+            .collect();
+        std::fs::write(&path, &lines).unwrap();
+
+        let memory = Memory::new(persist_config(&path));
+        memory.handle_value(ObjectMap::from([("b".into(), Value::from(2))]));
+        let (persistence, job) = memory.persist_job(false).unwrap();
+        lock_persistence(&persistence).write(job);
+
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(&lines));
+        assert_eq!(log_lines(&path), 11);
+        assert_eq!(failed_ticks(&memory), 0);
+    }
+
+    fn log_event(key: &str, ttl: i64) -> Event {
+        Event::Log(LogEvent::from(ObjectMap::from([(
+            key.into(),
+            Value::from(ObjectMap::from([("ttl".into(), Value::from(ttl))])),
+        )])))
+    }
+
+    /// Runs a sink over `events`, each sent after `delay_ms`, then idles `tail_ms`
+    /// before the input ends.
+    async fn run_sink(memory: Memory, events: Vec<(u64, Event)>, tail_ms: u64) {
+        let input = stream::iter(events)
+            .then(|(delay_ms, event)| async move {
+                time::sleep(Duration::from_millis(delay_ms)).await;
+                event
+            })
+            .chain(
+                stream::once(time::sleep(Duration::from_millis(tail_ms)))
+                    .filter_map(|()| ready(None)),
+            );
+        VectorSink::from_event_streamsink(memory)
+            .run(input.map(Into::into))
+            .await
+            .expect("the sink must not fail");
+    }
+
+    #[tokio::test]
+    async fn restart_after_a_stop_append_compacts_and_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let config = build_memory_config(|c| {
+            c.ttl = 3600;
+            c.ttl_field = OptionalValuePath::new("ttl");
+            c.flush_interval = Some(1);
+            c.scan_interval = NonZeroU64::new(1).unwrap();
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(1 << 20);
+            c.persist_path = Some(path.clone());
+        });
+
+        // First run: every row lands at stop, and most of them expire before the restart.
+        let mut events: Vec<_> = (0..20)
+            .map(|i| (0, log_event(&format!("short_{i}"), 1)))
+            .collect();
+        events.insert(0, (200, log_event("long", 3600)));
+        run_sink(Memory::new(config.clone()), events, 0).await;
+        assert_eq!(log_lines(&path), 21);
+        time::sleep(Duration::from_millis(2100)).await;
+
+        // Second run: the startup tick rewrites the log, later ticks append to it.
+        let memory = Memory::new(config.clone());
+        assert!(find(&memory, "long").is_some());
+        let table = memory.clone();
+        run_sink(memory, vec![(1500, log_event("new", 3600))], 1200).await;
+
+        assert!(find(&table, "new").is_some());
+        assert_eq!(failed_ticks(&table), 0);
+        assert_eq!(log_lines(&path), 2);
+        let reloaded = Memory::new(config);
+        assert!(find(&reloaded, "long").is_some());
+        assert!(find(&reloaded, "new").is_some());
+    }
+
+    #[tokio::test]
+    async fn persistence_errors_do_not_end_the_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("table.ndjson");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.scan_interval = NonZeroU64::new(1).unwrap();
+            c.persist_path = Some(path.clone());
+        }));
+        let table = memory.clone();
+
+        run_sink(
+            memory,
+            vec![(0, log_event("a", 3600)), (1200, log_event("b", 3600))],
+            1200,
+        )
+        .await;
+
+        assert!(find(&table, "a").is_some());
+        assert!(find(&table, "b").is_some());
+        assert!(failed_ticks(&table) >= 2);
+    }
+
+    #[test]
+    fn a_panic_during_a_write_does_not_stop_later_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let memory = Memory::new(persist_config(&path));
+        let persistence = Arc::clone(memory.persistence.as_ref().unwrap());
+        _ = std::thread::spawn(move || {
+            let _guard = persistence.lock().unwrap();
+            panic!("a write panicked");
+        })
+        .join();
+        assert!(memory.persistence.as_ref().unwrap().is_poisoned());
+
+        memory.handle_value(ObjectMap::from([("a".into(), Value::from(1))]));
+        persist_now(&memory);
+
+        assert_eq!(failed_ticks(&memory), 0);
+        assert_eq!(log_lines(&path), 1);
+    }
+
+    #[test]
+    fn writes_the_status_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.persist_path = Some(path.clone());
+            c.max_byte_size = Some(1 << 20);
+        }));
+        memory.handle_value(ObjectMap::from([
+            ("a".into(), Value::from(1)),
+            ("b".into(), Value::from(2)),
+        ]));
+        let before = persist::unix_now();
+        persist_now(&memory);
+
+        let status = read_status(&path);
+        let last = status.last_snapshot_unix.unwrap();
+        assert!(last >= before && last <= persist::unix_now());
+        assert_eq!(
+            status,
+            persist::StatusFile {
+                entries: 2,
+                bytes: memory.live_byte_size(),
+                max_bytes: Some(1 << 20),
+                evictions_total: 0,
+                persist_failing: false,
+                failed_ticks: 0,
+                last_snapshot_unix: Some(last),
+            }
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(persist::status_path(&path)).unwrap()).unwrap();
+        let mut keys: Vec<_> = raw.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "bytes",
+                "entries",
+                "evictions_total",
+                "failed_ticks",
+                "last_snapshot_unix",
+                "max_bytes",
+                "persist_failing"
+            ]
+        );
     }
 }

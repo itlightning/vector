@@ -1,0 +1,33 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Windows Firewall With Advanced Security" Guid="{d1bc9aff-2abf-4d71-9146-ecb2a986eb85}"/>
+    <EventID>2004</EventID>
+    <Version>0</Version>
+    <Level>4</Level>
+    <Task>0</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8000000000000000</Keywords>
+    <TimeCreated SystemTime="2026-08-07T14:03:11.1234567Z"/>
+    <EventRecordID>91827</EventRecordID>
+    <Correlation/>
+    <Execution ProcessID="1180" ThreadID="2244"/>
+    <Channel>ForwardedEvents</Channel>
+    <Computer>WORKSTATION-07.example.test</Computer>
+    <Security UserID="S-1-5-18"/>
+  </System>
+  <EventData>
+    <Data Name="ServiceName">MpsSvc</Data>
+    <Data Name="NewState">Running</Data>
+  </EventData>
+  <RenderingInfo Culture="en-US">
+    <Message>The Windows Firewall service entered the running state.</Message>
+    <Level>Information</Level>
+    <Task>Service state change</Task>
+    <Opcode>Info</Opcode>
+    <Channel>ForwardedEvents</Channel>
+    <Provider>Microsoft-Windows-Windows Firewall With Advanced Security</Provider>
+    <Keywords>
+      <Keyword>Classic</Keyword>
+    </Keywords>
+  </RenderingInfo>
+</Event>

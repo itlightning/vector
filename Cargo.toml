@@ -234,7 +234,7 @@ vector-common-macros = { path = "lib/vector-common-macros" }
 vector-lib = { path = "lib/vector-lib", default-features = false, features = ["vrl"] }
 vector-vrl-category = { path = "lib/vector-vrl/category" }
 vector-vrl-functions = { path = "lib/vector-vrl/functions", default-features = false }
-vrl = { git = "https://github.com/vectordotdev/vrl.git", branch = "main", default-features = false, features = ["arbitrary", "cli", "test", "test_framework", "stdlib-base"] }
+vrl = { git = "https://github.com/itlightning/vrl.git", rev = "b675acea035ea76363c7689f59baee312f45979d", default-features = false, features = ["arbitrary", "cli", "test", "test_framework", "stdlib-base"] }
 zstd = { version = "0.13.0", default-features = false }
 mock_instant = { version = "0.6" }
 serial_test = { version = "3.4" }
@@ -428,6 +428,10 @@ libc.workspace = true
 lru = { version = "0.16.3", default-features = false }
 maxminddb = { version = "0.27.0", default-features = false, optional = true, features = ["simdutf8"] }
 md-5 = { version = "0.10", default-features = false, optional = true }
+# Profiling-only allocator (see the `mimalloc-pprof` feature). Builds mimalloc with
+# MI_PPROF=ON, which costs roughly +70% per allocation even while profiling is disabled,
+# so it must never be enabled in a shipping build.
+mimalloc-pprof = { version = "0.9.2", optional = true }
 mongodb = { version = "3.7.0", default-features = false, optional = true, features = ["compat-3-0-0", "dns-resolver", "rustls-tls"] }
 async-nats = { version = "0.49.0", default-features = false, optional = true, features = ["ring", "websockets", "jetstream", "nkeys"] }
 nkeys = { version = "0.4.5", default-features = false, optional = true }
@@ -481,7 +485,11 @@ byteorder = "1.5.0"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }
 windows-service = "0.8.0"
-windows = { version = "0.58", features = ["Win32_System_EventLog", "Win32_Foundation", "Win32_System_Com", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem"], optional = true }
+# Win32_System_Rpc supplies the RPC_S_* status constants the windows_event_log
+# source classifies EvtNext failures against. Binding them beats transcribing
+# them: every one of the four constants this source originally hand-copied was
+# wrong, and one of those errors wedged a production agent for nine hours.
+windows = { version = "0.58", features = ["Win32_System_EventLog", "Win32_Foundation", "Win32_System_Com", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Rpc"], optional = true }
 quick-xml = { version = "0.31", default-features = false, features = ["serialize"], optional = true }
 rdkafka = { workspace = true, features = ["cmake_build"], optional = true }
 
@@ -545,6 +553,16 @@ ntapi = { git = "https://github.com/MSxDOS/ntapi.git", rev = "24fc1e47677fc9f6e3
 # table below). Local dev builds skip it so they don't need `libsasl2-dev` / cyrus-sasl
 # installed, and so rdkafka's build script doesn't link GSSAPI.
 default = ["enable-api-client", "sources-dnstap", "tikv-jemallocator"]
+
+# Per-component allocation attribution: wraps the global allocator so every allocation
+# carries the id of the group that made it, and the deallocation path credits that same
+# group. Off by default and platform independent; the allocation header changes the
+# layout, so tracking can only be armed at process start, never on a live process.
+allocation-tracing = []
+# Use mimalloc built with pprof heap sampling as the global allocator. Profiling only:
+# the profiling build pays a large per-allocation cost even with sampling disabled.
+mimalloc-pprof = ["dep:mimalloc-pprof"]
+
 antithesis-scenario-memory = ["dep:antithesis-instrumentation"]
 antithesis-scenario-disk = ["dep:antithesis-instrumentation", "vector-lib/antithesis-disk-asserts"]
 # Default features for `cargo docs`. We're not using `gssapi` which would require installing libsasl2 in our doc environment.
@@ -624,6 +642,7 @@ api = [
   "dep:prost-types",
   "protobuf-build",
   "vector-lib/api",
+  "vector-lib/grpc",
 ]
 
 # API client
@@ -800,7 +819,7 @@ sources-websocket = ["dep:tokio-tungstenite"]
 sources-windows_event_log = ["dep:windows", "dep:quick-xml", "dep:governor"]
 sources-windows_event_log-integration-tests = ["sources-windows_event_log"]
 
-sources-vector = ["dep:prost", "dep:tonic", "dep:tonic-health", "protobuf-build"]
+sources-vector = ["dep:prost", "dep:tonic", "dep:tonic-health", "protobuf-build", "vector-lib/grpc"]
 
 # Transforms
 transforms = ["transforms-logs", "transforms-metrics"]
@@ -982,7 +1001,7 @@ sinks-socket = ["sinks-utils-udp"]
 sinks-splunk_hec = []
 sinks-statsd = ["sinks-utils-udp", "tokio-util/net"]
 sinks-utils-udp = []
-sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost"]
+sinks-vector = ["sinks-utils-udp", "dep:tonic", "protobuf-build", "dep:prost", "vector-lib/grpc"]
 sinks-websocket = ["dep:tokio-tungstenite"]
 sinks-websocket-server = ["dep:tokio-tungstenite", "sources-utils-http-auth", "sources-utils-http-error", "sources-utils-http-prelude"]
 sinks-webhdfs = ["dep:opendal"]

@@ -34,6 +34,9 @@ async fn experiment(actions: Vec<FileWatcherAction>) {
         None,
         100_000,
         Bytes::from("\n"),
+        &crate::FileEncodingMode::Fixed {
+            encoding_name: None,
+        },
     )
     .await
     .expect("must be able to create");

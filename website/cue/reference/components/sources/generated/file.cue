@@ -39,22 +39,88 @@ generated: components: sources: file: configuration: {
 	encoding: {
 		description: "Character set encoding."
 		required:    false
-		type: object: options: charset: {
-			description: """
-				Encoding of the source messages.
+		type: object: options: {
+			auto_detect_idle_timeout_secs: {
+				description: """
+					Seconds a file may stay Pending (below `auto_detect_min_bytes`) before force-deciding.
 
-				Takes one of the encoding [label strings](https://encoding.spec.whatwg.org/#concept-encoding-get) defined as
-				part of the [Encoding Standard](https://encoding.spec.whatwg.org/).
+					Only valid when `charset` is `auto`. Defaults to 30. Post-timeout decisions use a
+					best-effort sniff window and may be lower confidence than a full `min_bytes` window.
+					"""
+				required: false
+				type: uint: {
+					examples: [30]
+					unit: "seconds"
+				}
+			}
+			auto_detect_max_bytes: {
+				description: """
+					Maximum number of bytes peeked from offset 0 for auto-detection.
 
-				When set, the messages are transcoded from the specified encoding to UTF-8, which is the encoding that is
-				assumed internally for string-like data. Enable this transcoding operation if you need your data to
-				be in UTF-8 for further processing. At the time of transcoding, any malformed sequences (that can't be mapped to
-				UTF-8) is replaced with the Unicode [REPLACEMENT
-				CHARACTER](https://en.wikipedia.org/wiki/Specials_(Unicode_block)#Replacement_character) and warnings are
-				logged.
-				"""
-			required: true
-			type: string: examples: ["utf-16le", "utf-16be"]
+					Only valid when `charset` is `auto`. Defaults to 2048. Clamped to at most 65536.
+					"""
+				required: false
+				type: uint: {
+					examples: [2048, 8192]
+					unit: "bytes"
+				}
+			}
+			auto_detect_min_bytes: {
+				description: """
+					Minimum number of bytes (from offset 0) required before non-BOM auto-detection decides.
+
+					Below this size without a BOM, the file stays pending (no lines emitted) until it grows.
+					Only valid when `charset` is `auto`. Defaults to 128. Clamped to at least 32.
+					"""
+				required: false
+				type: uint: {
+					examples: [128, 1024]
+					unit: "bytes"
+				}
+			}
+			charset: {
+				description: """
+					Encoding of the source messages.
+
+					Takes one of the encoding [label strings](https://encoding.spec.whatwg.org/#concept-encoding-get)
+					defined as part of the [Encoding Standard](https://encoding.spec.whatwg.org/), or the special
+					value `auto` to detect the encoding per file (BOM, then UTF-16, then UTF-8, then
+					`fallback_charset`).
+
+					When set to an explicit label, the messages are transcoded from the specified encoding to
+					UTF-8, which is the encoding that is assumed internally for string-like data. Enable this
+					transcoding operation if you need your data to be in UTF-8 for further processing. At the
+					time of transcoding, any malformed sequences (that can't be mapped to UTF-8) is replaced
+					with the Unicode [REPLACEMENT
+					CHARACTER](https://en.wikipedia.org/wiki/Specials_(Unicode_block)#Replacement_character) and
+					warnings are logged.
+
+					When set to `auto`, a leading BOM is stripped from decoded output (same behavior as an
+					explicit charset that goes through the decoder).
+					"""
+				required: true
+				type: string: examples: ["utf-16le", "utf-16be", "auto"]
+			}
+			fallback_charset: {
+				description: """
+					Fallback encoding used when `charset` is `auto` and detection is inconclusive.
+
+					Only valid when `charset` is `auto`. Defaults to `utf-8`.
+					"""
+				required: false
+				type: string: examples: ["utf-8"]
+			}
+			max_replacement_ratio: {
+				description: """
+					Reject a file when the fraction of U+FFFD replacements in the sniff window meets or exceeds
+					this ratio under the chosen charset.
+
+					Set to `0` to disable the reject gate. Only valid when `charset` is `auto`. Defaults to
+					`0.33`. A leading BOM is excluded from the replacement-ratio calculation.
+					"""
+				required: false
+				type: float: examples: [0.33, 0.0]
+			}
 		}
 	}
 	exclude: {

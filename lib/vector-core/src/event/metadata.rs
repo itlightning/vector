@@ -1,6 +1,12 @@
 #![deny(missing_docs)]
 
-use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 use derivative::Derivative;
 use lookup::OwnedTargetPath;
@@ -53,6 +59,13 @@ pub(super) struct Inner {
 
     /// The id of the source
     pub(crate) source_id: Option<Arc<ComponentKey>>,
+
+    /// `source_id` in the form VRL reads it as `%vector.source_id`.
+    /// Built on first read and dropped whenever `source_id` is set, so an event no
+    /// program reads the source id from never pays for it.
+    #[serde(default, skip)]
+    #[derivative(PartialEq = "ignore")]
+    pub(crate) source_id_value: OnceLock<Value>,
 
     /// The type of the source
     pub(crate) source_type: Option<Cow<'static, str>>,
@@ -194,9 +207,27 @@ impl EventMetadata {
         self.inner.upstream_id.as_deref()
     }
 
+    /// Returns the source component id as a VRL value, or `None` when the event did
+    /// not come from a source. This backs the read-only `%vector.source_id` path.
+    ///
+    /// The id is deliberately not stored in the metadata value map: the presence of a
+    /// `vector` key there is what marks an event as using the Vector log namespace, so
+    /// writing it would reclassify every legacy-namespace event.
+    #[must_use]
+    pub fn source_id_value(&self) -> Option<&Value> {
+        let source_id = self.inner.source_id.as_ref()?;
+        Some(
+            self.inner
+                .source_id_value
+                .get_or_init(|| Value::from(source_id.id())),
+        )
+    }
+
     /// Sets the `source_id` in the metadata to the provided value.
     pub fn set_source_id(&mut self, source_id: Arc<ComponentKey>) {
-        self.get_mut().source_id = Some(source_id);
+        let inner = self.get_mut();
+        inner.source_id = Some(source_id);
+        inner.source_id_value = OnceLock::new();
     }
 
     /// Sets the `source_type` in the metadata to the provided value.
@@ -272,6 +303,7 @@ impl Default for Inner {
             finalizers: Default::default(),
             schema_definition: default_schema_definition(),
             source_id: None,
+            source_id_value: OnceLock::new(),
             source_type: None,
             upstream_id: None,
             dropped_fields: ObjectMap::new(),
