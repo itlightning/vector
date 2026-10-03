@@ -119,6 +119,11 @@ pub struct WindowsEvent {
     /// How `rendered_message` was obtained, or would have to be reconstructed.
     /// Authoritative for consumers; see [`MessageSource`].
     pub message_source: MessageSource,
+    /// The record's `<Binary>` payload, verbatim, when its provider is listed
+    /// in `binary_providers`. Shipped as the top-level `binary_data` field,
+    /// apart from `event_data`, where a provider template may declare its own
+    /// `Binary` field.
+    pub binary_data: Option<String>,
 }
 
 impl WindowsEvent {
@@ -444,6 +449,11 @@ pub fn build_event(
     }
 
     let event_data_result = extract_event_data(&xml, config);
+    let binary_data = if config.keeps_binary(&system_fields.provider_name) {
+        extract_binary(&xml, config.max_event_data_length)
+    } else {
+        None
+    };
 
     let message_source = if rendered_message.is_some() {
         MessageSource::Publisher
@@ -493,6 +503,7 @@ pub fn build_event(
         qualifiers: system_fields.qualifiers,
         string_inserts: event_data_result.string_inserts,
         message_source,
+        binary_data,
     };
 
     Ok(Some(event))
@@ -625,6 +636,55 @@ fn parse_section(
 /// Check if bookmark XML is valid (contains an actual bookmark position).
 pub fn is_valid_bookmark_xml(xml: &str) -> bool {
     !xml.is_empty() && xml.contains("<Bookmark") && xml.contains("RecordId")
+}
+
+/// The `<Binary>` text inside `EventData`, verbatim as Windows renders it.
+///
+/// `None` when the record has no payload, an empty one, or one longer than a
+/// nonzero `max_len`: a cut hex string would decode to the wrong bytes, so an
+/// over-long payload is dropped whole. A separate pass from the EventData
+/// parse, run only for providers that asked for the payload.
+fn extract_binary(xml: &str, max_len: usize) -> Option<String> {
+    const MAX_ITERATIONS: usize = 500;
+    const MAX_VALUE_SIZE: usize = 1024 * 1024;
+    let max_len = if max_len == 0 {
+        MAX_VALUE_SIZE
+    } else {
+        max_len.min(MAX_VALUE_SIZE)
+    };
+
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(false);
+    let mut buf = Vec::new();
+    let mut in_event_data = false;
+    let mut in_binary = false;
+    let mut hex = String::new();
+
+    for _ in 0..MAX_ITERATIONS {
+        match reader.read_event_into(&mut buf) {
+            Ok(XmlEvent::Start(ref e)) => match e.name().as_ref() {
+                b"EventData" => in_event_data = true,
+                b"Binary" if in_event_data => in_binary = true,
+                _ => {}
+            },
+            Ok(XmlEvent::Text(ref e)) if in_binary => {
+                let text = e.unescape().ok()?;
+                if hex.len() + text.len() > max_len {
+                    return None;
+                }
+                hex.push_str(&text);
+            }
+            Ok(XmlEvent::End(ref e)) => match e.name().as_ref() {
+                b"Binary" if in_binary => return (!hex.is_empty()).then_some(hex),
+                b"EventData" => return None,
+                _ => {}
+            },
+            Ok(XmlEvent::Eof) | Err(_) => return None,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
 }
 
 /// Extract a single element's text content by tag name.
@@ -894,6 +954,7 @@ mod tests {
             qualifiers: Some(0),
             string_inserts: vec![],
             message_source: MessageSource::Publisher,
+            binary_data: None,
         };
 
         assert_eq!(event.level_name(), "Error");
@@ -931,6 +992,7 @@ mod tests {
             qualifiers: Some(0),
             string_inserts: vec![],
             message_source: MessageSource::Publisher,
+            binary_data: None,
         };
 
         assert_eq!(event.level_name(), "Information");
