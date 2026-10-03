@@ -281,6 +281,16 @@ impl EventLogParser {
             log_event.insert(event_path!("string_inserts"), Value::Array(string_inserts));
         }
 
+        // Only for providers listed in `binary_providers`. Top level rather than
+        // in `event_data`, where a provider template may declare a `Binary`
+        // field of its own.
+        if let Some(ref binary_data) = event.binary_data {
+            log_event.insert(
+                event_path!("binary_data"),
+                Value::Bytes(binary_data.clone().into()),
+            );
+        }
+
         // Include raw XML if requested
         if self.config.include_xml && !event.raw_xml.is_empty() {
             log_event.insert(
@@ -577,6 +587,7 @@ mod tests {
             qualifiers: Some(0),
             string_inserts: vec!["value1".to_string(), "value2".to_string()],
             message_source: MessageSource::Publisher,
+            binary_data: None,
         }
     }
 
@@ -672,6 +683,7 @@ mod tests {
             qualifiers: None,
             string_inserts: vec![],
             message_source: MessageSource::Publisher,
+            binary_data: None,
         };
 
         let log_event = parser.parse_event(event).unwrap();

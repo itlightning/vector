@@ -37,6 +37,7 @@ fn create_test_config() -> WindowsEventLogConfig {
         status_path: None,
         status_interval_secs: 30,
         suppress_ids: Default::default(),
+        binary_providers: Vec::new(),
     }
 }
 
@@ -97,6 +98,7 @@ fn create_test_event() -> WindowsEvent {
         qualifiers: Some(0),
         string_inserts: vec!["admin".to_string(), "2".to_string()],
         message_source: MessageSource::Publisher,
+        binary_data: None,
     }
 }
 
@@ -1928,5 +1930,204 @@ mod ack_drain_tests {
         .expect("sync-mode drain must not block shutdown");
 
         _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[cfg(test)]
+mod binary_payload_tests {
+    use super::*;
+
+    /// A Service Control Manager 7031 as the Event Log renders it (Windows 11
+    /// build 26200), host name replaced.
+    const SCM_7031_FIXTURE: &str = include_str!("testdata/scm_7031_binary.xml");
+    /// The fixture's payload: the service key `WSearch` as UTF-16LE with its
+    /// terminator.
+    const SCM_7031_BINARY: &str = "57005300650061007200630068000000";
+    const SCM: &str = "Service Control Manager";
+
+    fn keeping(providers: &[&str]) -> WindowsEventLogConfig {
+        WindowsEventLogConfig {
+            binary_providers: providers.iter().map(|name| name.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn parse(xml: &str, config: &WindowsEventLogConfig) -> WindowsEvent {
+        parse_event_xml(xml.to_string(), "System", config, None)
+            .expect("the record parses")
+            .expect("the record is not filtered")
+    }
+
+    fn to_log(event: WindowsEvent, config: &WindowsEventLogConfig) -> vector_lib::event::LogEvent {
+        EventLogParser::new(config, LogNamespace::Legacy)
+            .parse_event(event)
+            .expect("the event converts")
+    }
+
+    fn message(log: &vector_lib::event::LogEvent) -> String {
+        log.get(event_path!("message"))
+            .and_then(Value::as_str)
+            .expect("a message is always set")
+            .into_owned()
+    }
+
+    #[test]
+    fn binary_is_dropped_unless_the_provider_is_listed() {
+        for config in [
+            WindowsEventLogConfig::default(),
+            keeping(&["Application Error"]),
+        ] {
+            let event = parse(SCM_7031_FIXTURE, &config);
+            assert_eq!(event.binary_data, None);
+            assert_eq!(event.event_data.len(), 5);
+            assert_eq!(
+                event.event_data.get("param1").map(String::as_str),
+                Some("Windows Search")
+            );
+            let log = to_log(event, &config);
+            assert!(log.get(event_path!("binary_data")).is_none());
+            assert!(log.get(event_path!("event_data", "Binary")).is_none());
+        }
+    }
+
+    #[test]
+    fn binary_is_kept_verbatim_for_a_listed_provider() {
+        for listed in [SCM, "service control MANAGER"] {
+            let config = keeping(&["Application Error", listed]);
+            let event = parse(SCM_7031_FIXTURE, &config);
+            assert_eq!(
+                event.binary_data.as_deref(),
+                Some(SCM_7031_BINARY),
+                "{listed}"
+            );
+            assert_eq!(event.event_data.len(), 5, "event_data is untouched");
+            assert!(!event.event_data.contains_key("Binary"));
+            assert!(event.string_inserts.is_empty());
+
+            let log = to_log(event, &config);
+            assert_eq!(
+                log.get(event_path!("binary_data")),
+                Some(&Value::Bytes(SCM_7031_BINARY.into()))
+            );
+            assert!(log.get(event_path!("event_data", "Binary")).is_none());
+        }
+    }
+
+    /// A template may declare its own `Binary` data field. It stays in
+    /// `event_data` exactly as the template wrote it, and the record blob
+    /// rides beside it as `binary_data`.
+    #[test]
+    fn a_template_binary_field_and_the_record_blob_stay_apart() {
+        let config = keeping(&[SCM]);
+        let xml = SCM_7031_FIXTURE.replace(
+            "<Data Name='param1'>",
+            "<Data Name='Binary'>template value</Data><Data Name='param1'>",
+        );
+        let event = parse(&xml, &config);
+        assert_eq!(
+            event.event_data.get("Binary").map(String::as_str),
+            Some("template value")
+        );
+        assert_eq!(event.binary_data.as_deref(), Some(SCM_7031_BINARY));
+
+        let log = to_log(event, &config);
+        assert_eq!(
+            log.get(event_path!("event_data", "Binary")),
+            Some(&Value::Bytes("template value".into()))
+        );
+        assert_eq!(
+            log.get(event_path!("binary_data")),
+            Some(&Value::Bytes(SCM_7031_BINARY.into()))
+        );
+    }
+
+    /// A cut hex string decodes to the wrong bytes, so a payload over the value
+    /// limit is dropped whole while the other values are truncated as usual.
+    #[test]
+    fn binary_over_the_value_limit_is_dropped_whole() {
+        let mut config = keeping(&[SCM]);
+        config.max_event_data_length = SCM_7031_BINARY.len() - 1;
+        assert_eq!(parse(SCM_7031_FIXTURE, &config).binary_data, None);
+
+        config.max_event_data_length = SCM_7031_BINARY.len();
+        assert_eq!(
+            parse(SCM_7031_FIXTURE, &config).binary_data.as_deref(),
+            Some(SCM_7031_BINARY)
+        );
+    }
+
+    /// Only a `<Binary>` directly in `EventData` with text is a payload.
+    #[test]
+    fn binary_is_read_only_from_event_data() {
+        let record = |body: &str| {
+            format!(
+                "<Event><System><Provider Name='{SCM}'/><EventID>7031</EventID>\
+                 <EventRecordID>1</EventRecordID></System>{body}</Event>"
+            )
+        };
+        let config = keeping(&[SCM]);
+        let cases = [
+            ("<EventData><Data Name='param1'>x</Data></EventData>", None),
+            ("<EventData><Binary></Binary></EventData>", None),
+            ("<EventData><Binary/></EventData>", None),
+            ("<UserData><Binary>0A00</Binary></UserData>", None),
+            ("<EventData></EventData><Binary>0A00</Binary>", None),
+            ("<EventData><Binary>0A00</Binary></EventData>", Some("0A00")),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(
+                parse(&record(body), &config).binary_data.as_deref(),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    /// Without a publisher message the text is built from the record's data,
+    /// and the kept blob never reaches it.
+    #[test]
+    fn a_kept_binary_never_enters_the_fallback_message() {
+        let config = keeping(&[SCM]);
+        let event = parse(SCM_7031_FIXTURE, &config);
+        assert_eq!(event.message_source, MessageSource::None);
+        let log = to_log(event, &config);
+        assert_eq!(
+            message(&log),
+            "no description; provider Service Control Manager is not registered on this host"
+        );
+
+        // Beside a message-named value and beside positional inserts, the two
+        // places the fallback reads, the blob still stays out.
+        let xml = SCM_7031_FIXTURE.replace(
+            "<Data Name='param1'>",
+            "<Data Name='Message'>stopped</Data><Data Name='param1'>",
+        );
+        let log = to_log(parse(&xml, &config), &config);
+        assert_eq!(
+            message(&log),
+            "stopped | no description; provider Service Control Manager is not registered on this host"
+        );
+        let xml = SCM_7031_FIXTURE.replace("<Data Name='param1'>", "<Data>");
+        let log = to_log(parse(&xml, &config), &config);
+        let text = message(&log);
+        assert!(text.starts_with("Windows Search | "), "{text}");
+        assert!(!text.contains(SCM_7031_BINARY), "{text}");
+    }
+
+    /// A rendered publisher message is used as is; the blob is never appended.
+    #[test]
+    fn a_kept_binary_never_enters_the_rendered_message() {
+        let config = keeping(&[SCM]);
+        let rendered = "The Windows Search service terminated unexpectedly.".to_string();
+        let event = parse_event_xml(
+            SCM_7031_FIXTURE.to_string(),
+            "System",
+            &config,
+            Some(rendered.clone()),
+        )
+        .expect("the record parses")
+        .expect("the record is not filtered");
+        assert_eq!(event.binary_data.as_deref(), Some(SCM_7031_BINARY));
+        assert_eq!(message(&to_log(event, &config)), rendered);
     }
 }

@@ -22,6 +22,7 @@ const MAX_STATUS_INTERVAL_SECS: u64 = 3600;
 pub(super) const MAX_SUPPRESS_PROVIDERS_PER_CHANNEL: usize = 4;
 pub(super) const MAX_SUPPRESS_IDS_PER_CHANNEL: usize = 64;
 const MAX_SUPPRESS_PROVIDER_LENGTH: usize = 128;
+const MAX_BINARY_PROVIDERS: usize = 16;
 
 /// The `channel` value on internal events raised for a failure that belongs to
 /// the source rather than to any single channel.
@@ -255,6 +256,19 @@ pub struct WindowsEventLogConfig {
     ))]
     pub suppress_ids: BTreeMap<String, Vec<SuppressRule>>,
 
+    /// Providers whose records keep their `<Binary>` payload.
+    ///
+    /// A record from a listed provider carries its `<Binary>` element as the
+    /// top-level `binary_data` field: the hex text exactly as Windows renders
+    /// it. Every other record drops it, which is the default for all providers.
+    /// `event_data` is unchanged either way, including a template field named
+    /// `Binary`. Matching on the provider name is case-insensitive, and names
+    /// follow the `suppress_ids` provider rules. A payload longer than a
+    /// nonzero `max_event_data_length` is dropped whole, never truncated.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "Service Control Manager"))]
+    pub binary_providers: Vec<String>,
+
     /// Controls how acknowledgements are handled for this source.
     ///
     /// When enabled, the source will wait for downstream sinks to acknowledge
@@ -380,6 +394,7 @@ impl Default for WindowsEventLogConfig {
             status_path: None,
             status_interval_secs: default_status_interval_secs(),
             suppress_ids: BTreeMap::new(),
+            binary_providers: Vec::new(),
             acknowledgements: Default::default(),
         }
     }
@@ -396,6 +411,16 @@ impl WindowsEventLogConfig {
         } else {
             std::time::Duration::from_secs(self.subscription_refresh_secs)
         }
+    }
+
+    /// Whether records from `provider` keep their `<Binary>` payload.
+    ///
+    /// Listed names are ASCII by validation, so an ASCII case fold is the
+    /// whole of case-insensitive matching.
+    pub(super) fn keeps_binary(&self, provider: &str) -> bool {
+        self.binary_providers
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(provider))
     }
 }
 
@@ -670,6 +695,7 @@ impl WindowsEventLogConfig {
         }
 
         self.validate_suppress_ids()?;
+        self.validate_binary_providers()?;
 
         Ok(())
     }
@@ -704,7 +730,7 @@ impl WindowsEventLogConfig {
                 .into());
             }
             for (index, rule) in rules.iter().enumerate() {
-                if !is_valid_suppress_provider(&rule.provider) {
+                if !is_valid_provider_name(&rule.provider) {
                     return Err(format!(
                         "suppress_ids provider '{}' for channel '{channel}' is not a valid provider name",
                         rule.provider
@@ -734,11 +760,36 @@ impl WindowsEventLogConfig {
         }
         Ok(())
     }
+
+    fn validate_binary_providers(&self) -> Result<(), crate::Error> {
+        if self.binary_providers.len() > MAX_BINARY_PROVIDERS {
+            return Err(format!(
+                "binary_providers names {} providers, maximum is {MAX_BINARY_PROVIDERS}",
+                self.binary_providers.len()
+            )
+            .into());
+        }
+        for (index, provider) in self.binary_providers.iter().enumerate() {
+            if !is_valid_provider_name(provider) {
+                return Err(format!(
+                    "binary_providers names '{provider}', which is not a valid provider name"
+                )
+                .into());
+            }
+            if self.binary_providers[..index]
+                .iter()
+                .any(|earlier| earlier.eq_ignore_ascii_case(provider))
+            {
+                return Err(format!("binary_providers names provider '{provider}' twice").into());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}$`: nothing that needs escaping inside
-/// the XPath string literal the name is composed into.
-fn is_valid_suppress_provider(name: &str) -> bool {
+/// the XPath string literal a suppress rule's name is composed into.
+fn is_valid_provider_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
         && name.len() <= MAX_SUPPRESS_PROVIDER_LENGTH
@@ -901,6 +952,7 @@ mod tests {
             status_path: Some(PathBuf::from("/test/data/status.json")),
             status_interval_secs: 30,
             suppress_ids: BTreeMap::new(),
+            binary_providers: vec!["Service Control Manager".to_string()],
             acknowledgements: SourceAcknowledgementsConfig::from(true),
         };
 
@@ -922,6 +974,7 @@ mod tests {
         assert_eq!(config.batch_size, deserialized.batch_size);
         assert_eq!(config.render_message, deserialized.render_message);
         assert_eq!(config.status_path, deserialized.status_path);
+        assert_eq!(config.binary_providers, deserialized.binary_providers);
         assert_eq!(
             config.status_interval_secs,
             deserialized.status_interval_secs
@@ -1129,6 +1182,64 @@ mod tests {
                 config.validate()
             );
         }
+    }
+
+    /// Every bound on `binary_providers`, accepted at the limit and rejected one
+    /// past it. Names share the `suppress_ids` provider rules.
+    #[test]
+    fn binary_providers_validation_table() {
+        let sixteen: Vec<String> = (0..16).map(|n| format!("P{n}")).collect();
+        let seventeen: Vec<String> = (0..17).map(|n| format!("P{n}")).collect();
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect();
+
+        let rows: Vec<(&str, Vec<String>, bool)> = vec![
+            ("empty list", Vec::new(), true),
+            ("one provider", names(&["Service Control Manager"]), true),
+            ("sixteen providers", sixteen, true),
+            ("seventeen providers", seventeen, false),
+            ("duplicate provider", names(&["A", "A"]), false),
+            (
+                "duplicate provider in another case",
+                names(&["Ab", "aB"]),
+                false,
+            ),
+            ("empty provider", names(&[""]), false),
+            ("provider with an apostrophe", names(&["A'B"]), false),
+            ("provider with a non-ASCII letter", names(&["Aé"]), false),
+        ];
+
+        for (name, binary_providers, valid) in rows {
+            let config = WindowsEventLogConfig {
+                binary_providers,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.validate().is_ok(),
+                valid,
+                "{name}: {:?}",
+                config.validate()
+            );
+        }
+    }
+
+    /// Absent keeps no payload for any provider; a listed name matches in any case.
+    #[test]
+    fn binary_providers_parse_and_match() {
+        let absent: WindowsEventLogConfig =
+            toml::from_str("channels = [\"System\"]").expect("minimal config must parse");
+        assert!(absent.binary_providers.is_empty());
+        assert!(!absent.keeps_binary("Service Control Manager"));
+
+        let parsed: WindowsEventLogConfig = toml::from_str(
+            "channels = [\"System\"]\n\
+             binary_providers = [\"Service Control Manager\"]\n",
+        )
+        .expect("a provider list must parse");
+        assert!(parsed.validate().is_ok());
+        assert!(parsed.keeps_binary("Service Control Manager"));
+        assert!(parsed.keeps_binary("service control MANAGER"));
+        assert!(!parsed.keeps_binary("Service Control"));
+        assert!(!parsed.keeps_binary("Microsoft-Windows-Kernel-General"));
     }
 
     /// Absent is empty, and a rendered rule parses into the typed shape.
