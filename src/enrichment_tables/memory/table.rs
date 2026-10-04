@@ -1,7 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)] // TODO review ShallowCopy usage code and fix properly.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -14,6 +14,7 @@ use evmap::{
 };
 use evmap_derive::ShallowCopy;
 use futures::{StreamExt, stream::BoxStream};
+use serde::{Deserialize, Serialize};
 use thread_local::ThreadLocal;
 use tokio::{
     sync::broadcast::{Receiver, Sender},
@@ -23,7 +24,7 @@ use tokio_stream::wrappers::IntervalStream;
 use vector_lib::{
     ByteSizeOf, EstimatedJsonEncodedSizeOf,
     config::LogNamespace,
-    enrichment::{Case, Condition, Error, IndexHandle, InternalError, Table},
+    enrichment::{Case, Claim, ClaimOutcome, Condition, Error, IndexHandle, InternalError, Table},
     event::{Event, EventStatus, Finalizable},
     internal_event::{
         ByteSize, BytesSent, CountByteSize, EventsSent, InternalEventHandle, Output, Protocol,
@@ -126,10 +127,80 @@ pub(super) struct MemoryEntryPair {
     pub(super) entry: MemoryEntry,
 }
 
+/// Rows the look-aside holds before a write publishes them. Bounds both the look-aside and
+/// how stale a reader of a table written faster than its flush interval can be.
+const LOOK_ASIDE_CAP: usize = 128;
+
+/// The value a claim stores for its key.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct ClaimRow {
+    window_secs: u64,
+    ttl_secs: u64,
+    passed: u64,
+    suppressed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<Value>,
+}
+
+/// A live claim row, as the next claim on its key reads it.
+struct PriorClaim {
+    row: ClaimRow,
+    /// The window's start and the row's lifetime, kept on every rewrite so the window never
+    /// moves.
+    update_time: Instant,
+    ttl: u64,
+    in_window: bool,
+}
+
+impl PriorClaim {
+    /// None for an expired row, or for one that is not a claim row, which the claim replaces.
+    fn read(entry: &MemoryEntry, now: Instant) -> Option<Self> {
+        if entry.expired(now) {
+            return None;
+        }
+        let row: ClaimRow = serde_json::from_str(&entry.value).ok()?;
+        // The window is the head of the row's life and the carry period its tail. Measured
+        // back from the expiry rather than forward from the start, because a row restored from
+        // persistence keeps its expiry but not its start.
+        let carry = Duration::from_secs(row.ttl_secs.saturating_sub(row.window_secs));
+        let in_window = entry
+            .update_time
+            .checked_add(Duration::from_secs(entry.ttl))
+            .is_none_or(|expiry| expiry.saturating_duration_since(now) > carry);
+        Some(Self {
+            row,
+            update_time: *entry.update_time,
+            ttl: entry.ttl,
+            in_window,
+        })
+    }
+}
+
 // Used to ensure that these 2 are locked together
 pub(super) struct MemoryWriter {
     pub(super) write_handle: evmap::WriteHandle<String, MemoryEntry>,
     metadata: MemoryMetadata,
+    /// Every row written since the last publish, which readers cannot see yet. A claim reads
+    /// it first, so it sees writes that are not published.
+    recent: HashMap<String, MemoryEntry>,
+}
+
+impl MemoryWriter {
+    /// Publishes pending writes to readers. Every publish goes through here, because the
+    /// look-aside must hold exactly the rows written since the last one.
+    pub(super) fn publish(&mut self) {
+        self.write_handle.refresh();
+        self.recent.clear();
+    }
+
+    /// The row for `key` as the next publish will leave it, apart from removals, which are
+    /// always published before the writer lock is released.
+    fn latest<R>(&self, key: &str, f: impl FnOnce(Option<&MemoryEntry>) -> R) -> R {
+        match self.recent.get(key) {
+            Some(entry) => f(Some(entry)),
+            None => f(self.write_handle.get_one(key).as_deref()),
+        }
+    }
 }
 
 /// A struct that implements [vector_lib::enrichment::Table] to handle loading enrichment data from a memory structure.
@@ -169,6 +240,7 @@ impl Memory {
             write_handle: Arc::new(Mutex::new(MemoryWriter {
                 write_handle,
                 metadata: MemoryMetadata::default(),
+                recent: HashMap::new(),
             })),
             expired_items_sender: expired_tx,
             expired_items_receiver: expired_rx,
@@ -203,7 +275,7 @@ impl Memory {
                 },
             );
         }
-        writer.write_handle.refresh();
+        writer.publish();
         writer.metadata.byte_size = self.live_byte_size();
         if let Some(max_byte_size) = self.config.max_byte_size
             && writer.metadata.byte_size > max_byte_size
@@ -292,48 +364,61 @@ impl Memory {
                     .map(|v| v as u64)
                     .unwrap_or(self.config.ttl),
             };
-            let new_entry_size = new_entry_key.size_of() + new_entry.size_of();
-            if let Some(max_byte_size) = self.config.max_byte_size
-                && writer
-                    .metadata
-                    .byte_size
-                    .saturating_add(new_entry_size as u64)
-                    > max_byte_size
-            {
-                let fits = match self.config.on_full {
-                    OnFull::Reject => false,
-                    OnFull::EvictOldest => self.make_room(
-                        &mut writer,
-                        Some(&new_entry_key),
-                        new_entry_size as u64,
-                        max_byte_size,
-                    ),
-                };
-                if !fits {
-                    emit!(MemoryEnrichmentTableInsertFailed {
-                        key: &new_entry_key,
-                        include_key_metric_tag: self.config.internal_metrics.include_key_tag
-                    });
-                    continue;
-                }
-            }
-            writer.metadata.byte_size = writer
-                .metadata
-                .byte_size
-                .saturating_add(new_entry_size as u64);
-            emit!(MemoryEnrichmentTableInserted {
-                key: &new_entry_key,
-                include_key_metric_tag: self.config.internal_metrics.include_key_tag
-            });
-            if self.persistence.is_some() {
-                writer.metadata.dirty.insert(new_entry_key.clone());
-            }
-            writer.write_handle.update(new_entry_key, new_entry);
+            self.write_row(&mut writer, new_entry_key, new_entry);
         }
 
         if self.config.flush_interval.is_none() {
             self.flush(writer);
         }
+    }
+
+    /// Writes one row. Every write to the table goes through here, so the size cap and
+    /// `on_full`, the insert metrics, the persistence dirty set and the look-aside apply
+    /// the same way to the sink and to claims. Returns false when the cap refused the row.
+    fn write_row(
+        &self,
+        writer: &mut MutexGuard<'_, MemoryWriter>,
+        key: String,
+        entry: MemoryEntry,
+    ) -> bool {
+        let new_size = (key.size_of() + entry.size_of()) as u64;
+        // A row that replaces another is charged only the difference, so a key rewritten on
+        // every event does not push the estimate over the cap between flushes.
+        let old_size = writer.latest(&key, |old| {
+            old.map_or(0, |old| (key.size_of() + old.size_of()) as u64)
+        });
+        let mut base = writer.metadata.byte_size.saturating_sub(old_size);
+        if let Some(max_byte_size) = self.config.max_byte_size
+            && base.saturating_add(new_size) > max_byte_size
+        {
+            let fits = match self.config.on_full {
+                OnFull::Reject => false,
+                OnFull::EvictOldest => self.make_room(writer, Some(&key), new_size, max_byte_size),
+            };
+            if !fits {
+                emit!(MemoryEnrichmentTableInsertFailed {
+                    key: &key,
+                    include_key_metric_tag: self.config.internal_metrics.include_key_tag
+                });
+                return false;
+            }
+            // Recounted without the row this one replaces.
+            base = writer.metadata.byte_size;
+        }
+        writer.metadata.byte_size = base.saturating_add(new_size);
+        emit!(MemoryEnrichmentTableInserted {
+            key: &key,
+            include_key_metric_tag: self.config.internal_metrics.include_key_tag
+        });
+        if self.persistence.is_some() {
+            writer.metadata.dirty.insert(key.clone());
+        }
+        writer.recent.insert(key.clone(), entry.clone());
+        writer.write_handle.update(key, entry);
+        if writer.recent.len() >= LOOK_ASIDE_CAP {
+            writer.publish();
+        }
+        true
     }
 
     /// Makes room for `new_size` bytes under `key` by removing the least recently written
@@ -351,7 +436,7 @@ impl Memory {
         max_byte_size: u64,
     ) -> bool {
         // Publish pending writes so the sizes below are exact.
-        writer.write_handle.refresh();
+        writer.publish();
         let mut live = 0u64;
         let mut replaced = 0u64;
         let mut candidates = Vec::new();
@@ -380,7 +465,7 @@ impl Memory {
             for (_, k, _) in candidates.drain(..count) {
                 writer.write_handle.empty(k);
             }
-            writer.write_handle.refresh();
+            writer.publish();
             writer.metadata.evictions_total += count as u64;
             emit!(MemoryEnrichmentTableEvicted { count });
         }
@@ -398,8 +483,10 @@ impl Memory {
         // Refresh will happen only after we manually invoke it after iteration
         if let Some(reader) = self.get_read_handle().read() {
             for (k, v) in reader.iter() {
+                // A row rewritten since the last publish is not the expired one.
                 if let Some(entry) = v.get_one()
                     && entry.expired(now)
+                    && !writer.recent.contains_key(k)
                 {
                     // Byte size is not reduced at this point, because the actual deletion
                     // will only happen at refresh time
@@ -456,7 +543,7 @@ impl Memory {
             }
         }
 
-        writer.write_handle.refresh();
+        writer.publish();
         let byte_size = self.live_byte_size();
         writer.metadata.byte_size = byte_size;
         emit!(MemoryEnrichmentTableFlushed {
@@ -471,7 +558,7 @@ impl Memory {
         let persistence = Arc::clone(self.persistence.as_ref()?);
         let mut writer = self.write_handle.lock().expect("mutex poisoned");
         // Publishes pending writes, and a map that was never published reads as None.
-        writer.write_handle.refresh();
+        writer.publish();
         let reader = self.get_read_handle().read()?;
         let now = Instant::now();
         let now_unix = persist::unix_now();
@@ -675,6 +762,84 @@ impl Table for Memory {
         let writer = self.write_handle.lock().expect("mutex poisoned");
         self.flush(writer);
         Some(Box::new(self.clone()))
+    }
+
+    /// Checks and marks `claim.key` under the writer lock, reading through the look-aside, so a
+    /// burst of one key counts every claim even before the table publishes. The row lives
+    /// `ttl_secs` from the window's start whatever `ttl_field` says, and is written through
+    /// the same path as the sink's rows.
+    fn claim(&self, claim: &Claim<'_>) -> Result<ClaimOutcome, Error> {
+        let mut writer = self.write_handle.lock().expect("mutex poisoned");
+        let now = Instant::now();
+        let prior = writer.latest(claim.key, |entry| {
+            entry.and_then(|entry| PriorClaim::read(entry, now))
+        });
+        if prior.is_some() {
+            emit!(MemoryEnrichmentTableRead {
+                key: claim.key,
+                include_key_metric_tag: self.config.internal_metrics.include_key_tag
+            });
+        } else {
+            emit!(MemoryEnrichmentTableReadFailed {
+                key: claim.key,
+                include_key_metric_tag: self.config.internal_metrics.include_key_tag
+            });
+        }
+
+        let (row, update_time, ttl, outcome) = match prior {
+            Some(prior) if prior.in_window => {
+                let row = prior.row;
+                let pass = row.passed < claim.cap.get();
+                let outcome = ClaimOutcome {
+                    pass,
+                    first: false,
+                    count: row.passed.saturating_add(row.suppressed).saturating_add(1),
+                    suppressed_prev: 0,
+                    window_secs: row.window_secs,
+                    value: row.value.clone().unwrap_or(Value::Null),
+                };
+                let row = ClaimRow {
+                    passed: row.passed.saturating_add(u64::from(pass)),
+                    suppressed: row.suppressed.saturating_add(u64::from(!pass)),
+                    ..row
+                };
+                (row, prior.update_time, prior.ttl, outcome)
+            }
+            prior => {
+                let window_secs = claim.window_secs.get();
+                let row = ClaimRow {
+                    window_secs,
+                    ttl_secs: claim.ttl_secs.max(window_secs),
+                    passed: 1,
+                    suppressed: 0,
+                    value: claim.value.filter(|v| !v.is_null()).cloned(),
+                };
+                let outcome = ClaimOutcome {
+                    pass: true,
+                    first: true,
+                    count: 1,
+                    suppressed_prev: prior.map_or(0, |prior| prior.row.suppressed),
+                    window_secs,
+                    value: row.value.clone().unwrap_or(Value::Null),
+                };
+                let ttl = row.ttl_secs;
+                (row, now, ttl, outcome)
+            }
+        };
+
+        let value = serde_json::to_string(&row).map_err(|error| Error::FailedToEncodeValue {
+            details: error.to_string(),
+        })?;
+        let entry = MemoryEntry {
+            value,
+            update_time: update_time.into(),
+            ttl,
+        };
+        self.write_row(&mut writer, claim.key.to_owned(), entry);
+        if self.config.flush_interval.is_none() {
+            self.flush(writer);
+        }
+        Ok(outcome)
     }
 }
 
@@ -2146,5 +2311,323 @@ mod tests {
                 "persist_failing"
             ]
         );
+    }
+
+    /// A table that never publishes on its own, so only the claim path can make a write
+    /// visible to the next claim.
+    fn claim_table(modfn: impl Fn(&mut MemoryConfig)) -> Memory {
+        Memory::new(build_memory_config(|c| {
+            c.flush_interval = Some(3600);
+            modfn(c);
+        }))
+    }
+
+    fn claim(
+        memory: &Memory,
+        key: &str,
+        window_secs: u64,
+        ttl_secs: u64,
+        cap: u64,
+    ) -> ClaimOutcome {
+        memory
+            .claim(&Claim {
+                key,
+                window_secs: NonZeroU64::new(window_secs).unwrap(),
+                ttl_secs,
+                cap: NonZeroU64::new(cap).unwrap(),
+                value: None,
+            })
+            .unwrap()
+    }
+
+    /// Moves the row's start `secs` into the past, as if that much time had passed.
+    fn age_row(memory: &Memory, key: &str, secs: u64) {
+        let mut writer = memory.write_handle.lock().unwrap();
+        writer.publish();
+        let mut entry = writer.write_handle.get_one(key).unwrap().clone();
+        entry.update_time = (*entry.update_time - Duration::from_secs(secs)).into();
+        writer.write_handle.update(key.to_string(), entry);
+        writer.publish();
+    }
+
+    #[test]
+    fn a_burst_of_one_key_passes_once() {
+        let memory = claim_table(|_| {});
+        let outcomes: Vec<_> = (0..50).map(|_| claim(&memory, "k", 60, 120, 1)).collect();
+
+        assert_eq!(outcomes.iter().filter(|o| o.pass).count(), 1);
+        assert_eq!(outcomes.iter().filter(|o| o.first).count(), 1);
+        assert!(outcomes[0].pass && outcomes[0].first);
+        let counts: Vec<u64> = outcomes.iter().map(|o| o.count).collect();
+        assert_eq!(counts, (1..=50).collect::<Vec<_>>());
+        // Every claim after the first read a row no reader can see yet.
+        assert_eq!(memory.get_read_handle().len(), 0);
+    }
+
+    #[test]
+    fn a_burst_passes_up_to_the_cap() {
+        let memory = claim_table(|_| {});
+        let passed = (0..20)
+            .map(|_| claim(&memory, "k", 60, 120, 3))
+            .filter(|o| o.pass)
+            .count();
+
+        assert_eq!(passed, 3);
+    }
+
+    #[test]
+    fn the_window_stays_fixed_from_its_first_claim() {
+        let memory = claim_table(|_| {});
+        claim(&memory, "k", 100, 100, 1);
+        age_row(&memory, "k", 30);
+        claim(&memory, "k", 100, 100, 1);
+
+        memory.flush(memory.write_handle.lock().unwrap());
+        assert!((69..=70).contains(&ttl_of(&memory, "k")));
+    }
+
+    #[test]
+    fn the_next_window_reports_what_the_last_one_suppressed() {
+        let memory = claim_table(|_| {});
+        for _ in 0..5 {
+            claim(&memory, "k", 60, 120, 1);
+        }
+        // Past the window, inside the carry period.
+        age_row(&memory, "k", 61);
+
+        let opener = claim(&memory, "k", 60, 120, 1);
+        assert!(opener.first && opener.pass);
+        assert_eq!(opener.suppressed_prev, 4);
+        let next = claim(&memory, "k", 60, 120, 1);
+        assert!(!next.pass);
+        assert_eq!(next.suppressed_prev, 0);
+        assert_eq!(next.count, 2);
+    }
+
+    #[test]
+    fn a_row_past_its_lifetime_starts_clean() {
+        let memory = claim_table(|_| {});
+        for _ in 0..5 {
+            claim(&memory, "k", 60, 120, 1);
+        }
+        age_row(&memory, "k", 122);
+
+        let opener = claim(&memory, "k", 60, 120, 1);
+        assert!(opener.first);
+        assert_eq!(opener.suppressed_prev, 0);
+    }
+
+    #[test]
+    fn a_window_in_force_keeps_its_own_length() {
+        let memory = claim_table(|_| {});
+        claim(&memory, "k", 60, 120, 1);
+        let later = claim(&memory, "k", 300, 600, 1);
+
+        assert_eq!(later.window_secs, 60);
+        assert!(!later.first);
+    }
+
+    #[test]
+    fn the_opening_value_rides_every_claim_in_the_window() {
+        let memory = claim_table(|_| {});
+        let claim_with = |ts: &str| {
+            let value = Value::from(ObjectMap::from([("first_seen_ts".into(), Value::from(ts))]));
+            memory
+                .claim(&Claim {
+                    key: "block",
+                    window_secs: NonZeroU64::new(1_209_600).unwrap(),
+                    ttl_secs: 1_209_600,
+                    cap: NonZeroU64::MIN,
+                    value: Some(&value),
+                })
+                .unwrap()
+        };
+        let first = claim_with("t0");
+        let repeat = claim_with("t1");
+
+        assert!(first.first && first.pass);
+        assert!(!repeat.first && !repeat.pass);
+        assert_eq!(repeat.count, 2);
+        assert_eq!(
+            repeat.value,
+            Value::from(ObjectMap::from([(
+                "first_seen_ts".into(),
+                Value::from("t0")
+            )]))
+        );
+    }
+
+    #[test]
+    fn a_row_the_sink_wrote_is_replaced_by_a_claim() {
+        let memory = claim_table(|_| {});
+        memory.handle_value(ObjectMap::from([("k".into(), Value::from(5))]));
+
+        let opener = claim(&memory, "k", 60, 120, 1);
+        assert!(opener.first);
+        assert!(!claim(&memory, "k", 60, 120, 1).first);
+    }
+
+    #[test]
+    fn without_a_flush_interval_a_claim_is_published_at_once() {
+        let memory = Memory::new(Default::default());
+        claim(&memory, "k", 60, 120, 1);
+
+        assert!(find(&memory, "k").is_some());
+    }
+
+    #[test]
+    fn the_look_aside_publishes_when_full() {
+        let memory = claim_table(|_| {});
+        for i in 0..LOOK_ASIDE_CAP - 1 {
+            claim(&memory, &format!("k{i}"), 60, 120, 1);
+        }
+        assert_eq!(memory.get_read_handle().len(), 0);
+
+        claim(&memory, "last", 60, 120, 1);
+        assert_eq!(memory.get_read_handle().len(), LOOK_ASIDE_CAP);
+        assert!(memory.write_handle.lock().unwrap().recent.is_empty());
+        // Published rows still count.
+        assert!(!claim(&memory, "k0", 60, 120, 1).first);
+    }
+
+    #[test]
+    fn a_scan_keeps_a_row_rewritten_since_it_expired() {
+        let memory = claim_table(|_| {});
+        claim(&memory, "k", 60, 60, 1);
+        age_row(&memory, "k", 61);
+        // Opens a new window over the published, expired row.
+        assert!(claim(&memory, "k", 60, 60, 1).first);
+
+        let writer = memory.write_handle.lock().unwrap();
+        memory.scan(writer);
+
+        assert!(!claim(&memory, "k", 60, 60, 1).first);
+        memory.flush(memory.write_handle.lock().unwrap());
+        assert!(find(&memory, "k").is_some());
+    }
+
+    #[test]
+    fn rewriting_one_key_near_the_cap_does_not_make_room() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = claim_table(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full + 400);
+        });
+        fill_aged(&memory, 40, "5");
+
+        for _ in 0..10_000 {
+            claim(&memory, "hot", 60, 120, 1);
+        }
+
+        // Making room publishes, which would have put the row in front of readers.
+        assert!(memory.get_read_handle().get_one("hot").is_none());
+        assert_eq!(evictions_total(&memory), 0);
+        assert!(memory.write_handle.lock().unwrap().metadata.byte_size <= full + 400);
+    }
+
+    #[test]
+    fn claimed_rows_are_evicted_oldest_first() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = claim_table(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        });
+        fill_aged(&memory, 40, "5");
+
+        for i in 0..40 {
+            claim(&memory, &format!("c{i:02}"), 60, 120, 1);
+        }
+
+        assert!(evictions_total(&memory) > 0);
+        assert!(memory.write_handle.lock().unwrap().metadata.byte_size <= full);
+        memory.flush(memory.write_handle.lock().unwrap());
+        assert!(find(&memory, "key_00").is_none());
+        assert!(find(&memory, "c39").is_some());
+        // A claim still counted in the window survives the eviction of older rows.
+        assert!(!claim(&memory, "c39", 60, 120, 1).first);
+    }
+
+    #[test]
+    fn claimed_rows_persist_with_their_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let config = build_memory_config(|c| {
+            c.ttl = 7200;
+            c.flush_interval = Some(3600);
+            c.persist_path = Some(path.clone());
+        });
+
+        let memory = Memory::new(config.clone());
+        for _ in 0..3 {
+            claim(&memory, "inside", 3600, 7200, 1);
+            claim(&memory, "carry", 3600, 7200, 1);
+        }
+        // Past the window, so the reload must still find it in its carry period.
+        age_row(&memory, "carry", 3700);
+        // `age_row` writes around the dirty set, so mark the row the way a claim would.
+        memory
+            .write_handle
+            .lock()
+            .unwrap()
+            .metadata
+            .dirty
+            .insert("carry".to_string());
+        persist_now(&memory);
+        drop(memory);
+
+        let memory = Memory::new(config);
+        let inside = claim(&memory, "inside", 3600, 7200, 1);
+        assert!(!inside.first);
+        assert_eq!(inside.count, 4);
+        let carry = claim(&memory, "carry", 3600, 7200, 1);
+        assert!(carry.first);
+        assert_eq!(carry.suppressed_prev, 2);
+    }
+
+    #[test]
+    fn concurrent_claims_on_one_key_pass_exactly_the_cap() {
+        let memory = claim_table(|_| {});
+        let outcomes: Vec<ClaimOutcome> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..500)
+                            .map(|_| claim(&memory, "k", 60, 120, 5))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert_eq!(outcomes.iter().filter(|o| o.pass).count(), 5);
+        assert_eq!(outcomes.iter().filter(|o| o.first).count(), 1);
+        let mut counts: Vec<u64> = outcomes.iter().map(|o| o.count).collect();
+        counts.sort_unstable();
+        assert_eq!(counts, (1..=4000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn concurrent_claims_on_many_keys_open_each_once() {
+        let memory = claim_table(|_| {});
+        let firsts: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..1000)
+                            .filter(|i| claim(&memory, &format!("k{}", i % 300), 60, 120, 1).first)
+                            .count()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+
+        assert_eq!(firsts, 300);
     }
 }

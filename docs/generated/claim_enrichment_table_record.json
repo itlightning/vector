@@ -1,0 +1,82 @@
+{
+  "anchor": "claim_enrichment_table_record",
+  "name": "claim_enrichment_table_record",
+  "category": "Enrichment",
+  "description": "Checks and marks a key in a `memory` enrichment table in one step, so a burst of events\nwith the same key counts every event even before the table publishes its writes to\nreaders.\n\nThe first claim on a key with no live row opens a window of `window_secs`, which stays\nfixed from then on. Each claim in the window counts; the first `cap` of them pass.\nThe returned object has `pass`, `first` (this claim opened the window), `count` (this\nclaim's position in the window, from 1), `suppressed_prev` (on the claim that opens a\nwindow, how many the previous window suppressed while its row was still live),\n`window_secs` (the window in force) and `value` (what the opening claim stored).\n\nThe row is written through the table's own write path, so its size cap, TTL scan and\npersistence apply to it.",
+  "arguments": [
+    {
+      "name": "table",
+      "description": "The [enrichment table](/docs/reference/glossary/#enrichment-tables) to claim the key in. Only `memory` tables support claims.",
+      "required": true,
+      "type": [
+        "string"
+      ]
+    },
+    {
+      "name": "key",
+      "description": "The key to check and mark.",
+      "required": true,
+      "type": [
+        "string"
+      ]
+    },
+    {
+      "name": "window_secs",
+      "description": "The length of the window this claim opens when the key has no live row, in seconds. At least 1. A window already open keeps its own length.",
+      "required": true,
+      "type": [
+        "integer"
+      ]
+    },
+    {
+      "name": "cap",
+      "description": "How many claims in one window pass. At least 1.",
+      "required": false,
+      "type": [
+        "integer"
+      ],
+      "default": "1"
+    },
+    {
+      "name": "ttl_secs",
+      "description": "How long the row lives from the start of the window this claim opens, in seconds. At least `window_secs`, which is the default. A longer row lets the claim that opens the next window report how many the previous window suppressed.",
+      "required": false,
+      "type": [
+        "integer"
+      ]
+    },
+    {
+      "name": "value",
+      "description": "A value stored by the claim that opens the window and returned to every claim in it.",
+      "required": false,
+      "type": [
+        "any"
+      ]
+    }
+  ],
+  "return": {
+    "types": [
+      "object"
+    ]
+  },
+  "internal_failure_reasons": [
+    "The table does not support claims.",
+    "`window_secs` or `cap` is less than 1.",
+    "`ttl_secs` is less than `window_secs`."
+  ],
+  "examples": [
+    {
+      "title": "Throttle a key to one event a minute",
+      "source": "claim_enrichment_table_record!(\"test\", \"4674:SeTcbPrivilege\", window_secs: 60, ttl_secs: 120)",
+      "return": {
+        "pass": true,
+        "first": true,
+        "count": 1,
+        "suppressed_prev": 0,
+        "window_secs": 60,
+        "value": null
+      }
+    }
+  ],
+  "pure": false
+}

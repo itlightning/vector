@@ -117,7 +117,7 @@ impl MemorySource {
                         })
                         .collect::<Vec<_>>();
                     if source_config.remove_after_export {
-                        writer.write_handle.refresh();
+                        writer.publish();
                     }
                 }
             }
