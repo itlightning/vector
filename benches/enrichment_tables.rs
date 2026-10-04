@@ -393,9 +393,9 @@ fn benchmark_enrichment_tables_mmdb(c: &mut Criterion) {
     });
 }
 
-/// Claims as an agent throttle or dedupe stage makes them. Every `TICK` claims the table
-/// flushes, as its 1 s flush interval would at 5000 claims a second, which also keeps the
-/// pending write log at a realistic length.
+/// Claims on one key and on many. Every `TICK` claims the table flushes, as a 1 s flush
+/// interval would at 5000 claims a second, which also keeps the pending write log at a
+/// realistic length.
 fn benchmark_enrichment_tables_memory(c: &mut Criterion) {
     const TICK: u64 = 5000;
     let mut group = c.benchmark_group("enrichment_tables_memory");
@@ -444,7 +444,7 @@ fn benchmark_enrichment_tables_memory(c: &mut Criterion) {
         bench_claims(b, &|_| "4104:block-hash".to_string(), Some(&value))
     });
 
-    // The plain lookup a pack stage makes today, for comparison.
+    // A plain lookup of a claimed row, for comparison.
     group.bench_function("enrichment_tables/memory_find_row", |b| {
         let table = build();
         let key = Value::from("4674:SeTcbPrivilege");

@@ -44,6 +44,8 @@ pub struct MemoryConfig {
     /// if it is shorter than the `scan_interval`.
     ///
     /// By default, all writes are made visible immediately.
+    ///
+    /// Writes also become visible whenever 128 rows are pending.
     #[serde(skip_serializing_if = "vector_lib::serde::is_default")]
     pub flush_interval: Option<u64>,
     /// Maximum size of the table in bytes. An insertion that would make

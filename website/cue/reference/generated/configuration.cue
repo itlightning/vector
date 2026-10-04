@@ -226,6 +226,8 @@ generated: configuration: {
 														if it is shorter than the `scan_interval`.
 
 														By default, all writes are made visible immediately.
+
+														Writes also become visible whenever 128 rows are pending.
 														"""
 						required:      false
 						relevant_when: "type = \"memory\""

@@ -82,6 +82,8 @@ pub enum Error {
     TableNotLoaded { table: String },
     #[snafu(display("Table does not support claims"))]
     ClaimNotSupported,
+    #[snafu(display("Table is full, claim not stored"))]
+    ClaimNotStored,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Snafu)]
@@ -166,9 +168,11 @@ dyn_clone::clone_trait_object!(Table);
 
 /// One atomic check-and-mark of a key in a table a transform can write.
 ///
-/// A key's window opens on the first claim that finds no live row and stays fixed from then on:
-/// later claims never move its deadline. The row outlives the window by `ttl_secs - window_secs`,
-/// so the claim that opens the next window can still read how many the previous one suppressed.
+/// A claim opens a window when the key has no row inside a window: no row at all, or one in its
+/// carry period. The window then stays fixed: later claims never move its deadline. The row
+/// outlives the window by `ttl_secs - window_secs`, the carry period, so the claim that opens the
+/// next window, with its own `window_secs` and `ttl_secs`, can still read how many the previous
+/// window suppressed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Claim<'a> {
     pub key: &'a str,
@@ -193,7 +197,7 @@ pub struct ClaimOutcome {
     /// This claim's position in its window, counting from 1.
     pub count: u64,
     /// Set only on the claim that opens a window: how many claims the previous window of this key
-    /// did not pass, when its row was still live. Zero otherwise.
+    /// did not pass, when the opening claim found its row in the carry period. Zero otherwise.
     pub suppressed_prev: u64,
     /// The window in force, which is the one the opening claim asked for.
     pub window_secs: u64,

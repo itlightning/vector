@@ -15,7 +15,7 @@ const PARAMETERS: &[Parameter] = &[
     Parameter::required(
         "window_secs",
         kind::INTEGER,
-        "The length of the window this claim opens when the key has no live row, in seconds. At least 1. A window already open keeps its own length.",
+        "The length of the window this claim opens, in seconds. At least 1. A claim opens a window when the key has no row inside one: no row at all, or one in its carry period. A window already open keeps its own length.",
     ),
     Parameter::optional(
         "cap",
@@ -26,7 +26,7 @@ const PARAMETERS: &[Parameter] = &[
     Parameter::optional(
         "ttl_secs",
         kind::INTEGER,
-        "How long the row lives from the start of the window this claim opens, in seconds. At least `window_secs`, which is the default. A longer row lets the claim that opens the next window report how many the previous window suppressed.",
+        "How long the row lives from the start of the window this claim opens, in seconds. At least `window_secs`, which is the default. The time past the window is the carry period: a claim in it opens a new window, with its own `window_secs` and `ttl_secs`, and reports how many the previous window suppressed.",
     ),
     Parameter::optional(
         "value",
@@ -90,21 +90,24 @@ impl Function for ClaimEnrichmentTableRecord {
             with the same key counts every event even before the table publishes its writes to
             readers.
 
-            The first claim on a key with no live row opens a window of `window_secs`, which stays
-            fixed from then on. Each claim in the window counts; the first `cap` of them pass.
-            The returned object has `pass`, `first` (this claim opened the window), `count` (this
-            claim's position in the window, from 1), `suppressed_prev` (on the claim that opens a
-            window, how many the previous window suppressed while its row was still live),
-            `window_secs` (the window in force) and `value` (what the opening claim stored).
+            A claim opens a window of `window_secs` when the key has no row inside a window: no
+            row at all, or one in its carry period, the time between the end of its window and the
+            end of its `ttl_secs`. The window stays fixed from then on. Each claim in the window
+            counts; the first `cap` of them pass. The returned object has `pass`, `first` (this
+            claim opened the window), `count` (this claim's position in the window, from 1),
+            `suppressed_prev` (on a claim that opens a window over a row in its carry period, how
+            many that row's window suppressed; otherwise 0), `window_secs` (the window in force)
+            and `value` (what the opening claim stored).
 
             The row is written through the table's own write path, so its size cap, TTL scan and
-            persistence apply to it.
+            persistence apply to it. A claim the size cap refuses is an error, not a pass.
         "}
     }
 
     fn internal_failure_reasons(&self) -> &'static [&'static str] {
         &[
             "The table does not support claims.",
+            "The table is full and refused the row.",
             "`window_secs` or `cap` is less than 1.",
             "`ttl_secs` is less than `window_secs`.",
         ]

@@ -97,7 +97,7 @@ impl MemorySource {
                         })
                         .filter_map(|(k, v)| {
                             if source_config.remove_after_export {
-                                writer.write_handle.empty(k.clone());
+                                writer.remove(k.clone());
                             }
                             v.get_one().map(|v| (k, v))
                         })
@@ -117,6 +117,7 @@ impl MemorySource {
                         })
                         .collect::<Vec<_>>();
                     if source_config.remove_after_export {
+                        // Also drops a rewrite of an exported key made since the last publish.
                         writer.publish();
                     }
                 }

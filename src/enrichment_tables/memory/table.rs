@@ -55,8 +55,12 @@ use crate::{
 #[derive(Clone, Eq, PartialEq, Hash, ShallowCopy)]
 pub struct MemoryEntry {
     value: String,
+    /// What the TTL counts from. A claim keeps it at its window's start across rewrites.
     update_time: CopyValue<Instant>,
     ttl: u64,
+    /// The last write, which orders eviction, so a key claimed on every event is not the
+    /// first evicted just because its window opened long ago.
+    last_write: CopyValue<Instant>,
 }
 
 impl ByteSizeOf for MemoryEntry {
@@ -66,6 +70,15 @@ impl ByteSizeOf for MemoryEntry {
 }
 
 impl MemoryEntry {
+    fn new(value: String, update_time: Instant, ttl: u64) -> Self {
+        Self {
+            value,
+            update_time: update_time.into(),
+            ttl,
+            last_write: update_time.into(),
+        }
+    }
+
     pub(super) fn as_object_map(&self, now: Instant, key: &str) -> Result<ObjectMap, Error> {
         let ttl = self.remaining_ttl(now);
         Ok(ObjectMap::from([
@@ -153,20 +166,25 @@ struct PriorClaim {
 }
 
 impl PriorClaim {
-    /// None for an expired row, or for one that is not a claim row, which the claim replaces.
+    /// None for a row past its expiry, or for one that is not a claim row, which the claim
+    /// replaces.
+    ///
+    /// The window is the head of the row's life and the carry period its tail. Both are
+    /// measured back from the expiry rather than forward from the start, because a row restored
+    /// from persistence keeps its expiry but not its start. Liveness uses the same exact
+    /// remaining time rather than [`MemoryEntry::expired`], which rounds down to whole seconds,
+    /// so a row without a carry period is never read as being in one.
     fn read(entry: &MemoryEntry, now: Instant) -> Option<Self> {
-        if entry.expired(now) {
+        let remaining = entry
+            .update_time
+            .checked_add(Duration::from_secs(entry.ttl))
+            .map(|expiry| expiry.saturating_duration_since(now));
+        if remaining == Some(Duration::ZERO) {
             return None;
         }
         let row: ClaimRow = serde_json::from_str(&entry.value).ok()?;
-        // The window is the head of the row's life and the carry period its tail. Measured
-        // back from the expiry rather than forward from the start, because a row restored from
-        // persistence keeps its expiry but not its start.
         let carry = Duration::from_secs(row.ttl_secs.saturating_sub(row.window_secs));
-        let in_window = entry
-            .update_time
-            .checked_add(Duration::from_secs(entry.ttl))
-            .is_none_or(|expiry| expiry.saturating_duration_since(now) > carry);
+        let in_window = remaining.is_none_or(|remaining| remaining > carry);
         Some(Self {
             row,
             update_time: *entry.update_time,
@@ -178,7 +196,7 @@ impl PriorClaim {
 
 // Used to ensure that these 2 are locked together
 pub(super) struct MemoryWriter {
-    pub(super) write_handle: evmap::WriteHandle<String, MemoryEntry>,
+    write_handle: evmap::WriteHandle<String, MemoryEntry>,
     metadata: MemoryMetadata,
     /// Every row written since the last publish, which readers cannot see yet. A claim reads
     /// it first, so it sees writes that are not published.
@@ -191,6 +209,11 @@ impl MemoryWriter {
     pub(super) fn publish(&mut self) {
         self.write_handle.refresh();
         self.recent.clear();
+    }
+
+    /// Removes `key` at the next publish.
+    pub(super) fn remove(&mut self, key: String) {
+        self.write_handle.empty(key);
     }
 
     /// The row for `key` as the next publish will leave it, apart from removals, which are
@@ -266,14 +289,9 @@ impl Memory {
             let (update_time, ttl) = now
                 .checked_sub(Duration::from_secs(ttl - remaining))
                 .map_or((now, remaining), |t| (t, ttl));
-            writer.write_handle.update(
-                row.key,
-                MemoryEntry {
-                    value: row.value,
-                    update_time: update_time.into(),
-                    ttl,
-                },
-            );
+            writer
+                .write_handle
+                .update(row.key, MemoryEntry::new(row.value, update_time, ttl));
         }
         writer.publish();
         writer.metadata.byte_size = self.live_byte_size();
@@ -354,6 +372,7 @@ impl Memory {
             let new_entry = MemoryEntry {
                 value: v,
                 update_time: now.into(),
+                last_write: now.into(),
                 ttl: self
                     .config
                     .ttl_field
@@ -447,7 +466,7 @@ impl Memory {
                 live += size;
                 match v.get_one() {
                     Some(_) if Some(k.as_str()) == key => replaced = size,
-                    Some(entry) => candidates.push((*entry.update_time, k.clone(), size)),
+                    Some(entry) => candidates.push((*entry.last_write, k.clone(), size)),
                     None => {}
                 }
             }
@@ -769,7 +788,12 @@ impl Table for Memory {
     /// `ttl_secs` from the window's start whatever `ttl_field` says, and is written through
     /// the same path as the sink's rows.
     fn claim(&self, claim: &Claim<'_>) -> Result<ClaimOutcome, Error> {
-        let mut writer = self.write_handle.lock().expect("mutex poisoned");
+        // A panic elsewhere under the lock leaves the table usable: every write completes or
+        // is never applied, so a claim must not take the transform down with it.
+        let mut writer = self
+            .write_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         let prior = writer.latest(claim.key, |entry| {
             entry.and_then(|entry| PriorClaim::read(entry, now))
@@ -834,8 +858,11 @@ impl Table for Memory {
             value,
             update_time: update_time.into(),
             ttl,
+            last_write: now.into(),
         };
-        self.write_row(&mut writer, claim.key.to_owned(), entry);
+        if !self.write_row(&mut writer, claim.key.to_owned(), entry) {
+            return Err(Error::ClaimNotStored);
+        }
         if self.config.flush_interval.is_none() {
             self.flush(writer);
         }
@@ -1014,11 +1041,11 @@ mod tests {
             let mut handle = memory.write_handle.lock().unwrap();
             handle.write_handle.update(
                 "test_key".to_string(),
-                MemoryEntry {
-                    value: "5".to_string(),
-                    update_time: (Instant::now() - Duration::from_secs(secs_to_subtract)).into(),
+                MemoryEntry::new(
+                    "5".to_string(),
+                    Instant::now() - Duration::from_secs(secs_to_subtract),
                     ttl,
-                },
+                ),
             );
             handle.write_handle.refresh();
         }
@@ -1106,11 +1133,11 @@ mod tests {
             let mut handle = memory.write_handle.lock().unwrap();
             handle.write_handle.update(
                 "test_key".to_string(),
-                MemoryEntry {
-                    value: "5".to_string(),
-                    update_time: (Instant::now() - Duration::from_secs(ttl + 10)).into(),
+                MemoryEntry::new(
+                    "5".to_string(),
+                    Instant::now() - Duration::from_secs(ttl + 10),
                     ttl,
-                },
+                ),
             );
             handle.write_handle.refresh();
         }
@@ -1174,11 +1201,11 @@ mod tests {
             let mut handle = memory.write_handle.lock().unwrap();
             handle.write_handle.update(
                 "test_key".to_string(),
-                MemoryEntry {
-                    value: "5".to_string(),
-                    update_time: (Instant::now() - Duration::from_secs(ttl / 2)).into(),
+                MemoryEntry::new(
+                    "5".to_string(),
+                    Instant::now() - Duration::from_secs(ttl / 2),
                     ttl,
-                },
+                ),
             );
             handle.write_handle.refresh();
         }
@@ -1572,11 +1599,11 @@ mod tests {
         for i in 0..count {
             writer.write_handle.update(
                 format!("key_{i:02}"),
-                MemoryEntry {
-                    value: value.to_string(),
-                    update_time: (now - Duration::from_secs((count - i) as u64)).into(),
-                    ttl: 1000,
-                },
+                MemoryEntry::new(
+                    value.to_string(),
+                    now - Duration::from_secs((count - i) as u64),
+                    1000,
+                ),
             );
         }
         writer.write_handle.refresh();
@@ -1752,11 +1779,11 @@ mod tests {
             let mut writer = memory.write_handle.lock().unwrap();
             writer.write_handle.update(
                 "aged".to_string(),
-                MemoryEntry {
-                    value: "7".to_string(),
-                    update_time: (Instant::now() - Duration::from_secs(30)).into(),
-                    ttl: 100,
-                },
+                MemoryEntry::new(
+                    "7".to_string(),
+                    Instant::now() - Duration::from_secs(30),
+                    100,
+                ),
             );
             writer.metadata.dirty.insert("aged".to_string());
         }
@@ -2342,10 +2369,14 @@ mod tests {
 
     /// Moves the row's start `secs` into the past, as if that much time had passed.
     fn age_row(memory: &Memory, key: &str, secs: u64) {
+        age_row_by(memory, key, Duration::from_secs(secs));
+    }
+
+    fn age_row_by(memory: &Memory, key: &str, age: Duration) {
         let mut writer = memory.write_handle.lock().unwrap();
         writer.publish();
         let mut entry = writer.write_handle.get_one(key).unwrap().clone();
-        entry.update_time = (*entry.update_time - Duration::from_secs(secs)).into();
+        entry.update_time = (*entry.update_time - age).into();
         writer.write_handle.update(key.to_string(), entry);
         writer.publish();
     }
@@ -2553,8 +2584,10 @@ mod tests {
     fn claimed_rows_persist_with_their_window() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("table.ndjson");
+        // Longer than the claims' own lifetime, so a restored row's start (back-dated against
+        // the table TTL) is not its window's start.
         let config = build_memory_config(|c| {
-            c.ttl = 7200;
+            c.ttl = 172_800;
             c.flush_interval = Some(3600);
             c.persist_path = Some(path.clone());
         });
@@ -2629,5 +2662,75 @@ mod tests {
         });
 
         assert_eq!(firsts, 300);
+    }
+
+    #[test]
+    fn a_claim_the_cap_refuses_is_an_error() {
+        let memory = claim_table(|c| c.max_byte_size = Some(1));
+
+        let refused = memory.claim(&Claim {
+            key: "k",
+            window_secs: NonZeroU64::new(60).unwrap(),
+            ttl_secs: 120,
+            cap: NonZeroU64::MIN,
+            value: None,
+        });
+
+        assert_eq!(refused, Err(Error::ClaimNotStored));
+    }
+
+    #[test]
+    fn without_a_carry_period_a_row_just_past_its_life_reports_nothing() {
+        let memory = claim_table(|_| {});
+        for _ in 0..5 {
+            claim(&memory, "k", 60, 60, 1);
+        }
+        // Past the expiry by less than a second, which whole-second expiry still calls live.
+        age_row_by(&memory, "k", Duration::from_millis(60_500));
+
+        let opener = claim(&memory, "k", 60, 60, 1);
+        assert!(opener.first);
+        assert_eq!(opener.suppressed_prev, 0);
+    }
+
+    #[test]
+    fn a_hot_key_is_evicted_by_its_last_claim_not_its_window_start() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = claim_table(|c| {
+            c.on_full = OnFull::EvictOldest;
+            c.max_byte_size = Some(full);
+        });
+        fill_aged(&memory, 40, "5");
+        claim(&memory, "hot", 3600, 7200, 1);
+        // Its window opened long before every other row was written, and it was just claimed.
+        age_row(&memory, "hot", 100);
+        claim(&memory, "hot", 3600, 7200, 1);
+
+        // New keys until one more eviction round has run, which takes the oldest rows first.
+        let before = evictions_total(&memory);
+        let mut i = 0;
+        while evictions_total(&memory) == before {
+            claim(&memory, &format!("new_{i}"), 3600, 7200, 1);
+            i += 1;
+        }
+
+        assert!(!claim(&memory, "hot", 3600, 7200, 1).first);
+    }
+
+    #[test]
+    fn reject_accepts_an_overwrite_at_the_cap() {
+        let probe = Memory::new(Default::default());
+        let full = fill_aged(&probe, 40, "5");
+        let memory = Memory::new(build_memory_config(|c| {
+            c.on_full = OnFull::Reject;
+            c.max_byte_size = Some(full);
+        }));
+        fill_aged(&memory, 40, "5");
+
+        memory.handle_value(ObjectMap::from([("key_05".into(), Value::from(6))]));
+
+        assert_eq!(find(&memory, "key_05").unwrap()["value"], Value::from(6));
+        assert_eq!(memory.get_read_handle().len(), 40);
     }
 }
