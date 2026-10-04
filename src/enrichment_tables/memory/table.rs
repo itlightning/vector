@@ -2733,4 +2733,50 @@ mod tests {
         assert_eq!(find(&memory, "key_05").unwrap()["value"], Value::from(6));
         assert_eq!(memory.get_read_handle().len(), 40);
     }
+
+    /// A table written only by claims has no sink inputs. Validation accepts it, and its sink
+    /// task still runs the flush, scan and persistence ticks.
+    #[tokio::test]
+    async fn a_table_with_no_inputs_keeps_its_ticks() {
+        crate::test_util::trace_init();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.ndjson");
+        let table_config = build_memory_config(|c| {
+            c.ttl = 3600;
+            c.flush_interval = Some(1);
+            c.scan_interval = NonZeroU64::new(1).unwrap();
+            c.persist_path = Some(path.clone());
+        });
+        let mut config = crate::config::Config::builder();
+        config.add_enrichment_table(
+            "claims",
+            &[],
+            crate::enrichment_tables::EnrichmentTables::Memory(table_config.clone()),
+        );
+        config.add_source(
+            "in",
+            crate::config::unit_test::UnitTestSourceConfig { events: vec![] },
+        );
+        config.add_sink("out", &["in"], crate::test_util::mock::basic_sink(1).1);
+        let config = config
+            .build()
+            .expect("a table with no inputs must validate");
+        let (topology, _crash) = crate::test_util::start_topology(config, false).await;
+
+        let memory = table_config.get_or_build_memory(None).await;
+        claim(&memory, "long", 3600, 3600, 1);
+        claim(&memory, "short", 1, 1, 1);
+        assert!(memory.get_read_handle().get_one("long").is_none());
+
+        time::sleep(Duration::from_millis(3500)).await;
+
+        // Published by the flush tick, the expired row removed by the scan tick, and the live
+        // row appended to the log by the persistence tick.
+        assert!(memory.get_read_handle().get_one("long").is_some());
+        assert!(memory.get_read_handle().get_one("short").is_none());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"long\""));
+        assert!(persist::status_path(&path).exists());
+
+        topology.stop().await;
+    }
 }
