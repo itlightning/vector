@@ -15,7 +15,7 @@ pub struct Opts {
 }
 
 impl Opts {
-    pub fn dangerously_allow_env_var_interpolation(&self) -> bool {
+    pub const fn dangerously_allow_env_var_interpolation(&self) -> bool {
         matches!(
             &self.sub_command,
             Some(SubCommand::Install(opts)) if opts.dangerously_allow_env_var_interpolation

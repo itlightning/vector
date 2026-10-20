@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{num::NonZeroU64, time::SystemTime};
 
 use chrono::prelude::*;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -6,15 +6,16 @@ use vector::enrichment_tables::{
     Condition, Table,
     file::{File, FileData},
     geoip::{Geoip, GeoipConfig},
+    memory::{Memory, MemoryConfig},
     mmdb::{Mmdb, MmdbConfig},
 };
-use vector_lib::enrichment::Case;
+use vector_lib::enrichment::{Case, Claim};
 use vrl::value::{ObjectMap, Value};
 
 criterion_group!(
     name = benches;
     config = Criterion::default().noise_threshold(0.02).sample_size(10);
-    targets = benchmark_enrichment_tables_file, benchmark_enrichment_tables_geoip, benchmark_enrichment_tables_mmdb
+    targets = benchmark_enrichment_tables_file, benchmark_enrichment_tables_geoip, benchmark_enrichment_tables_mmdb, benchmark_enrichment_tables_memory
 );
 criterion_main!(benches);
 
@@ -389,5 +390,87 @@ fn benchmark_enrichment_tables_mmdb(c: &mut Criterion) {
             },
             BatchSize::SmallInput,
         );
+    });
+}
+
+/// Claims on one key and on many. Every `TICK` claims the table flushes, as a 1 s flush
+/// interval would at 5000 claims a second, which also keeps the pending write log at a
+/// realistic length.
+fn benchmark_enrichment_tables_memory(c: &mut Criterion) {
+    const TICK: u64 = 5000;
+    let mut group = c.benchmark_group("enrichment_tables_memory");
+    let build = || {
+        let mut config = MemoryConfig::default();
+        config.ttl = 7200;
+        config.flush_interval = Some(1);
+        Memory::new(config)
+    };
+    let window = NonZeroU64::new(60).unwrap();
+
+    let bench_claims =
+        |b: &mut criterion::Bencher, key_of: &dyn Fn(u64) -> String, value: Option<&Value>| {
+            let table = build();
+            let keys: Vec<String> = (0..100_000).map(key_of).collect();
+            let mut n = 0u64;
+            b.iter(|| {
+                n += 1;
+                if n.is_multiple_of(TICK) {
+                    // Flushes and publishes, as the sink's interval does.
+                    drop(table.extract_state());
+                }
+                table
+                    .claim(&Claim {
+                        key: &keys[(n % 100_000) as usize],
+                        window_secs: window,
+                        ttl_secs: 120,
+                        cap: NonZeroU64::MIN,
+                        value,
+                    })
+                    .unwrap()
+            });
+        };
+
+    group.bench_function("enrichment_tables/memory_claim_same_key", |b| {
+        bench_claims(b, &|_| "4674:SeTcbPrivilege".to_string(), None)
+    });
+    group.bench_function("enrichment_tables/memory_claim_distinct_keys", |b| {
+        bench_claims(b, &|i| format!("4674:key-{i}"), None)
+    });
+    group.bench_function("enrichment_tables/memory_claim_same_key_with_value", |b| {
+        let value = Value::from(ObjectMap::from([
+            ("first_seen_ts".into(), Value::from("2026-10-04T00:00:00Z")),
+            ("first_seen_record_id".into(), Value::from("123456789")),
+        ]));
+        bench_claims(b, &|_| "4104:block-hash".to_string(), Some(&value))
+    });
+
+    // A plain lookup of a claimed row, for comparison.
+    group.bench_function("enrichment_tables/memory_find_row", |b| {
+        let table = build();
+        let key = Value::from("4674:SeTcbPrivilege");
+        table
+            .claim(&Claim {
+                key: "4674:SeTcbPrivilege",
+                window_secs: window,
+                ttl_secs: 120,
+                cap: NonZeroU64::MIN,
+                value: None,
+            })
+            .unwrap();
+        drop(table.extract_state());
+        b.iter(|| {
+            table
+                .find_table_row(
+                    Case::Sensitive,
+                    &[Condition::Equals {
+                        field: "key",
+                        value: key.clone(),
+                    }],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        });
     });
 }
