@@ -1,6 +1,10 @@
 //! Service implementation for the `http` sink.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use http::{
@@ -90,6 +94,19 @@ impl HttpServiceRequestBuilder<PartitionKey> for HttpSinkRequestBuilder {
                 .map_err(|e| format!("Invalid header value '{value}': {e}"))?;
             headers.insert(header_name, header_value);
         }
+
+        // Send-time client UTC unix seconds for ingest clock-skew correction.
+        // Set here (not at config/batch time) so Tower retries refresh the value.
+        let client_clock_utc_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let client_clock_header_value = HeaderValue::from_str(&client_clock_utc_now.to_string())
+            .map_err(|e| format!("Invalid X-Client-Clock-Utc-Now value: {e}"))?;
+        headers.insert(
+            HeaderName::from_static("x-client-clock-utc-now"),
+            client_clock_header_value,
+        );
 
         // The request building should not have errors at this point
         let mut request = builder

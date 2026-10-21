@@ -5,7 +5,7 @@ use std::{
 
 use vrl::value::{ObjectMap, Value};
 
-use crate::{Case, Condition, Error, IndexHandle, Table, TableRegistry};
+use crate::{Case, Claim, ClaimOutcome, Condition, Error, IndexHandle, Table, TableRegistry};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DummyEnrichmentTable {
@@ -68,6 +68,17 @@ impl Table for DummyEnrichmentTable {
 
     fn needs_reload(&self) -> bool {
         false
+    }
+
+    fn claim(&self, claim: &Claim<'_>) -> Result<ClaimOutcome, Error> {
+        Ok(ClaimOutcome {
+            pass: true,
+            first: true,
+            count: 1,
+            suppressed_prev: 0,
+            window_secs: claim.window_secs.get(),
+            value: claim.value.cloned().unwrap_or(Value::Null),
+        })
     }
 }
 

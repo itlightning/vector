@@ -1,23 +1,45 @@
 #![allow(missing_docs)]
-use std::{ffi::OsString, time::Duration};
+use std::{
+    ffi::OsString,
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError},
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
+use exitcode::ExitCode;
+use tokio::runtime::Runtime;
 use windows_service::{
     Result, define_windows_service,
     service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
         ServiceType,
     },
-    service_control_handler::ServiceControlHandlerResult,
+    service_control_handler::{ServiceControlHandlerResult, ServiceStatusHandle},
     service_dispatcher,
 };
 
-use crate::{app::Application, signal::SignalTo};
+use crate::{
+    app::{Application, StartedApplication},
+    signal::SignalTo,
+};
 
 const SERVICE_NAME: &str = "vector";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 const NO_ERROR: u32 = 0;
 const ERROR: u32 = 121;
+
+/// Checkpoint reported with the first STOP_PENDING status; each later report adds one.
+const FIRST_STOP_CHECKPOINT: u32 = 1;
+/// How often the stop checkpoint is advanced while the topology drains.
+const STOP_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+/// Added to the graceful shutdown limit when reporting the stop wait hint, so a drain that
+/// legitimately runs to the limit is not read as a hung stop.
+const STOP_WAIT_HINT_MARGIN: Duration = Duration::from_secs(5);
+/// Stands in for the graceful shutdown limit when the limit is disabled. Matches the default
+/// of `--graceful-shutdown-limit-secs`; with no limit the drain is unbounded, and it is the
+/// advancing checkpoint rather than the hint that keeps a stop client waiting.
+const UNBOUNDED_STOP_WAIT_HINT: Duration = Duration::from_secs(60);
 
 pub mod service_control {
     use std::{ffi::OsString, fmt, fmt::Formatter, time::Duration};
@@ -148,12 +170,12 @@ pub mod service_control {
         {
             service.start(&[] as &[OsString]).context(ServiceSnafu)?;
             emit!(WindowsServiceStart {
-                name: &*service_def.name.to_string_lossy(),
+                name: &service_def.name.to_string_lossy(),
                 already_started: false,
             });
         } else {
             emit!(WindowsServiceStart {
-                name: &*service_def.name.to_string_lossy(),
+                name: &service_def.name.to_string_lossy(),
                 already_started: true,
             });
         }
@@ -182,7 +204,7 @@ pub mod service_control {
         }
 
         emit!(WindowsServiceStop {
-            name: &*service_def.name.to_string_lossy(),
+            name: &service_def.name.to_string_lossy(),
             already_stopped,
         });
 
@@ -214,7 +236,7 @@ pub mod service_control {
 
         service.start(&[] as &[OsString]).context(ServiceSnafu)?;
         emit!(WindowsServiceRestart {
-            name: &*service_def.name.to_string_lossy()
+            name: &service_def.name.to_string_lossy()
         });
         Ok(())
     }
@@ -242,7 +264,7 @@ pub mod service_control {
             .context(ServiceSnafu)?;
 
         emit!(WindowsServiceInstall {
-            name: &*service_def.name.to_string_lossy(),
+            name: &service_def.name.to_string_lossy(),
         });
 
         // TODO: It is currently not possible to change the description of the service.
@@ -265,7 +287,7 @@ pub mod service_control {
         if service_status.current_state != ServiceState::Stopped {
             service.stop().context(ServiceSnafu)?;
             emit!(WindowsServiceStop {
-                name: &*service_def.name.to_string_lossy(),
+                name: &service_def.name.to_string_lossy(),
                 already_stopped: false,
             });
         }
@@ -281,7 +303,7 @@ pub mod service_control {
         service.delete().context(ServiceSnafu)?;
 
         emit!(WindowsServiceUninstall {
-            name: &*service_def.name.to_string_lossy(),
+            name: &service_def.name.to_string_lossy(),
         });
         Ok(())
     }
@@ -296,11 +318,10 @@ pub mod service_control {
 
         let service = service_manager
             .open_service(&service_def.name, access)
-            .map_err(|e| {
+            .inspect_err(|_| {
                 emit!(WindowsServiceDoesNotExistError {
-                    name: &*service_def.name.to_string_lossy(),
+                    name: &service_def.name.to_string_lossy(),
                 });
-                e
             })
             .context(ServiceSnafu)?;
         Ok(service)
@@ -381,10 +402,183 @@ pub fn run() -> Result<i32> {
     // Always returns 0 exit code as errors are handled by the service dispatcher.
 }
 
+/// Sink for service status reports.
+///
+/// The stop sequence is driven through this rather than through the SCM handle directly so it
+/// can be exercised without a service control manager.
+trait StatusReporter: Send + Sync + 'static {
+    fn report(&self, status: ServiceStatus) -> Result<()>;
+}
+
+/// Reports through the registered SCM handle.
+///
+/// The control handler closure has to be built before `register` hands back the handle, so the
+/// handle is installed once it exists; reports made before that are dropped.
+#[derive(Default)]
+struct ScmReporter(OnceLock<ServiceStatusHandle>);
+
+impl ScmReporter {
+    fn install(&self, handle: ServiceStatusHandle) {
+        _ = self.0.set(handle);
+    }
+}
+
+impl StatusReporter for ScmReporter {
+    fn report(&self, status: ServiceStatus) -> Result<()> {
+        match self.0.get() {
+            Some(handle) => handle.set_service_status(status),
+            None => Ok(()),
+        }
+    }
+}
+
+const fn stop_pending_status(checkpoint: u32, wait_hint: Duration) -> ServiceStatus {
+    ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::StopPending,
+        // A service that has begun stopping accepts no further controls.
+        controls_accepted: ServiceControlAccept::empty(),
+        exit_code: ServiceExitCode::Win32(NO_ERROR),
+        checkpoint,
+        wait_hint,
+        process_id: None,
+    }
+}
+
+/// Wait hint to report with each STOP_PENDING status for the given graceful shutdown limit.
+fn stop_wait_hint(graceful_shutdown_duration: Option<Duration>) -> Duration {
+    graceful_shutdown_duration
+        .unwrap_or(UNBOUNDED_STOP_WAIT_HINT)
+        .saturating_add(STOP_WAIT_HINT_MARGIN)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[derive(Default)]
+struct StopTicker {
+    started: bool,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// Keeps the service control manager informed while the topology drains.
+///
+/// A stop control is answered with STOP_PENDING and a wait hint covering the graceful shutdown
+/// limit, then the checkpoint advances on a timer until the drain ends. Without those reports
+/// the service stays in the running state for the entire drain and a stop client, seeing no
+/// state change and no progress, concludes the service never acted on the request.
+struct StopProgress {
+    reporter: Arc<dyn StatusReporter>,
+    wait_hint: Duration,
+    checkpoint_interval: Duration,
+    ticker: Mutex<StopTicker>,
+    /// Set once the drain is over, to end the checkpoint timer.
+    drained: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl StopProgress {
+    fn new(
+        reporter: Arc<dyn StatusReporter>,
+        wait_hint: Duration,
+        checkpoint_interval: Duration,
+    ) -> Self {
+        Self {
+            reporter,
+            wait_hint,
+            checkpoint_interval,
+            ticker: Mutex::new(StopTicker::default()),
+            drained: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    /// Report the first STOP_PENDING status and start advancing the checkpoint.
+    ///
+    /// Repeat stop controls are ignored: the checkpoint has to keep moving forward, so a second
+    /// request must not restart it at the beginning.
+    fn begin(&self) {
+        let mut ticker = lock(&self.ticker);
+        if ticker.started {
+            return;
+        }
+        ticker.started = true;
+
+        _ = self
+            .reporter
+            .report(stop_pending_status(FIRST_STOP_CHECKPOINT, self.wait_hint));
+
+        let reporter = Arc::clone(&self.reporter);
+        let drained = Arc::clone(&self.drained);
+        let wait_hint = self.wait_hint;
+        let interval = self.checkpoint_interval;
+        ticker.handle = thread::Builder::new()
+            .name("vector-stop-progress".to_string())
+            .spawn(move || advance_stop_checkpoints(&*reporter, &drained, wait_hint, interval))
+            .ok();
+    }
+
+    /// End the checkpoint timer and wait for it to exit.
+    ///
+    /// Joining is what guarantees no STOP_PENDING report lands after the final STOPPED report.
+    /// Does nothing when no stop control was received, which is the case when the process shuts
+    /// down for its own reasons.
+    fn finish(&self) {
+        let Some(handle) = lock(&self.ticker).handle.take() else {
+            return;
+        };
+        let (drained, wake) = &*self.drained;
+        *lock(drained) = true;
+        wake.notify_all();
+        _ = handle.join();
+    }
+}
+
+fn advance_stop_checkpoints(
+    reporter: &dyn StatusReporter,
+    drained: &(Mutex<bool>, Condvar),
+    wait_hint: Duration,
+    interval: Duration,
+) {
+    let (done, wake) = drained;
+    let mut checkpoint = FIRST_STOP_CHECKPOINT;
+    let mut guard = lock(done);
+    while !*guard {
+        let (next, timeout) = wake
+            .wait_timeout(guard, interval)
+            .unwrap_or_else(PoisonError::into_inner);
+        guard = next;
+        if *guard {
+            break;
+        }
+        if timeout.timed_out() {
+            checkpoint = checkpoint.saturating_add(1);
+            _ = reporter.report(stop_pending_status(checkpoint, wait_hint));
+        }
+    }
+}
+
+/// `Application::prepare_start`, additionally reporting the graceful shutdown limit the
+/// application was started with, which bounds the drain and so sets the stop wait hint.
+fn prepare_start_with_shutdown_limit()
+-> std::result::Result<(Runtime, StartedApplication, Option<Duration>), ExitCode> {
+    let (runtime, app) = Application::prepare(Default::default())?;
+    let graceful_shutdown_duration = app.root_opts.graceful_shutdown_duration();
+    let app = app.start(runtime.handle())?;
+    Ok((runtime, app, graceful_shutdown_duration))
+}
+
 fn run_service(_arguments: Vec<OsString>) -> Result<()> {
-    match Application::prepare_start(Default::default()) {
-        Ok((runtime, app)) => {
+    match prepare_start_with_shutdown_limit() {
+        Ok((runtime, app, graceful_shutdown_duration)) => {
+            let reporter = Arc::new(ScmReporter::default());
+            let stop_progress = Arc::new(StopProgress::new(
+                Arc::clone(&reporter) as Arc<dyn StatusReporter>,
+                stop_wait_hint(graceful_shutdown_duration),
+                STOP_CHECKPOINT_INTERVAL,
+            ));
+
             let signal_tx = app.signals.handler.clone_tx();
+            let handler_stop_progress = Arc::clone(&stop_progress);
             let event_handler = move |control_event| -> ServiceControlHandlerResult {
                 match control_event {
                     // Notifies a service to report its current status information to the service
@@ -393,6 +587,10 @@ fn run_service(_arguments: Vec<OsString>) -> Result<()> {
 
                     // Handle stop
                     ServiceControl::Stop => {
+                        // Report STOP_PENDING before the signal goes out. The drain may take
+                        // the whole graceful shutdown limit, and until a pending state with a
+                        // wait hint is reported the service still reads as running.
+                        handler_stop_progress.begin();
                         while signal_tx.send(SignalTo::Shutdown(None)).is_err() {}
                         ServiceControlHandlerResult::NoError
                     }
@@ -403,6 +601,7 @@ fn run_service(_arguments: Vec<OsString>) -> Result<()> {
 
             let status_handle =
                 windows_service::service_control_handler::register(SERVICE_NAME, event_handler)?;
+            reporter.install(status_handle);
 
             status_handle.set_service_status(ServiceStatus {
                 service_type: SERVICE_TYPE,
@@ -415,6 +614,10 @@ fn run_service(_arguments: Vec<OsString>) -> Result<()> {
             })?;
 
             let program_completion_status = runtime.block_on(app.run());
+
+            // The drain is over: end the checkpoint timer first, so no pending report can land
+            // after the stopped one below.
+            stop_progress.finish();
 
             // Tell the system that service has stopped.
             status_handle.set_service_status(ServiceStatus {
@@ -436,6 +639,134 @@ fn run_service(_arguments: Vec<OsString>) -> Result<()> {
 
             Ok(())
         }
-        _ => Ok(()),
+        Err(exit_code) => {
+            // Startup failed (for example, an invalid configuration). Register a control
+            // handler and report SERVICE_STOPPED with a nonzero exit code: if ServiceMain
+            // returns without ever reporting a status, the service is left stuck in the
+            // START_PENDING state and configured recovery actions never run.
+            let event_handler = move |_control_event| ServiceControlHandlerResult::NoError;
+            let status_handle =
+                windows_service::service_control_handler::register(SERVICE_NAME, event_handler)?;
+            status_handle.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::ServiceSpecific(exit_code.unsigned_abs()),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    const TEST_INTERVAL: Duration = Duration::from_millis(20);
+    const TEST_WAIT_HINT: Duration = Duration::from_secs(13);
+    const TEST_DEADLINE: Duration = Duration::from_secs(10);
+
+    #[derive(Default)]
+    struct RecordingReporter(Mutex<Vec<ServiceStatus>>);
+
+    impl RecordingReporter {
+        fn statuses(&self) -> Vec<ServiceStatus> {
+            lock(&self.0).clone()
+        }
+    }
+
+    impl StatusReporter for RecordingReporter {
+        fn report(&self, status: ServiceStatus) -> Result<()> {
+            lock(&self.0).push(status);
+            Ok(())
+        }
+    }
+
+    fn progress(reporter: &Arc<RecordingReporter>) -> StopProgress {
+        StopProgress::new(
+            Arc::clone(reporter) as Arc<dyn StatusReporter>,
+            TEST_WAIT_HINT,
+            TEST_INTERVAL,
+        )
+    }
+
+    /// Block until the reporter has seen at least `count` statuses, or the deadline passes.
+    fn await_statuses(reporter: &RecordingReporter, count: usize) -> Vec<ServiceStatus> {
+        let deadline = Instant::now() + TEST_DEADLINE;
+        loop {
+            let statuses = reporter.statuses();
+            if statuses.len() >= count || Instant::now() >= deadline {
+                return statuses;
+            }
+            thread::sleep(TEST_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn reports_stop_pending_with_an_advancing_checkpoint() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let progress = progress(&reporter);
+
+        progress.begin();
+        let statuses = await_statuses(&reporter, 3);
+        progress.finish();
+
+        assert!(statuses.len() >= 3, "no checkpoints advanced: {statuses:?}");
+        for (index, status) in statuses.iter().enumerate() {
+            assert_eq!(status.current_state, ServiceState::StopPending);
+            assert_eq!(status.controls_accepted, ServiceControlAccept::empty());
+            assert_eq!(status.wait_hint, TEST_WAIT_HINT);
+            assert_eq!(status.checkpoint, FIRST_STOP_CHECKPOINT + index as u32);
+        }
+    }
+
+    #[test]
+    fn stops_reporting_once_the_drain_is_over() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let progress = progress(&reporter);
+
+        progress.begin();
+        await_statuses(&reporter, 2);
+        progress.finish();
+
+        // `finish` joins the timer, so the count is final the moment it returns.
+        let settled = reporter.statuses().len();
+        thread::sleep(TEST_INTERVAL * 5);
+        assert_eq!(reporter.statuses().len(), settled);
+    }
+
+    #[test]
+    fn a_repeat_stop_control_does_not_restart_the_checkpoint() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let progress = progress(&reporter);
+
+        progress.begin();
+        await_statuses(&reporter, 2);
+        progress.begin();
+        progress.finish();
+
+        let checkpoints: Vec<u32> = reporter.statuses().iter().map(|s| s.checkpoint).collect();
+        let restarts = checkpoints
+            .iter()
+            .filter(|checkpoint| **checkpoint == FIRST_STOP_CHECKPOINT)
+            .count();
+        assert_eq!(restarts, 1, "checkpoint restarted: {checkpoints:?}");
+    }
+
+    #[test]
+    fn the_wait_hint_covers_the_graceful_shutdown_limit() {
+        assert_eq!(
+            stop_wait_hint(Some(Duration::from_secs(8))),
+            Duration::from_secs(8) + STOP_WAIT_HINT_MARGIN
+        );
+        assert_eq!(
+            stop_wait_hint(None),
+            UNBOUNDED_STOP_WAIT_HINT + STOP_WAIT_HINT_MARGIN
+        );
     }
 }
