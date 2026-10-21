@@ -526,6 +526,10 @@ struct ChannelSubscription {
     last_event_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Previous record id, for gap detection.
     last_record_id_seen: Option<u64>,
+    /// Records read since `last_record_id_seen` whose own id could not be
+    /// read (a render failure, unparseable XML). Each one occupies an id in
+    /// the next gap, so that gap is reduced by this count.
+    unidentified_since_last_seen: u64,
     /// The active query filters events, so record ids skip by construction and
     /// gap detection cannot mean anything on this channel.
     query_filters: bool,
@@ -533,6 +537,11 @@ struct ChannelSubscription {
     /// fallback ran. Internal diagnostics; serialized on the status file by
     /// the stacked status patch.
     name_table_misses: u64,
+    /// Records read and then not delivered: an event-id filter, the age cap,
+    /// or a record that could not be rendered or parsed. Such a record was
+    /// seen, so it is counted here and never reported as a gap. Serialized on
+    /// the status file by the stacked status patch.
+    records_filtered: u64,
     /// Test-only handle accounting, per channel so parallel tests cannot
     /// perturb each other. `opens - closes` must return to its baseline after
     /// any number of rebuilds.
@@ -961,6 +970,99 @@ impl ChannelSubscription {
             rendered_delivery: self.rendered_delivery_seen,
         }
     }
+
+    /// Mark this channel as delivering forwarded rendered text. Sticky: it
+    /// revokes record-id trust for the channel's whole population.
+    const fn note_rendered_delivery(&mut self) {
+        if !self.rendered_delivery_seen {
+            self.rendered_delivery_seen = true;
+            self.resume.mark_record_identity_unusable();
+        }
+    }
+
+    /// Account for a record this drain read and then did not deliver.
+    ///
+    /// `record_id` is 0 when the record's id could not be read. `xml` is the
+    /// record's XML when it was dropped before the display pass, which is
+    /// where forwarded delivery is otherwise derived: without it a forwarded
+    /// channel whose first records are all filtered would report its
+    /// interleaved ids as gaps. It is parsed only while that can still change
+    /// the verdict.
+    fn note_filtered_record(&mut self, record_id: u64, xml: Option<&str>) {
+        self.records_filtered += 1;
+        if let Some(xml) = xml
+            && !self.query_filters
+            && !self.rendered_delivery_seen
+            && super::rendering_info::parse(xml).is_some()
+        {
+            self.note_rendered_delivery();
+        }
+        self.observe_record_id(record_id);
+    }
+
+    /// Run gap detection on one record this drain read, delivered or not, and
+    /// remember its id as the last one seen.
+    ///
+    /// A gap is therefore only ids the channel never handed over. A record
+    /// read without a usable id (0) cannot be placed, so it is held and
+    /// subtracted from the next gap, which is where it sits.
+    fn observe_record_id(&mut self, record_id: u64) {
+        if record_id == 0 {
+            self.unidentified_since_last_seen += 1;
+            return;
+        }
+        let unidentified = std::mem::take(&mut self.unidentified_since_last_seen);
+        match evaluate_gap(
+            self.last_record_id_seen,
+            record_id,
+            unidentified,
+            self.gap_detection(),
+            self.resume.rung.is_deliberate_skip(),
+        ) {
+            GapVerdict::Gap { missing } => {
+                warn!(
+                    message = format!(
+                        "Windows Event Log record ID gap detected; events were \
+                         overwritten before they could be read (channel={}, \
+                         missing_records={}).",
+                        self.channel, missing
+                    ),
+                    error_code = "record_id_gap",
+                    // The missing records were overwritten before they could
+                    // be read.
+                    error_type = error_type::READER_FAILED,
+                    channel = %self.channel,
+                    missing_records = missing,
+                    previous_record_id = self.last_record_id_seen,
+                    record_id = record_id,
+                    internal_log_rate_limit = false,
+                );
+            }
+            GapVerdict::DeliberateSkip { missing } => {
+                // Same gap, different story: the rung WARN already reported
+                // this as intentional. Quantify it without a second,
+                // unexplained-sounding alarm.
+                warn!(
+                    message = format!(
+                        "Windows Event Log resume skip discarded records, as \
+                         reported (channel={}, missing_records={}).",
+                        self.channel, missing
+                    ),
+                    error_code = "record_id_gap_expected",
+                    error_type = error_type::READER_FAILED,
+                    channel = %self.channel,
+                    // `missing_records` and `cause` are named to match the
+                    // per-source status file, so this event and the status
+                    // entry describing the same skip join without translation.
+                    missing_records = missing,
+                    cause = self.resume.rung.as_str(),
+                    internal_log_rate_limit = false,
+                );
+            }
+            GapVerdict::Continuous | GapVerdict::Suppressed => {}
+        }
+        self.last_record_id_seen = Some(record_id);
+    }
 }
 
 /// Result of waiting for events across all channels.
@@ -1199,8 +1301,10 @@ impl EventLogSubscription {
                 // the triage fact this field exists to carry.
                 last_event_at: resume_seed_time,
                 last_record_id_seen: None,
+                unidentified_since_last_seen: 0,
                 query_filters,
                 name_table_misses: 0,
+                records_filtered: 0,
                 #[cfg(test)]
                 subscription_opens: 0,
                 #[cfg(test)]
@@ -1668,6 +1772,8 @@ impl EventLogSubscription {
                             {
                                 counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_prefilter")
                                     .increment(1);
+                                channel_sub
+                                    .note_filtered_record(system_fields.record_id, Some(&xml));
                                 channel_sub.discard_event_handle(event_handle);
                                 continue;
                             }
@@ -1678,6 +1784,8 @@ impl EventLogSubscription {
                             {
                                 counter!(CounterName::WindowsEventLogEventsFilteredTotal, "reason" => "event_id_prefilter")
                                     .increment(1);
+                                channel_sub
+                                    .note_filtered_record(system_fields.record_id, Some(&xml));
                                 channel_sub.discard_event_handle(event_handle);
                                 continue;
                             }
@@ -1704,174 +1812,123 @@ impl EventLogSubscription {
                                 self.refresh_interval,
                             );
 
-                            if display.rendered_delivery && !channel_sub.rendered_delivery_seen {
+                            if display.rendered_delivery {
                                 // Same per-event signal that drives the crash
                                 // guard also marks this channel's record IDs
                                 // as untrustworthy: forwarded IDs come from
                                 // many originating machines interleaved, so
                                 // every batch would otherwise look like a gap.
-                                channel_sub.rendered_delivery_seen = true;
-                                channel_sub.resume.mark_record_identity_unusable();
+                                channel_sub.note_rendered_delivery();
                             }
 
-                            if let Ok(Some(mut event)) = xml_parser::build_event(
+                            let record_id = system_fields.record_id;
+                            let Ok(Some(mut event)) = xml_parser::build_event(
                                 xml,
                                 &channel_name,
                                 &self.config,
                                 display.rendered_message,
                                 system_fields,
-                            ) {
-                                event.task_name = display.task_name;
-                                event.opcode_name = display.opcode_name;
-                                event.keyword_names = display.keyword_names;
-                                event.resolved_level = display.level_name;
-                                channel_sub.name_table_misses += u64::from(display.table_misses);
+                            ) else {
+                                // Filtered by id or age, or no usable ids. The
+                                // display pass above already derived forwarded
+                                // delivery, so the XML is not needed again.
+                                channel_sub.note_filtered_record(record_id, None);
+                                channel_sub.discard_event_handle(event_handle);
+                                continue;
+                            };
+                            event.task_name = display.task_name;
+                            event.opcode_name = display.opcode_name;
+                            event.keyword_names = display.keyword_names;
+                            event.resolved_level = display.level_name;
+                            channel_sub.name_table_misses += u64::from(display.table_misses);
 
-                                // The ONLY reason an event that rendered is not
-                                // sent. There is no time
-                                // comparison here and there must never be one:
-                                // the API delivers in record order, the
-                                // provider writes the time, and a gate on time
-                                // silently discards real events. Duplicates
-                                // from the millisecond-floored XPath are
-                                // accepted instead, because loss is
-                                // unrecoverable and duplication is not.
-                                if channel_sub.resume.take_poison_skip() {
-                                    // Advance the bookmark and the stored
-                                    // position past it so a restart does not
-                                    // resume onto the same record and repeat
-                                    // the whole escape.
-                                    if channel_sub.bookmark.update(event_handle).is_ok() {
-                                        channel_sub.bookmark_positioned = true;
-                                    }
-                                    channel_sub
-                                        .resume
-                                        .observe_event(event.time_created, event.record_id);
-                                    // The rung WARN already reported this
-                                    // skip; leaving the gap detector behind
-                                    // would report it a second time as an
-                                    // unexplained gap.
-                                    channel_sub.last_record_id_seen = Some(event.record_id);
-                                    warn!(
-                                        message = format!(
-                                            "Windows Event Log poison-event escape \
-                                             skipped one record (channel={}, \
-                                             record_id={}).",
-                                            channel_sub.channel, event.record_id
-                                        ),
-                                        error_code = "poison_record_skipped",
-                                        error_type = error_type::READER_FAILED,
-                                        channel = %channel_sub.channel,
-                                        record_id = event.record_id,
-                                        rung = channel_sub.resume.rung.as_str(),
-                                        internal_log_rate_limit = false,
-                                    );
-                                    counter!(
-                                        CounterName::WindowsEventLogEventsFilteredTotal,
-                                        "reason" => "poison_skip"
-                                    )
-                                    .increment(1);
-                                    channel_sub.discard_event_handle(event_handle);
-                                    continue;
+                            // The ONLY reason an event that rendered is not
+                            // sent. There is no time
+                            // comparison here and there must never be one:
+                            // the API delivers in record order, the
+                            // provider writes the time, and a gate on time
+                            // silently discards real events. Duplicates
+                            // from the millisecond-floored XPath are
+                            // accepted instead, because loss is
+                            // unrecoverable and duplication is not.
+                            if channel_sub.resume.take_poison_skip() {
+                                // Advance the bookmark and the stored
+                                // position past it so a restart does not
+                                // resume onto the same record and repeat
+                                // the whole escape.
+                                if channel_sub.bookmark.update(event_handle).is_ok() {
+                                    channel_sub.bookmark_positioned = true;
                                 }
-
-                                // Record-id gap detection: the only signal we
-                                // have for retention-overwrite data loss, and
-                                // customer-actionable (raise the channel's max
-                                // size).
-                                match evaluate_gap(
-                                    channel_sub.last_record_id_seen,
-                                    event.record_id,
-                                    channel_sub.gap_detection(),
-                                    channel_sub.resume.rung.is_deliberate_skip(),
-                                ) {
-                                    GapVerdict::Gap { missing } => {
-                                        warn!(
-                                            message = format!(
-                                                "Windows Event Log record ID gap \
-                                                 detected; events were overwritten \
-                                                 before they could be read \
-                                                 (channel={}, missing_records={}).",
-                                                channel_sub.channel, missing
-                                            ),
-                                            error_code = "record_id_gap",
-                                            // The missing records were
-                                            // overwritten before they could be
-                                            // read.
-                                            error_type = error_type::READER_FAILED,
-                                            channel = %channel_sub.channel,
-                                            missing_records = missing,
-                                            previous_record_id =
-                                                channel_sub.last_record_id_seen,
-                                            record_id = event.record_id,
-                                            internal_log_rate_limit = false,
-                                        );
-                                    }
-                                    GapVerdict::DeliberateSkip { missing } => {
-                                        // Same gap, different story: the rung
-                                        // WARN already reported this as
-                                        // intentional. Quantify it without a
-                                        // second, unexplained-sounding alarm.
-                                        warn!(
-                                            message = format!(
-                                                "Windows Event Log resume skip \
-                                                 discarded records, as reported \
-                                                 (channel={}, missing_records={}).",
-                                                channel_sub.channel, missing
-                                            ),
-                                            error_code = "record_id_gap_expected",
-                                            error_type = error_type::READER_FAILED,
-                                            channel = %channel_sub.channel,
-                                            // `missing_records` and `cause` are named to
-                                            // match the per-source status file, so this
-                                            // event and the status entry describing the
-                                            // same skip join without translation. The
-                                            // count was `skipped_records` and the slug
-                                            // was `rung`: two names for two things that
-                                            // were already one.
-                                            missing_records = missing,
-                                            cause = channel_sub.resume.rung.as_str(),
-                                            internal_log_rate_limit = false,
-                                        );
-                                    }
-                                    GapVerdict::Continuous | GapVerdict::Suppressed => {}
-                                }
-                                channel_sub.last_record_id_seen = Some(event.record_id);
                                 channel_sub
                                     .resume
                                     .observe_event(event.time_created, event.record_id);
-                                channel_sub.last_event_at = Some(event.time_created);
-
-                                // Resolve SID to human-readable account name
-                                if let Some(ref sid) = event.user_id
-                                    && let Some(account_name) = self.sid_resolver.resolve(sid)
-                                {
-                                    event.user_name = Some(account_name);
-                                }
-
-                                let bookmark_update = channel_sub.bookmark.update(event_handle);
-                                if bookmark_update.is_ok() {
-                                    channel_sub.bookmark_positioned = true;
-                                }
-                                if let Err(e) = bookmark_update {
-                                    emit!(WindowsEventLogBookmarkError {
-                                        channel: channel_sub.channel.clone(),
-                                        error: e.to_string(),
-                                    });
-                                    bookmark_failed = true;
-                                    // Events already in all_events will still be delivered
-                                    // (at-least-once semantics — see doc comment on pull_events).
-                                    // Close current handle normally
-                                    channel_sub.discard_event_handle(event_handle);
-                                    // Close remaining unprocessed handles to prevent leak
-                                    for &h in &batch_handles[idx + 1..] {
-                                        channel_sub.discard_event_handle(EVT_HANDLE(h));
-                                    }
-                                    break 'drain;
-                                }
-                                all_events.push(event);
-                                channel_count += 1;
+                                // The rung WARN already reported this
+                                // skip; leaving the gap detector behind
+                                // would report it a second time as an
+                                // unexplained gap.
+                                channel_sub.last_record_id_seen = Some(event.record_id);
+                                warn!(
+                                    message = format!(
+                                        "Windows Event Log poison-event escape \
+                                         skipped one record (channel={}, \
+                                         record_id={}).",
+                                        channel_sub.channel, event.record_id
+                                    ),
+                                    error_code = "poison_record_skipped",
+                                    error_type = error_type::READER_FAILED,
+                                    channel = %channel_sub.channel,
+                                    record_id = event.record_id,
+                                    rung = channel_sub.resume.rung.as_str(),
+                                    internal_log_rate_limit = false,
+                                );
+                                counter!(
+                                    CounterName::WindowsEventLogEventsFilteredTotal,
+                                    "reason" => "poison_skip"
+                                )
+                                .increment(1);
+                                channel_sub.discard_event_handle(event_handle);
+                                continue;
                             }
+
+                            // Record-id gap detection: the only signal we
+                            // have for retention-overwrite data loss, and
+                            // customer-actionable (raise the channel's max
+                            // size).
+                            channel_sub.observe_record_id(event.record_id);
+                            channel_sub
+                                .resume
+                                .observe_event(event.time_created, event.record_id);
+                            channel_sub.last_event_at = Some(event.time_created);
+
+                            // Resolve SID to human-readable account name
+                            if let Some(ref sid) = event.user_id
+                                && let Some(account_name) = self.sid_resolver.resolve(sid)
+                            {
+                                event.user_name = Some(account_name);
+                            }
+
+                            let bookmark_update = channel_sub.bookmark.update(event_handle);
+                            if bookmark_update.is_ok() {
+                                channel_sub.bookmark_positioned = true;
+                            }
+                            if let Err(e) = bookmark_update {
+                                emit!(WindowsEventLogBookmarkError {
+                                    channel: channel_sub.channel.clone(),
+                                    error: e.to_string(),
+                                });
+                                bookmark_failed = true;
+                                // Events already in all_events will still be delivered
+                                // (at-least-once semantics — see doc comment on pull_events).
+                                // Close current handle normally
+                                channel_sub.discard_event_handle(event_handle);
+                                // Close remaining unprocessed handles to prevent leak
+                                for &h in &batch_handles[idx + 1..] {
+                                    channel_sub.discard_event_handle(EVT_HANDLE(h));
+                                }
+                                break 'drain;
+                            }
+                            all_events.push(event);
+                            channel_count += 1;
                         }
                         Err(e) => {
                             // A batch that READ successfully but contains one
@@ -1882,6 +1939,9 @@ impl EventLogSubscription {
                             // turn a single malformed event into a channel
                             // outage.
                             channel_sub.render_errors_counter.increment(1);
+                            // No XML, so no id: the record is held against the
+                            // next gap instead.
+                            channel_sub.note_filtered_record(0, None);
 
                             // Advance the bookmark PAST the skipped event. The
                             // bookmark is updated from the event handle, which
@@ -2054,9 +2114,15 @@ impl EventLogSubscription {
     #[cfg(test)]
     pub(super) fn first_channel_reports_record_id_gaps(&self) -> bool {
         matches!(
-            evaluate_gap(Some(1), 5, self.channels[0].gap_detection(), false),
+            evaluate_gap(Some(1), 5, 0, self.channels[0].gap_detection(), false),
             GapVerdict::Gap { .. }
         )
+    }
+
+    /// Test-only: records the first channel read and did not deliver.
+    #[cfg(test)]
+    pub(super) fn first_channel_records_filtered(&self) -> u64 {
+        self.channels[0].records_filtered
     }
 
     /// Test-only: could the resume ladder still select the single-record skip
@@ -5133,6 +5199,13 @@ mod tests {
 
     impl XmlRewriteGuard {
         fn install(f: std::sync::Arc<dyn Fn(String) -> String + Send + Sync>) -> Self {
+            Self::install_fallible(std::sync::Arc::new(move |xml| Some(f(xml))))
+        }
+
+        /// Same, where `None` fails that record's render.
+        fn install_fallible(
+            f: std::sync::Arc<dyn Fn(String) -> Option<String> + Send + Sync>,
+        ) -> Self {
             *super::super::render::RENDER_XML_REWRITE.lock().unwrap() = Some(f);
             Self
         }
@@ -5398,6 +5471,263 @@ mod tests {
             "{label}: record numbers were contiguous, so any gap report is the \
              source describing its own dropped events as missing records: {warns:#?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // A record that was read is never a gap.
+    //
+    // Gap detection reports ids the channel never handed over: overwritten by
+    // retention before the read reached them. A record the drain read and then
+    // chose not to deliver was handed over, so reporting its id as missing
+    // tells an operator to grow a channel that lost nothing. Each drop path
+    // below renumbers the real backlog contiguously and drops every third
+    // record by that path, then asserts no gap; the controls add one id
+    // nobody handed over and assert exactly one.
+    // ---------------------------------------------------------------------
+
+    /// An event id no Application provider writes.
+    const IGNORED_EVENT_ID: u32 = 65_001;
+
+    /// Replace the text of the first `<tag ...>text</tag>` element.
+    fn replace_element_text(xml: &str, tag: &str, text: &str) -> String {
+        let mut out = xml.to_string();
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        if let Some(start) = out.find(&open)
+            && let Some(gt) = out[start..].find('>')
+            && let Some(end) = out[start..].find(&close)
+        {
+            out.replace_range(start + gt + 1..start + end, text);
+        }
+        out
+    }
+
+    /// Read the head of the backlog with record `i` renumbered to
+    /// `INJECTED_FIRST_RECORD_ID + i` and then handed to `shape`, whose `None`
+    /// fails that record's render. Returns what was delivered, how many
+    /// records the API returned, and the warn-band error codes.
+    ///
+    /// A few bounded pulls rather than the whole backlog: every record the API
+    /// returns is still rendered and shaped, and a few hundred hold every
+    /// pattern below many times over.
+    fn drain_renumbered(
+        seams: &SeamSession,
+        subscription: &mut EventLogSubscription,
+        shape: fn(usize, String) -> Option<String>,
+    ) -> (Vec<u64>, u64, Vec<(String, String)>) {
+        let request_log = RequestLog::install(seams);
+        let index = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = XmlRewriteGuard::install_fallible(std::sync::Arc::new(move |xml: String| {
+            let i = index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = (INJECTED_FIRST_RECORD_ID + i as u64).to_string();
+            shape(i, replace_element_text(&xml, "EventRecordID", &id))
+        }));
+        let (delivered, warns) = warn_band_error_codes(|| {
+            let mut delivered = Vec::new();
+            for _ in 0..3 {
+                let batch = subscription.pull_events(100).unwrap_or_default();
+                delivered.extend(batch.iter().map(|e| e.record_id));
+            }
+            delivered
+        });
+        let returned = request_log.returned_total();
+        assert!(
+            returned >= 10,
+            "the Application backlog must hold several records for every third \
+             one to be dropped between delivered ones, got {returned}"
+        );
+        (delivered, returned, warns)
+    }
+
+    fn gap_reports(warns: &[(String, String)]) -> usize {
+        warns
+            .iter()
+            .filter(|(_, kind)| kind == "record_id_gap" || kind == "record_id_gap_expected")
+            .count()
+    }
+
+    /// Shift every record from index `at` up by one id, so exactly one id is
+    /// never handed over.
+    fn skip_one_id_at(i: usize, xml: String, at: usize) -> String {
+        if i < at {
+            return xml;
+        }
+        let id = (INJECTED_FIRST_RECORD_ID + i as u64 + 1).to_string();
+        replace_element_text(&xml, "EventRecordID", &id)
+    }
+
+    fn ignore_every_third(i: usize, xml: String) -> Option<String> {
+        Some(if i % 3 == 1 {
+            replace_element_text(&xml, "EventID", &IGNORED_EVENT_ID.to_string())
+        } else {
+            xml
+        })
+    }
+
+    fn ignoring_config() -> WindowsEventLogConfig {
+        WindowsEventLogConfig {
+            ignore_event_ids: vec![IGNORED_EVENT_ID],
+            ..application_config()
+        }
+    }
+
+    /// Assert one drop path left no gap and counted every dropped record.
+    fn assert_dropped_records_are_no_gap(
+        label: &str,
+        subscription: &EventLogSubscription,
+        delivered: &[u64],
+        returned: u64,
+        warns: &[(String, String)],
+    ) {
+        let dropped = (0..returned as usize).filter(|i| i % 3 == 1).count() as u64;
+        assert_eq!(
+            delivered.len() as u64,
+            returned - dropped,
+            "{label}: exactly the shaped records must be dropped, or the path \
+             under test was not the one that ran"
+        );
+        assert_eq!(
+            subscription.first_channel_records_filtered(),
+            dropped,
+            "{label}: every dropped record is counted as filtered"
+        );
+        assert_eq!(
+            gap_reports(warns),
+            0,
+            "{label}: every id was handed over, so a gap report is the source \
+             describing its own filter as overwritten records: {warns:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn records_dropped_by_the_event_id_prefilter_are_no_gap() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&ignoring_config()).await;
+        let (delivered, returned, warns) =
+            drain_renumbered(&_seams, &mut subscription, ignore_every_third);
+        assert_dropped_records_are_no_gap("prefilter", &subscription, &delivered, returned, &warns);
+    }
+
+    #[tokio::test]
+    async fn records_dropped_by_the_age_cap_are_no_gap() {
+        let _seams = SeamSession::acquire();
+        let config = WindowsEventLogConfig {
+            max_event_age_secs: Some(3_600),
+            ..application_config()
+        };
+        let mut subscription = subscription_from(&config).await;
+        let (delivered, returned, warns) =
+            drain_renumbered(&_seams, &mut subscription, |i, xml| {
+                let age = if i % 3 == 1 {
+                    chrono::Duration::days(2)
+                } else {
+                    chrono::Duration::minutes(10)
+                };
+                Some(rewrite_time_and_record(
+                    &xml,
+                    chrono::Utc::now() - age,
+                    None,
+                ))
+            });
+        assert_dropped_records_are_no_gap("age cap", &subscription, &delivered, returned, &warns);
+    }
+
+    #[tokio::test]
+    async fn records_without_usable_ids_are_no_gap() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        let (delivered, returned, warns) =
+            drain_renumbered(&_seams, &mut subscription, |i, xml| {
+                Some(if i % 3 == 1 {
+                    let no_record = replace_element_text(&xml, "EventRecordID", "0");
+                    replace_element_text(&no_record, "EventID", "0")
+                } else {
+                    xml
+                })
+            });
+        assert_dropped_records_are_no_gap("no ids", &subscription, &delivered, returned, &warns);
+    }
+
+    #[tokio::test]
+    async fn records_that_fail_to_render_are_no_gap() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        let (delivered, returned, warns) =
+            drain_renumbered(&_seams, &mut subscription, |i, xml| {
+                (i % 3 != 1).then_some(xml)
+            });
+        assert_dropped_records_are_no_gap(
+            "render failure",
+            &subscription,
+            &delivered,
+            returned,
+            &warns,
+        );
+    }
+
+    /// Control: a filter in play does not hide an id nobody handed over.
+    #[tokio::test]
+    async fn an_id_never_handed_over_is_still_a_gap_beside_filtered_records() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&ignoring_config()).await;
+        let (_, _, warns) = drain_renumbered(&_seams, &mut subscription, |i, xml| {
+            ignore_every_third(i, skip_one_id_at(i, xml, 7))
+        });
+        assert_eq!(
+            warns
+                .iter()
+                .filter(|(_, kind)| kind == "record_id_gap")
+                .count(),
+            1,
+            "one id was never handed over: {warns:#?}"
+        );
+    }
+
+    /// Control: a render failure fills only its own place in a hole.
+    #[tokio::test]
+    async fn an_id_never_handed_over_is_still_a_gap_beside_a_render_failure() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        let (_, _, warns) = drain_renumbered(&_seams, &mut subscription, |i, xml| {
+            (i != 6).then(|| skip_one_id_at(i, xml, 7))
+        });
+        assert_eq!(
+            warns
+                .iter()
+                .filter(|(_, kind)| kind == "record_id_gap")
+                .count(),
+            1,
+            "record 6 failed to render and id 7 was never handed over: {warns:#?}"
+        );
+    }
+
+    /// A forwarded channel whose first record is filtered before the display
+    /// pass must still self-suppress, or its interleaved ids read as gaps.
+    #[tokio::test]
+    async fn a_filtered_forwarded_record_still_revokes_record_id_trust() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&ignoring_config()).await;
+        let (delivered, _, warns) = drain_renumbered(&_seams, &mut subscription, |i, xml| {
+            if i == 0 {
+                let ignored = replace_element_text(&xml, "EventID", &IGNORED_EVENT_ID.to_string());
+                return Some(ignored.replace(
+                    "</Event>",
+                    "<RenderingInfo Culture='en-US'><Message>forwarded</Message>\
+                     </RenderingInfo></Event>",
+                ));
+            }
+            // Interleaved origins: every later id leaves a hole.
+            let id = (INJECTED_FIRST_RECORD_ID + 2 * i as u64).to_string();
+            Some(replace_element_text(&xml, "EventRecordID", &id))
+        });
+        assert!(
+            delivered.len() >= 2,
+            "records after the filtered forwarded one must be delivered for \
+             their holes to be judged, got {}",
+            delivered.len()
+        );
+        assert_eq!(gap_reports(&warns), 0, "{warns:#?}");
+        assert!(!subscription.first_channel_reports_record_id_gaps());
     }
 
     /// One drain of the whole backlog under an injected timeline.

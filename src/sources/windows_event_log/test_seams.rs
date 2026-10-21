@@ -47,7 +47,7 @@
 use std::sync::{Mutex, MutexGuard};
 use std::thread::ThreadId;
 
-use super::{metadata, subscription};
+use super::{metadata, render, subscription};
 
 /// Process-wide exclusion over every seam listed in the module docs.
 static SEAM_LOCK: Mutex<()> = Mutex::new(());
@@ -137,6 +137,7 @@ fn reset_all() {
     clear!(subscription::EVT_NEXT_REQUESTS);
     clear!(subscription::EVT_SUBSCRIBE_FLAG_LOG);
     clear!(subscription::DRAIN_STEP_HOOK);
+    clear!(render::RENDER_XML_REWRITE);
 
     subscription::FAIL_ALL_RENDERS.store(false, SeqCst);
     subscription::FAIL_ALL_BOOKMARK_UPDATES.store(false, SeqCst);
