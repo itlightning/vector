@@ -536,10 +536,15 @@ pub(super) struct GapDetection {
     pub(super) rendered_delivery: bool,
 }
 
-/// Evaluate one event's record id against the previous one.
+/// Evaluate one record id against the previous one seen.
+///
+/// `unidentified` is how many records were read in between without a usable
+/// id. Each one occupies an id in the hole, so the hole is reduced by that
+/// many, and a hole they fill completely is no gap at all.
 pub(super) const fn evaluate_gap(
     previous: Option<u64>,
     current: u64,
+    unidentified: u64,
     detection: GapDetection,
     deliberate_skip_in_play: bool,
 ) -> GapVerdict {
@@ -552,7 +557,10 @@ pub(super) const fn evaluate_gap(
     if current <= previous + 1 {
         return GapVerdict::Continuous;
     }
-    let missing = current - previous - 1;
+    let missing = (current - previous - 1).saturating_sub(unidentified);
+    if missing == 0 {
+        return GapVerdict::Continuous;
+    }
     if deliberate_skip_in_play {
         GapVerdict::DeliberateSkip { missing }
     } else {
@@ -923,12 +931,42 @@ mod tests {
             rendered_delivery: false,
         };
         assert_eq!(
-            evaluate_gap(Some(10), 11, detection, false),
+            evaluate_gap(Some(10), 11, 0, detection, false),
             GapVerdict::Continuous
         );
         assert_eq!(
-            evaluate_gap(Some(10), 20, detection, false),
+            evaluate_gap(Some(10), 20, 0, detection, false),
             GapVerdict::Gap { missing: 9 }
+        );
+    }
+
+    /// A record read without a usable id still occupies one id of the hole
+    /// it sits in. Ignoring it reports a render failure as an overwrite;
+    /// over-counting it hides a real one.
+    #[test]
+    fn records_read_without_an_id_fill_their_place_in_the_hole() {
+        let detection = GapDetection {
+            query_filters: false,
+            rendered_delivery: false,
+        };
+        assert_eq!(
+            evaluate_gap(Some(10), 12, 1, detection, false),
+            GapVerdict::Continuous,
+            "one unreadable record between 10 and 12 is id 11"
+        );
+        assert_eq!(
+            evaluate_gap(Some(10), 14, 1, detection, false),
+            GapVerdict::Gap { missing: 2 },
+            "the ids nobody handed over are still a gap"
+        );
+        assert_eq!(
+            evaluate_gap(Some(10), 14, 1, detection, true),
+            GapVerdict::DeliberateSkip { missing: 2 }
+        );
+        assert_eq!(
+            evaluate_gap(Some(10), 12, 3, detection, false),
+            GapVerdict::Continuous,
+            "more unreadable records than the hole can hold never underflow"
         );
     }
 
@@ -941,13 +979,14 @@ mod tests {
             rendered_delivery: false,
         };
         assert_eq!(
-            evaluate_gap(Some(10), 20, plain, true),
+            evaluate_gap(Some(10), 20, 0, plain, true),
             GapVerdict::DeliberateSkip { missing: 9 }
         );
         assert_eq!(
             evaluate_gap(
                 Some(10),
                 20,
+                0,
                 GapDetection {
                     query_filters: true,
                     rendered_delivery: false
@@ -960,6 +999,7 @@ mod tests {
             evaluate_gap(
                 Some(10),
                 20,
+                0,
                 GapDetection {
                     query_filters: false,
                     rendered_delivery: true

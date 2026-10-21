@@ -21,25 +21,30 @@ use super::win32_errors::{RenderDisposition, classify_render, win32_code};
 /// event whose XML carries the element exercises the real derivation. A WEC
 /// forwarding pair is the only way to obtain such an event from the API, and
 /// setting the derived flag directly would assert the seam instead.
+///
+/// Returning `None` fails this one render, so a test can place a render
+/// failure at a chosen record rather than failing every render.
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
 pub(super) static RENDER_XML_REWRITE: std::sync::Mutex<
-    Option<std::sync::Arc<dyn Fn(String) -> String + Send + Sync>>,
+    Option<std::sync::Arc<dyn Fn(String) -> Option<String> + Send + Sync>>,
 > = std::sync::Mutex::new(None);
 
 /// Apply the test-only rewrite, if one is installed.
 #[cfg(test)]
-fn rewrite_xml(xml: String) -> String {
+fn rewrite_xml(xml: String) -> Result<String, WindowsEventLogError> {
     let rewrite = RENDER_XML_REWRITE.lock().unwrap().clone();
     match rewrite {
-        Some(f) => f(xml),
-        None => xml,
+        Some(f) => f(xml).ok_or_else(|| WindowsEventLogError::ReadEventError {
+            source: windows::core::Error::from_hresult(windows::core::HRESULT(13)),
+        }),
+        None => Ok(xml),
     }
 }
 
 #[cfg(not(test))]
-const fn rewrite_xml(xml: String) -> String {
-    xml
+const fn rewrite_xml(xml: String) -> Result<String, WindowsEventLogError> {
+    Ok(xml)
 }
 
 /// Render an event handle to XML using reusable buffers.
@@ -118,7 +123,7 @@ pub(super) fn render_event_xml(
             }
             shrink_decode_buffer(decode_buffer);
 
-            return Ok(rewrite_xml(result));
+            return rewrite_xml(result);
         }
         return Err(WindowsEventLogError::ReadEventError { source: e });
     }
@@ -134,7 +139,7 @@ pub(super) fn render_event_xml(
     }
     shrink_decode_buffer(decode_buffer);
 
-    Ok(rewrite_xml(result))
+    rewrite_xml(result)
 }
 
 /// Decoded UTF-16 scratch: its resting size, and the size past which an outsized
