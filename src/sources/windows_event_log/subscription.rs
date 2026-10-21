@@ -732,7 +732,7 @@ struct ChannelSubscription {
     /// Not counted: a record skipped by a poison escape, and the records
     /// discarded after a failed bookmark update. Those discarded records are
     /// lost in this process, and the next record reports them as a gap.
-    /// Serialized on the status file by the stacked status patch.
+    /// Reported in the status file.
     records_filtered: u64,
     /// Holes the resume ladder punched in this channel, newest last and bounded
     /// so a flapping channel cannot grow without limit. Reported in the status
@@ -1274,6 +1274,7 @@ impl ChannelSubscription {
             query_filters: self.query_filters(),
             suppress_active: self.factory.suppress_active(),
             records_read: self.records_read,
+            records_filtered: self.records_filtered,
             bookmark_positioned: self.bookmark_positioned,
             unavailable_since: self
                 .unavailable_since
@@ -1318,7 +1319,7 @@ impl ChannelSubscription {
     fn note_filtered_record(&mut self, record_id: u64, xml: Option<&str>) {
         self.records_filtered += 1;
         if let Some(xml) = xml
-            && !self.query_filters
+            && !self.query_filters()
             && !self.rendered_delivery_seen
             && super::rendering_info::parse(xml).is_some()
         {
@@ -6831,6 +6832,11 @@ mod tests {
         let (delivered, returned, warns) =
             drain_renumbered(&_seams, &mut subscription, ignore_every_third);
         assert_dropped_records_are_no_gap("prefilter", &subscription, &delivered, returned, &warns);
+        assert_eq!(
+            application_status(&subscription).records_filtered,
+            subscription.first_channel_records_filtered(),
+            "the status file reports the filtered count"
+        );
     }
 
     #[tokio::test]
