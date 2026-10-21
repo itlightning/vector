@@ -1918,7 +1918,7 @@ impl EventLogSubscription {
                                 });
                                 bookmark_failed = true;
                                 // Events already in all_events will still be delivered
-                                // (at-least-once semantics — see doc comment on pull_events).
+                                // (at-least-once semantics; see the doc comment on pull_events).
                                 // Close current handle normally
                                 channel_sub.discard_event_handle(event_handle);
                                 // Close remaining unprocessed handles to prevent leak
