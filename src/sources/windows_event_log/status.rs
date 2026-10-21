@@ -148,11 +148,13 @@ pub(super) struct ChannelStatus {
     #[serde(default)]
     pub(super) records_read: u64,
     /// Of [`Self::records_read`], those dropped by a filter decision: an
-    /// event-id filter, the age cap, or a record that could not be rendered or
-    /// parsed. Such a record was read, so it never counts toward a record-id
-    /// gap. A record skipped by a poison escape, or discarded after a failed
-    /// bookmark update (re-read later), is not delivered either and is not
-    /// counted here. Monotonic, like [`Self::records_read`].
+    /// event-id filter (`only_event_ids`, `ignore_event_ids`), the age cap, a
+    /// record with no usable ids, and one that could not be rendered. Such a
+    /// record was read, so it never counts toward a record-id gap.
+    /// Not counted: a record skipped by a poison escape, and the records
+    /// discarded after a failed bookmark update. Those discarded records are
+    /// lost in this process, and the next record reports them as a gap.
+    /// Monotonic, like [`Self::records_read`].
     ///
     /// Additive: absent means a writer that did not count, not zero filtered.
     #[serde(default)]
