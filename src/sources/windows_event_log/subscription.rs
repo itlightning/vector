@@ -1822,113 +1822,112 @@ impl EventLogSubscription {
                             }
 
                             let record_id = system_fields.record_id;
-                            let Ok(Some(mut event)) = xml_parser::build_event(
+                            if let Ok(Some(mut event)) = xml_parser::build_event(
                                 xml,
                                 &channel_name,
                                 &self.config,
                                 display.rendered_message,
                                 system_fields,
-                            ) else {
+                            ) {
+                                event.task_name = display.task_name;
+                                event.opcode_name = display.opcode_name;
+                                event.keyword_names = display.keyword_names;
+                                event.resolved_level = display.level_name;
+                                channel_sub.name_table_misses += u64::from(display.table_misses);
+
+                                // The ONLY reason an event that rendered is not
+                                // sent. There is no time
+                                // comparison here and there must never be one:
+                                // the API delivers in record order, the
+                                // provider writes the time, and a gate on time
+                                // silently discards real events. Duplicates
+                                // from the millisecond-floored XPath are
+                                // accepted instead, because loss is
+                                // unrecoverable and duplication is not.
+                                if channel_sub.resume.take_poison_skip() {
+                                    // Advance the bookmark and the stored
+                                    // position past it so a restart does not
+                                    // resume onto the same record and repeat
+                                    // the whole escape.
+                                    if channel_sub.bookmark.update(event_handle).is_ok() {
+                                        channel_sub.bookmark_positioned = true;
+                                    }
+                                    channel_sub
+                                        .resume
+                                        .observe_event(event.time_created, event.record_id);
+                                    // The rung WARN already reported this
+                                    // skip; leaving the gap detector behind
+                                    // would report it a second time as an
+                                    // unexplained gap.
+                                    channel_sub.last_record_id_seen = Some(event.record_id);
+                                    warn!(
+                                        message = format!(
+                                            "Windows Event Log poison-event escape \
+                                             skipped one record (channel={}, \
+                                             record_id={}).",
+                                            channel_sub.channel, event.record_id
+                                        ),
+                                        error_code = "poison_record_skipped",
+                                        error_type = error_type::READER_FAILED,
+                                        channel = %channel_sub.channel,
+                                        record_id = event.record_id,
+                                        rung = channel_sub.resume.rung.as_str(),
+                                        internal_log_rate_limit = false,
+                                    );
+                                    counter!(
+                                        CounterName::WindowsEventLogEventsFilteredTotal,
+                                        "reason" => "poison_skip"
+                                    )
+                                    .increment(1);
+                                    channel_sub.discard_event_handle(event_handle);
+                                    continue;
+                                }
+
+                                // Record-id gap detection: the only signal we
+                                // have for retention-overwrite data loss, and
+                                // customer-actionable (raise the channel's max
+                                // size).
+                                channel_sub.observe_record_id(event.record_id);
+                                channel_sub
+                                    .resume
+                                    .observe_event(event.time_created, event.record_id);
+                                channel_sub.last_event_at = Some(event.time_created);
+
+                                // Resolve SID to human-readable account name
+                                if let Some(ref sid) = event.user_id
+                                    && let Some(account_name) = self.sid_resolver.resolve(sid)
+                                {
+                                    event.user_name = Some(account_name);
+                                }
+
+                                let bookmark_update = channel_sub.bookmark.update(event_handle);
+                                if bookmark_update.is_ok() {
+                                    channel_sub.bookmark_positioned = true;
+                                }
+                                if let Err(e) = bookmark_update {
+                                    emit!(WindowsEventLogBookmarkError {
+                                        channel: channel_sub.channel.clone(),
+                                        error: e.to_string(),
+                                    });
+                                    bookmark_failed = true;
+                                    // Events already in all_events will still be delivered
+                                    // (at-least-once semantics — see doc comment on pull_events).
+                                    // Close current handle normally
+                                    channel_sub.discard_event_handle(event_handle);
+                                    // Close remaining unprocessed handles to prevent leak
+                                    for &h in &batch_handles[idx + 1..] {
+                                        channel_sub.discard_event_handle(EVT_HANDLE(h));
+                                    }
+                                    break 'drain;
+                                }
+                                all_events.push(event);
+                                channel_count += 1;
+                            } else {
                                 // Filtered by id or age, or no usable ids. The
                                 // display pass above already derived forwarded
                                 // delivery, so the XML is not needed again.
                                 channel_sub.note_filtered_record(record_id, None);
-                                channel_sub.discard_event_handle(event_handle);
-                                continue;
-                            };
-                            event.task_name = display.task_name;
-                            event.opcode_name = display.opcode_name;
-                            event.keyword_names = display.keyword_names;
-                            event.resolved_level = display.level_name;
-                            channel_sub.name_table_misses += u64::from(display.table_misses);
-
-                            // The ONLY reason an event that rendered is not
-                            // sent. There is no time
-                            // comparison here and there must never be one:
-                            // the API delivers in record order, the
-                            // provider writes the time, and a gate on time
-                            // silently discards real events. Duplicates
-                            // from the millisecond-floored XPath are
-                            // accepted instead, because loss is
-                            // unrecoverable and duplication is not.
-                            if channel_sub.resume.take_poison_skip() {
-                                // Advance the bookmark and the stored
-                                // position past it so a restart does not
-                                // resume onto the same record and repeat
-                                // the whole escape.
-                                if channel_sub.bookmark.update(event_handle).is_ok() {
-                                    channel_sub.bookmark_positioned = true;
-                                }
-                                channel_sub
-                                    .resume
-                                    .observe_event(event.time_created, event.record_id);
-                                // The rung WARN already reported this
-                                // skip; leaving the gap detector behind
-                                // would report it a second time as an
-                                // unexplained gap.
-                                channel_sub.last_record_id_seen = Some(event.record_id);
-                                warn!(
-                                    message = format!(
-                                        "Windows Event Log poison-event escape \
-                                         skipped one record (channel={}, \
-                                         record_id={}).",
-                                        channel_sub.channel, event.record_id
-                                    ),
-                                    error_code = "poison_record_skipped",
-                                    error_type = error_type::READER_FAILED,
-                                    channel = %channel_sub.channel,
-                                    record_id = event.record_id,
-                                    rung = channel_sub.resume.rung.as_str(),
-                                    internal_log_rate_limit = false,
-                                );
-                                counter!(
-                                    CounterName::WindowsEventLogEventsFilteredTotal,
-                                    "reason" => "poison_skip"
-                                )
-                                .increment(1);
-                                channel_sub.discard_event_handle(event_handle);
-                                continue;
                             }
-
-                            // Record-id gap detection: the only signal we
-                            // have for retention-overwrite data loss, and
-                            // customer-actionable (raise the channel's max
-                            // size).
-                            channel_sub.observe_record_id(event.record_id);
-                            channel_sub
-                                .resume
-                                .observe_event(event.time_created, event.record_id);
-                            channel_sub.last_event_at = Some(event.time_created);
-
-                            // Resolve SID to human-readable account name
-                            if let Some(ref sid) = event.user_id
-                                && let Some(account_name) = self.sid_resolver.resolve(sid)
-                            {
-                                event.user_name = Some(account_name);
-                            }
-
-                            let bookmark_update = channel_sub.bookmark.update(event_handle);
-                            if bookmark_update.is_ok() {
-                                channel_sub.bookmark_positioned = true;
-                            }
-                            if let Err(e) = bookmark_update {
-                                emit!(WindowsEventLogBookmarkError {
-                                    channel: channel_sub.channel.clone(),
-                                    error: e.to_string(),
-                                });
-                                bookmark_failed = true;
-                                // Events already in all_events will still be delivered
-                                // (at-least-once semantics; see the doc comment on pull_events).
-                                // Close current handle normally
-                                channel_sub.discard_event_handle(event_handle);
-                                // Close remaining unprocessed handles to prevent leak
-                                for &h in &batch_handles[idx + 1..] {
-                                    channel_sub.discard_event_handle(EVT_HANDLE(h));
-                                }
-                                break 'drain;
-                            }
-                            all_events.push(event);
-                            channel_count += 1;
                         }
                         Err(e) => {
                             // A batch that READ successfully but contains one
