@@ -537,10 +537,14 @@ struct ChannelSubscription {
     /// fallback ran. Internal diagnostics; serialized on the status file by
     /// the stacked status patch.
     name_table_misses: u64,
-    /// Records read and then not delivered: an event-id filter, the age cap,
-    /// or a record that could not be rendered or parsed. Such a record was
-    /// seen, so it is counted here and never reported as a gap. Serialized on
-    /// the status file by the stacked status patch.
+    /// Records read and then dropped by a filter decision: an event-id filter
+    /// (`only_event_ids`, `ignore_event_ids`), the age cap, a record with no
+    /// usable ids, and one that could not be rendered. Such a record was seen,
+    /// so it never counts toward a gap.
+    /// Not counted: a record skipped by a poison escape, and the records
+    /// discarded after a failed bookmark update. Those discarded records are
+    /// lost in this process, and the next record reports them as a gap.
+    /// Serialized on the status file by the stacked status patch.
     records_filtered: u64,
     /// Test-only handle accounting, per channel so parallel tests cannot
     /// perturb each other. `opens - closes` must return to its baseline after
@@ -5764,6 +5768,67 @@ mod tests {
         assert_eq!(
             across_reread, 1,
             "the re-read of base+5 spent the hold; id base+6 was never handed over"
+        );
+    }
+
+    /// The poison skip spends a held render failure at the drain, not only in
+    /// the helper. The skip rung reads one record per batch and a clean batch
+    /// disarms it, so the hold has to exist before the ladder is walked: a
+    /// scripted batch of one null handle fails to render and is held, the skip
+    /// then discards the first real record past the boundary, and the one-id
+    /// hole right after that record must still report.
+    #[tokio::test]
+    async fn a_poison_skip_at_the_drain_spends_a_held_render_failure() {
+        let _seams = SeamSession::acquire();
+        let index = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _rewrite = XmlRewriteGuard::install(std::sync::Arc::new(move |xml: String| {
+            let i = index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = (INJECTED_FIRST_RECORD_ID + i as u64).to_string();
+            // Index 3 is the record the skip discards; index 4 opens the hole.
+            skip_one_id_at(i, replace_element_text(&xml, "EventRecordID", &id), 4)
+        }));
+        let mut subscription = subscription_from(&application_config()).await;
+        let read = subscription.pull_events(3).unwrap_or_default();
+        assert_eq!(read.len(), 3, "the resume boundary must land mid-backlog");
+
+        {
+            let _guard = ScriptGuard::install(&_seams, &[(0, 1), (259, 0)]);
+            _ = subscription.pull_events(usize::MAX);
+        }
+        assert_eq!(
+            subscription.first_channel_records_filtered(),
+            1,
+            "the scripted null handle must have failed to render and been held"
+        );
+
+        // Two stuck detections walk the ladder to the skip rung, as in the
+        // deliberate-skip test above.
+        for _ in 0..6 {
+            {
+                let _guard = ScriptGuard::install(&_seams, &[(15011, 0)]);
+                _ = subscription.pull_events(usize::MAX);
+            }
+            subscription.force_rebuild_all();
+        }
+        assert!(subscription.first_channel_is_live());
+
+        let (_, warns) = warn_band_error_codes(|| {
+            for _ in 0..3 {
+                _ = subscription.pull_events(100);
+            }
+        });
+        assert!(
+            warns
+                .iter()
+                .any(|(level, kind)| level == "WARN" && kind == "poison_record_skipped"),
+            "the skip rung must have discarded a record, or the path under test \
+             did not run: {warns:#?}"
+        );
+        assert_eq!(
+            gap_reports(&warns),
+            1,
+            "the skip moved the last id past the held render failure, so the \
+             hold is spent and the one-id hole must report: {warns:#?}"
         );
     }
 
