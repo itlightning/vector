@@ -1000,6 +1000,16 @@ impl ChannelSubscription {
         self.observe_record_id(record_id);
     }
 
+    /// Remember `record_id` as the last one seen without judging the hole
+    /// before it, for a skip that has already been reported.
+    ///
+    /// Any held records without an id are consumed too: they sat before this
+    /// record, so they must not reduce a later, unrelated gap.
+    const fn place_record_id_unchecked(&mut self, record_id: u64) {
+        self.unidentified_since_last_seen = 0;
+        self.last_record_id_seen = Some(record_id);
+    }
+
     /// Run gap detection on one record this drain read, delivered or not, and
     /// remember its id as the last one seen.
     ///
@@ -1859,7 +1869,7 @@ impl EventLogSubscription {
                                     // skip; leaving the gap detector behind
                                     // would report it a second time as an
                                     // unexplained gap.
-                                    channel_sub.last_record_id_seen = Some(event.record_id);
+                                    channel_sub.place_record_id_unchecked(event.record_id);
                                     warn!(
                                         message = format!(
                                             "Windows Event Log poison-event escape \
@@ -5679,6 +5689,81 @@ mod tests {
                 .count(),
             1,
             "one id was never handed over: {warns:#?}"
+        );
+    }
+
+    /// Control: a held render failure is spent on the hole it sat in, so a
+    /// later one-id hole still reports.
+    #[tokio::test]
+    async fn a_render_failure_does_not_absorb_a_later_hole() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        let (_, _, warns) = drain_renumbered(&_seams, &mut subscription, |i, xml| {
+            (i != 3).then(|| skip_one_id_at(i, xml, 10))
+        });
+        assert_eq!(
+            warns
+                .iter()
+                .filter(|(_, kind)| kind == "record_id_gap")
+                .count(),
+            1,
+            "record 3 failed to render inside a contiguous run; id 10 was never \
+             handed over and must still report: {warns:#?}"
+        );
+    }
+
+    /// Feed one channel record ids directly, `0` standing for a record read
+    /// without an id, and count the gap reports.
+    fn gap_reports_for(subscription: &mut EventLogSubscription, steps: &[(&str, u64)]) -> usize {
+        let channel = &mut subscription.channels[0];
+        let (_, warns) = warn_band_error_codes(|| {
+            for &(step, id) in steps {
+                match step {
+                    "read" => channel.observe_record_id(id),
+                    "skip" => channel.place_record_id_unchecked(id),
+                    other => panic!("unknown step {other}"),
+                }
+            }
+        });
+        warns
+            .iter()
+            .filter(|(_, kind)| kind == "record_id_gap")
+            .count()
+    }
+
+    /// A held record without an id is consumed wherever the last seen id
+    /// moves, so it cannot hide a later one-id hole: across a reported poison
+    /// skip, and across a rebuild that re-reads ids already seen.
+    #[tokio::test]
+    async fn a_held_unidentified_record_never_absorbs_a_later_hole() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        let base = INJECTED_FIRST_RECORD_ID;
+
+        let across_skip = gap_reports_for(
+            &mut subscription,
+            &[
+                ("read", base),
+                ("read", 0),
+                ("skip", base + 2),
+                ("read", base + 4),
+            ],
+        );
+        assert_eq!(across_skip, 1, "id base+3 was never handed over");
+
+        let mut subscription = subscription_from(&application_config()).await;
+        let across_reread = gap_reports_for(
+            &mut subscription,
+            &[
+                ("read", base + 10),
+                ("read", 0),
+                ("read", base + 5),
+                ("read", base + 7),
+            ],
+        );
+        assert_eq!(
+            across_reread, 1,
+            "the re-read of base+5 spent the hold; id base+6 was never handed over"
         );
     }
 
