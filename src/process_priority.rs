@@ -46,7 +46,7 @@ impl PriorityClassSetter for CurrentProcess {
 /// leaves the priority class as the process was started with.
 ///
 /// Best-effort: a refused change is a warning, never a failed start.
-pub fn settle(priority: Option<SteadyPriority>) {
+pub(crate) fn settle(priority: Option<SteadyPriority>) {
     settle_with(priority, &CurrentProcess);
 }
 

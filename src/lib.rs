@@ -101,9 +101,9 @@ pub mod list;
 #[cfg(any(feature = "sources-nats", feature = "sinks-nats"))]
 pub mod nats;
 pub mod net;
-#[allow(unreachable_pub)]
 #[cfg(windows)]
 mod process_priority;
+#[allow(unreachable_pub)]
 pub(crate) mod proto;
 pub mod providers;
 pub mod secrets;
