@@ -147,6 +147,14 @@ pub(super) struct ChannelStatus {
     /// Additive: absent means a writer that did not count, not zero reads.
     #[serde(default)]
     pub(super) records_read: u64,
+    /// Of [`Self::records_read`], those not delivered: an event-id filter, the
+    /// age cap, or a record that could not be rendered or parsed. Such a
+    /// record was read, so it never counts toward a record-id gap. Monotonic,
+    /// like [`Self::records_read`].
+    ///
+    /// Additive: absent means a writer that did not count, not zero filtered.
+    #[serde(default)]
+    pub(super) records_filtered: u64,
     /// Whether the stored bookmark marks a real position.
     pub(super) bookmark_positioned: bool,
     /// When this channel's current run of failures began: the first failure
@@ -539,6 +547,7 @@ mod tests {
                 query_filters: false,
                 suppress_active: false,
                 records_read: 9_876,
+                records_filtered: 12,
                 bookmark_positioned: true,
                 unavailable_since: None,
                 last_error: None,
@@ -571,6 +580,7 @@ mod tests {
                 query_filters: true,
                 suppress_active: true,
                 records_read: 0,
+                records_filtered: 0,
                 bookmark_positioned: false,
                 unavailable_since: Some(rfc3339(ts(1_699_999_500))),
                 last_error: Some(15007),
@@ -611,6 +621,7 @@ mod tests {
         assert_eq!(defender["query_filters"], false);
         assert_eq!(defender["suppress_active"], false);
         assert_eq!(defender["records_read"], 9_876);
+        assert_eq!(defender["records_filtered"], 12);
         assert_eq!(defender["name_table_misses"], 0);
         assert_eq!(defender["gaps"][0]["cause"], "skip_record");
         assert_eq!(defender["gaps"][0]["exact"], true);
