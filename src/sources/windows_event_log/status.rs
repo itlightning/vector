@@ -147,10 +147,12 @@ pub(super) struct ChannelStatus {
     /// Additive: absent means a writer that did not count, not zero reads.
     #[serde(default)]
     pub(super) records_read: u64,
-    /// Of [`Self::records_read`], those not delivered: an event-id filter, the
-    /// age cap, or a record that could not be rendered or parsed. Such a
-    /// record was read, so it never counts toward a record-id gap. Monotonic,
-    /// like [`Self::records_read`].
+    /// Of [`Self::records_read`], those dropped by a filter decision: an
+    /// event-id filter, the age cap, or a record that could not be rendered or
+    /// parsed. Such a record was read, so it never counts toward a record-id
+    /// gap. A record skipped by a poison escape, or discarded after a failed
+    /// bookmark update (re-read later), is not delivered either and is not
+    /// counted here. Monotonic, like [`Self::records_read`].
     ///
     /// Additive: absent means a writer that did not count, not zero filtered.
     #[serde(default)]
