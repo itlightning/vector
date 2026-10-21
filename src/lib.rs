@@ -102,6 +102,8 @@ pub mod list;
 pub mod nats;
 pub mod net;
 #[allow(unreachable_pub)]
+#[cfg(windows)]
+mod process_priority;
 pub(crate) mod proto;
 pub mod providers;
 pub mod secrets;

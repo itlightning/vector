@@ -275,6 +275,10 @@ impl Application {
         crate::trace::stop_early_buffering();
 
         emit!(VectorStarted);
+        // The topology is running: settle at the steady priority class, after the
+        // startup burst rather than during it.
+        #[cfg(windows)]
+        crate::process_priority::settle(self.config.topology.config().global.steady_priority);
         handle.spawn(heartbeat::heartbeat());
 
         let Self {
