@@ -85,6 +85,14 @@ pub(super) struct GapRecord {
 pub(super) struct ChannelStatus {
     /// A live subscription handle exists for this channel.
     pub(super) subscribed: bool,
+    /// The channel held no records when last read, so it holds no subscription.
+    /// Not a failure: [`Self::last_drained_at`] is stamped by each read of zero,
+    /// so a channel that stops being read ages like any other, and a false here
+    /// beside a false [`Self::subscribed`] is what means unavailable.
+    ///
+    /// Additive: absent means a writer that subscribes to every channel.
+    #[serde(default)]
+    pub(super) dormant: bool,
     /// Slug of the reason this channel is skipped for the current subscription
     /// generation, or `null` when it is not skipped.
     pub(super) skipped_reason: Option<String>,
@@ -98,7 +106,8 @@ pub(super) struct ChannelStatus {
     ///
     /// Earned by a read that returned zero events, or by a read that ended with
     /// "no more items" even if it also returned events: both say the queue was
-    /// empty at that instant. Never earned by a full batch or a budget stop.
+    /// empty at that instant. A dormant channel earns it by a record count of
+    /// zero. Never earned by a full batch or a budget stop.
     ///
     /// The fact a reader should decide on: a queue the service reports empty
     /// IS caught up, with no arithmetic, filtered or not. It has to be stamped
@@ -111,7 +120,7 @@ pub(super) struct ChannelStatus {
     /// `EventRecordID` of the newest record in the channel, read off that
     /// record at write time. Reported, not decided on.
     ///
-    /// `null` when the channel is empty or the read failed. Never derived from
+    /// `null` when the channel is empty, dormant, or the read failed. Never derived from
     /// the oldest record number and the count: that undershoots whenever the id
     /// range has holes, and after a clear restarts the oldest number.
     ///
@@ -542,6 +551,7 @@ mod tests {
             "Microsoft-Windows-Windows Defender/Operational".to_string(),
             ChannelStatus {
                 subscribed: true,
+                dormant: false,
                 skipped_reason: None,
                 rung: "bookmark".to_string(),
                 last_event_at: Some(rfc3339(ts(1_700_000_000))),
@@ -575,6 +585,7 @@ mod tests {
             "Security".to_string(),
             ChannelStatus {
                 subscribed: false,
+                dormant: false,
                 skipped_reason: Some("access_denied".to_string()),
                 rung: "bookmark".to_string(),
                 last_event_at: None,
@@ -615,6 +626,7 @@ mod tests {
 
         let defender = &value["channels"]["Microsoft-Windows-Windows Defender/Operational"];
         assert_eq!(defender["subscribed"], true);
+        assert_eq!(defender["dormant"], false);
         assert_eq!(defender["last_record_id"], 123_456);
         assert_eq!(defender["newest_record_id"], 123_460);
         assert_eq!(defender["bookmark_positioned"], true);
@@ -727,6 +739,7 @@ mod tests {
             "unreported means no suppress ids"
         );
         assert_eq!(security.records_read, 0);
+        assert!(!security.dormant, "that writer subscribed to every channel");
         assert_eq!(security.last_record_id, Some(10));
     }
 

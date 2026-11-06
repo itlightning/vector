@@ -348,6 +348,12 @@ impl ResumeState {
         self.rung
     }
 
+    /// Forget the stored position, back to a channel that has never been read.
+    /// What a record's identity proved stays proven.
+    pub(super) const fn forget_position(&mut self) {
+        *self = Self::new(self.record_identity_usable);
+    }
+
     /// The lower bound for the generated XPath predicate, floored to the
     /// millisecond.
     ///

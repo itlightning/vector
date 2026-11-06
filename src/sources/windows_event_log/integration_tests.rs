@@ -1866,6 +1866,62 @@ mod suppress_lab {
         }
     }
 
+    /// An empty real channel takes no slot; a record written to it arrives,
+    /// with the channel configured for future events only, from a recheck.
+    #[tokio::test]
+    async fn an_empty_channel_subscribes_when_its_first_record_lands() {
+        let _seams = SeamSession::acquire();
+        clear();
+        let (checkpointer, _dir) = checkpointer().await;
+        let config = WindowsEventLogConfig {
+            channels: vec![LAB_CHANNEL.to_string()],
+            read_existing_events: false,
+            event_timeout_ms: 500,
+            ..Default::default()
+        };
+        config.validate().expect("the lab config is valid");
+        let mut subscription = EventLogSubscription::new(&config, checkpointer, false)
+            .await
+            .expect("the lab subscription opens");
+
+        assert!(subscription.first_channel_is_dormant());
+        assert!(!status(&subscription).subscribed);
+
+        write(KEPT_ID, 3);
+        assert!(
+            subscription.pull_events(1_000).expect("pull").is_empty(),
+            "the recheck is not due, so nothing has looked yet"
+        );
+        subscription.make_dormant_rechecks_due();
+
+        assert_eq!(drain(&mut subscription, 3), vec![u32::from(KEPT_ID); 3]);
+        let status = status(&subscription);
+        assert!(status.subscribed);
+        assert!(!status.dormant);
+    }
+
+    /// What a strict subscribe says on a cleared channel, the code dormancy
+    /// reports without making the call.
+    #[tokio::test]
+    async fn a_strict_subscribe_on_a_cleared_channel_reports_the_dead_bookmark_code() {
+        let _seams = SeamSession::acquire();
+        clear();
+        write(KEPT_ID, 2);
+        let (checkpointer, _dir) = checkpointer().await;
+        let mut reader = subscribe(Vec::new(), Arc::clone(&checkpointer)).await;
+        assert_eq!(drain(&mut reader, 2).len(), 2);
+        reader.flush_bookmarks().await.expect("flush");
+        drop(reader);
+        clear();
+
+        *super::super::render::RECORD_COUNT_SCRIPT.lock().unwrap() =
+            Some([Some(1)].into_iter().collect());
+        let subscription = subscribe(Vec::new(), checkpointer).await;
+
+        let status = status(&subscription);
+        assert_eq!(status.last_error, Some(15011), "{status:?}");
+    }
+
     /// A suppressed id never reaches the collector and is never read; the kept
     /// id around it arrives in full.
     #[tokio::test]

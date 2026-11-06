@@ -138,7 +138,9 @@ fn reset_all() {
     clear!(subscription::EVT_SUBSCRIBE_FLAG_LOG);
     clear!(subscription::DRAIN_STEP_HOOK);
     clear!(render::RENDER_XML_REWRITE);
+    clear!(render::RECORD_COUNT_SCRIPT);
 
+    render::DORMANCY_CHECKS.store(0, SeqCst);
     subscription::FAIL_ALL_RENDERS.store(false, SeqCst);
     subscription::FAIL_ALL_BOOKMARK_UPDATES.store(false, SeqCst);
     subscription::EVT_NEXT_RETURNED_TOTAL.store(0, SeqCst);
