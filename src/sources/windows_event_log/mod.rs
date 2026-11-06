@@ -512,13 +512,15 @@ impl WindowsEventLogSource {
 
             // The status file runs on its own cadence and reads each channel's
             // newest record itself, so a quiet channel, which the pull loop
-            // never touches, still reports one. Both the reads and the file
+            // never touches, still reports one; a dormant channel reports its
+            // record count being zero instead. Both the reads and the file
             // write are blocking, so they ride the same blocking thread as the
             // subscription.
             if status_writer.is_due(std::time::Instant::now()) {
                 let mut writer = status_writer;
                 let (returned_sub, returned_writer) =
-                    with_subscription_blocking(subscription, move |sub| {
+                    with_subscription_blocking(subscription, move |mut sub| {
+                        sub.confirm_dormant_channels();
                         let snapshot = sub.status_snapshot();
                         writer.write(&snapshot, std::time::Instant::now());
                         (sub, writer)

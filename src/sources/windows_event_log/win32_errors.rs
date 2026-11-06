@@ -42,8 +42,8 @@ use windows::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, ERROR_NO_MORE_ITEMS, ERROR_NOT_FOUND,
 };
 use windows::Win32::System::Rpc::{
-    RPC_S_CALL_CANCELLED, RPC_S_CALL_FAILED, RPC_S_INVALID_BOUND, RPC_S_SERVER_UNAVAILABLE,
-    RPC_S_UNKNOWN_IF,
+    RPC_S_CALL_CANCELLED, RPC_S_CALL_FAILED, RPC_S_INVALID_BOUND, RPC_S_SERVER_TOO_BUSY,
+    RPC_S_SERVER_UNAVAILABLE, RPC_S_UNKNOWN_IF,
 };
 
 /// 16953 / 0x4239, inherited from the source's original commit under the name
@@ -328,6 +328,7 @@ pub(super) const fn describe(code: u32) -> Option<&'static str> {
         c if c == ERROR_INVALID_OPERATION.0 => "ERROR_INVALID_OPERATION",
         c if c == RPC_S_UNKNOWN_IF.0 as u32 => "RPC_S_UNKNOWN_IF",
         c if c == RPC_S_SERVER_UNAVAILABLE.0 as u32 => "RPC_S_SERVER_UNAVAILABLE",
+        c if c == RPC_S_SERVER_TOO_BUSY.0 as u32 => "RPC_S_SERVER_TOO_BUSY",
         c if c == RPC_S_CALL_FAILED.0 as u32 => "RPC_S_CALL_FAILED",
         c if c == RPC_S_CALL_CANCELLED.0 as u32 => "RPC_S_CALL_CANCELLED",
         c if c == RPC_S_INVALID_BOUND.0 as u32 => "RPC_S_INVALID_BOUND",
@@ -344,6 +345,21 @@ pub(super) const fn describe(code: u32) -> Option<&'static str> {
         c if c == INHERITED_UNDOCUMENTED_16953 => "inherited-undocumented-16953",
         _ => return None,
     })
+}
+
+/// [`describe`] for a code `EvtSubscribe` returned.
+///
+/// 1723 there is the Event Log service refusing a subscription because it holds
+/// 1000 across the whole machine, every process included: the check is
+/// `wevtsvc.dll`'s, and at the limit every retry fails the same way until a
+/// slot frees. The RPC name says the server is busy, which sends a reader after
+/// the wrong thing. The RPC runtime has 1723 sites of its own, so this is what
+/// the code almost always means, not proof.
+pub(super) const fn describe_subscribe(code: u32) -> Option<&'static str> {
+    if code == RPC_S_SERVER_TOO_BUSY.0 as u32 {
+        return Some("EVENTLOG_SUBSCRIPTION_LIMIT");
+    }
+    describe(code)
 }
 
 /// Classify an error from the render / size-probe path.
@@ -581,5 +597,18 @@ mod tests {
     fn describe_is_descriptive_only() {
         assert_eq!(describe(15007), Some("ERROR_EVT_CHANNEL_NOT_FOUND"));
         assert_eq!(describe(60123), None);
+    }
+
+    /// The name belongs to the call: the same code from `EvtNext` is the RPC
+    /// fault it says it is.
+    #[test]
+    fn a_subscribe_1723_is_named_as_the_service_subscription_limit() {
+        assert_eq!(
+            describe_subscribe(1723),
+            Some("EVENTLOG_SUBSCRIPTION_LIMIT")
+        );
+        assert_eq!(describe(1723), Some("RPC_S_SERVER_TOO_BUSY"));
+        assert_eq!(describe_subscribe(1722), describe(1722));
+        assert_eq!(describe_subscribe(60123), None);
     }
 }

@@ -325,8 +325,7 @@ impl Checkpointer {
         Ok(())
     }
 
-    /// Remove checkpoint for a channel (useful for testing or reset)
-    #[cfg(test)]
+    /// Remove the checkpoint for a channel.
     pub async fn remove(&self, channel: &str) -> Result<(), WindowsEventLogError> {
         let mut state = self.state.lock().await;
         state.channels.remove(channel);

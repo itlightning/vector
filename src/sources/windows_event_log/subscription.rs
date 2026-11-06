@@ -10,7 +10,9 @@ use vector_lib::{
     counter, gauge,
     internal_event::{CounterName, GaugeName, error_type},
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_EVT_QUERY_RESULT_STALE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EvtClose, EvtNext, EvtOpenChannelConfig, EvtSubscribe,
     EvtSubscribeStartAfterBookmark, EvtSubscribeStartAtOldestRecord, EvtSubscribeStrict,
@@ -35,7 +37,8 @@ use super::{
     status::{ChannelStatus, GapRecord, StatusSnapshot, gap_for_rung},
     win32_errors::{
         DrainOutcome, QueryOrigin, SkipReason, SubscribeOutcome, classify_evt_next,
-        classify_subscribe, describe, subscribe_failure_is_not_the_query, win32_code,
+        classify_subscribe, describe, describe_subscribe, subscribe_failure_is_not_the_query,
+        win32_code,
     },
     xml_parser,
 };
@@ -202,6 +205,19 @@ pub(super) static EVT_NEXT_RETURNED_TOTAL: std::sync::atomic::AtomicU64 =
 pub(super) static EVT_SUBSCRIBE_FLAG_LOG: std::sync::Mutex<Option<Vec<u32>>> =
     std::sync::Mutex::new(None);
 
+/// How often a dormant channel's record count is read again.
+///
+/// This is how late the first record on an empty channel can be seen, and all
+/// the wait can cost: the channel is then read from its oldest record, so
+/// nothing is lost unless the log wraps within the interval. A read costs about
+/// 124 us per channel, measured on 182 channels of Server 2025 (22 ms a round),
+/// so a minute leaves the service alone and still sees a first record promptly.
+const DORMANT_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The code a strict subscribe gets from a bookmark on a cleared channel, measured
+/// on Windows 11, which dormancy reports in place of making the call.
+const CLEARED_BOOKMARK_CODE: u32 = ERROR_EVT_QUERY_RESULT_STALE.0;
+
 /// Why a rebuild is happening, which decides what a failure is allowed to cost.
 ///
 /// The distinction is the whole point: rebuilding a channel that is already
@@ -317,6 +333,15 @@ impl SubscriptionFactory {
             read_existing_events,
             suppress_rules,
         }
+    }
+
+    /// Read from the oldest record whatever the configuration says.
+    ///
+    /// For a channel seen empty: every record in it from then on arrived after
+    /// the source started, so `read_existing_events: false` must not skip them.
+    /// Held on the factory because a failed subscribe is retried from here.
+    const fn read_from_oldest(&mut self) {
+        self.read_existing_events = true;
     }
 
     /// Whether queries built from now on carry the suppress ids.
@@ -684,6 +709,11 @@ struct ChannelSubscription {
     skipped_this_generation: Option<SkipReason>,
     /// When the next periodic refresh is due.
     next_refresh: std::time::Instant,
+    /// `Some` while the channel is dormant: it held no records when last read,
+    /// so it gives its slot of the service's machine-wide subscription limit
+    /// back, and has its count read again at this instant. `None` from the
+    /// moment a read shows anything else, for the rest of the process.
+    dormant_recheck_at: Option<std::time::Instant>,
     /// `TimeCreated` of the most recent event, for the triage fields on the
     /// onset and recovery edges.
     last_event_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -757,7 +787,8 @@ struct ChannelSubscription {
     events_read_counter: Counter,
     /// Pre-registered counter for render errors on this channel.
     render_errors_counter: Counter,
-    /// Gauge indicating whether this channel subscription is active (1.0) or failed (0.0).
+    /// Gauge indicating whether this channel is working (1.0: subscribed or dormant) or
+    /// failed (0.0).
     subscription_active_gauge: Gauge,
     /// Gauge tracking the timestamp (unix seconds) of the last event received on this channel.
     last_event_timestamp_gauge: Gauge,
@@ -795,6 +826,79 @@ impl ChannelSubscription {
     /// Whether this channel is currently readable.
     const fn is_live(&self) -> bool {
         self.subscription_handle.is_some() && self.skipped_this_generation.is_none()
+    }
+
+    /// Whether this channel is empty and holds no subscription.
+    const fn is_dormant(&self) -> bool {
+        self.dormant_recheck_at.is_some()
+    }
+
+    /// Bring the channel up at source start: dormant on a read of exactly zero,
+    /// subscribed on anything else. A count that cannot be read proves nothing,
+    /// so it subscribes, and a channel with records never reads its count again.
+    fn start(&mut self) -> Result<(), WindowsEventLogError> {
+        if super::render::dormancy_record_count(&self.channel) == Some(0) {
+            return self.enter_dormant();
+        }
+        self.rebuild("startup", RebuildKind::FromDead);
+        Ok(())
+    }
+
+    /// Hold no subscription until the channel has records.
+    ///
+    /// A stored position on an empty channel means the log was cleared, so it
+    /// is dead, and is reported as any dead bookmark is before it is forgotten:
+    /// the first record after this reads from the oldest, which a time rung or
+    /// a kept bookmark would not.
+    fn enter_dormant(&mut self) -> Result<(), WindowsEventLogError> {
+        if self.bookmark_positioned {
+            self.note_bookmark_dead(CLEARED_BOOKMARK_CODE);
+        }
+        self.bookmark = BookmarkManager::new(&self.channel)?;
+        self.resume.forget_position();
+        self.factory.read_from_oldest();
+        self.subscription_active_gauge.set(1.0);
+        self.dormant_recheck_at = Some(std::time::Instant::now() + DORMANT_RECHECK_INTERVAL);
+        // Stamped here, not left to the first recheck: a channel with no stamp
+        // holds its whole module short of a drain.
+        self.note_reached_head();
+        debug!(
+            message = "Windows Event Log channel is empty; holding no subscription.",
+            channel = %self.channel,
+        );
+        Ok(())
+    }
+
+    /// Read a dormant channel's count again, and report whether it woke.
+    ///
+    /// Only a read of exactly zero keeps it dormant. Records or a failed read
+    /// both end dormancy for good: the channel subscribes, and from then on the
+    /// ordinary retry ladder owns it, so this read can never hold a channel dark.
+    fn recheck_dormant(&mut self, now: std::time::Instant) -> bool {
+        if super::render::dormancy_record_count(&self.channel) == Some(0) {
+            self.dormant_recheck_at = Some(now + DORMANT_RECHECK_INTERVAL);
+            self.note_reached_head();
+            return false;
+        }
+        self.dormant_recheck_at = None;
+        debug!(
+            message = "Windows Event Log channel is no longer provably empty; subscribing.",
+            channel = %self.channel,
+        );
+        true
+    }
+
+    /// Stamp a dormant channel for the status file from a read made now.
+    ///
+    /// The reader takes a module's oldest drain stamp and sizes its window from
+    /// the status interval, so one recheck interval is too old on a fast beat.
+    /// Any answer but zero is left to the next pull, which owns that decision.
+    fn confirm_dormant(&mut self) {
+        if super::render::dormancy_record_count(&self.channel) == Some(0) {
+            self.note_reached_head();
+        } else {
+            self.dormant_recheck_at = Some(std::time::Instant::now());
+        }
     }
 
     /// Close the current subscription handle, if any, accounting for it.
@@ -909,6 +1013,7 @@ impl ChannelSubscription {
             }
             Err((error, origin)) => {
                 let code = win32_code(&error);
+                let name = describe_subscribe(code).unwrap_or("unknown");
 
                 // A proactive rebuild's replacement failed, but the current
                 // subscription is healthy and still serving events. Keep it,
@@ -922,7 +1027,7 @@ impl ChannelSubscription {
                         channel = %self.channel,
                         rebuild_cause = cause,
                         win32_error = code,
-                        win32_error_name = describe(code).unwrap_or("unknown"),
+                        win32_error_name = name,
                         retry_in_ms = retry_in.as_millis() as u64,
                     );
                     return false;
@@ -940,12 +1045,7 @@ impl ChannelSubscription {
                         // resolves, so there is no offending record to skip and
                         // nothing to isolate. Go to the time rung directly, or
                         // to future-only when there is no stored time at all.
-                        let previous = self.resume.rung;
-                        let rung = self.resume.bookmark_dead();
-                        self.bookmark_positioned = false;
-                        if self.note_rung_move(previous, rung) {
-                            self.log_rung_advance(rung, code, "bookmark_dead");
-                        }
+                        self.note_bookmark_dead(code);
                         // The position died, not the channel, and the rebuild
                         // at the new rung is the whole fix, so the first one of
                         // an episode does not wait. Once per episode: a channel
@@ -957,7 +1057,7 @@ impl ChannelSubscription {
                             self.fast_recreate_used = true;
                             RetryPacing::Immediate
                         };
-                        self.schedule_retry(code, &error, cause, pacing);
+                        self.schedule_retry(code, name, &error, cause, pacing);
                     }
                     SubscribeOutcome::GeneratedQueryInvalid => {
                         // Our own ladder predicate is invalid. Advance exactly
@@ -970,14 +1070,25 @@ impl ChannelSubscription {
                         if rung == Rung::IsolateOne {
                             self.batch.isolate();
                         }
-                        self.schedule_retry(code, &error, cause, RetryPacing::Backoff);
+                        self.schedule_retry(code, name, &error, cause, RetryPacing::Backoff);
                     }
                     SubscribeOutcome::Retry => {
-                        self.schedule_retry(code, &error, cause, RetryPacing::Backoff)
+                        self.schedule_retry(code, name, &error, cause, RetryPacing::Backoff)
                     }
                 }
                 false
             }
+        }
+    }
+
+    /// The stored position no longer resolves: step the ladder, record the hole
+    /// and announce it.
+    fn note_bookmark_dead(&mut self, code: u32) {
+        let previous = self.resume.rung;
+        let rung = self.resume.bookmark_dead();
+        self.bookmark_positioned = false;
+        if self.note_rung_move(previous, rung) {
+            self.log_rung_advance(rung, code, "bookmark_dead");
         }
     }
 
@@ -1059,6 +1170,7 @@ impl ChannelSubscription {
     fn schedule_retry(
         &mut self,
         code: u32,
+        name: &'static str,
         error: &windows::core::Error,
         cause: &str,
         pacing: RetryPacing,
@@ -1080,7 +1192,6 @@ impl ChannelSubscription {
         self.unavailable_since.get_or_insert(now);
         self.last_error = Some(code);
 
-        let name = describe(code).unwrap_or("unknown");
         let last_event_at = self.last_event_at_rfc3339();
         match self.episode.observe_failure(std::time::Instant::now()) {
             FailureEdge::Onset => {
@@ -1259,6 +1370,7 @@ impl ChannelSubscription {
     fn status(&self, newest_record_id: Option<u64>) -> ChannelStatus {
         ChannelStatus {
             subscribed: self.subscription_handle.is_some(),
+            dormant: self.is_dormant(),
             skipped_reason: self
                 .skipped_this_generation
                 .map(|reason| reason.as_str().to_string()),
@@ -1637,6 +1749,7 @@ impl EventLogSubscription {
                 retry_at: None,
                 skipped_this_generation: None,
                 next_refresh: std::time::Instant::now() + refresh_interval,
+                dormant_recheck_at: None,
                 // Seeded from the checkpoint, not left unknown until the first
                 // event arrives. An onset edge raised right after a restart
                 // would otherwise report `last_event_at=never` on a channel
@@ -1691,7 +1804,22 @@ impl EventLogSubscription {
             // failure. Vector never gives up on its own: it keeps rebuilding
             // with backoff and the agent decides when to stop asking. The
             // original wedge was the opposite polarity.
-            channel_sub.rebuild("startup", RebuildKind::FromDead);
+            channel_sub.start()?;
+            // The stored position is gone with the log. Left on disk it would
+            // read as a fresh clear at every restart while the channel stays
+            // empty. A failed removal only repeats that report.
+            if channel_sub.is_dormant()
+                && checkpoint.is_some()
+                && let Err(error) = checkpointer.remove(channel).await
+            {
+                warn!(
+                    message = format!(
+                        "Failed to remove the checkpoint of an empty channel (channel={channel})."
+                    ),
+                    channel = %channel,
+                    error = %error,
+                );
+            }
             channel_subscriptions.push(channel_sub);
         }
 
@@ -1709,7 +1837,11 @@ impl EventLogSubscription {
 
         info!(
             message = "Successfully subscribed to channels (pull mode).",
-            channel_count = channel_subscriptions.len()
+            channel_count = channel_subscriptions.len(),
+            dormant_channels = channel_subscriptions
+                .iter()
+                .filter(|channel| channel.is_dormant())
+                .count(),
         );
 
         let shutdown_event = HANDLE(shutdown_event_raw as *mut std::ffi::c_void);
@@ -1878,6 +2010,18 @@ impl EventLogSubscription {
             // event arrives.
             unsafe {
                 _ = ResetEvent(channel_sub.signal_event);
+            }
+
+            // A dormant channel holds no subscription, so nothing below applies
+            // to it until a read says otherwise, the periodic refresh included.
+            if let Some(recheck_at) = channel_sub.dormant_recheck_at {
+                if now < recheck_at || !channel_sub.recheck_dormant(now) {
+                    continue;
+                }
+                channel_sub.next_refresh = now + self.refresh_interval;
+                if !channel_sub.rebuild("dormant_wake", RebuildKind::FromDead) {
+                    continue;
+                }
             }
 
             // Periodic refresh. Rebuilding from the bookmark is clean by
@@ -2127,6 +2271,7 @@ impl EventLogSubscription {
                             channel_sub.close_current();
                             channel_sub.schedule_retry(
                                 code,
+                                describe(code).unwrap_or("unknown"),
                                 &err,
                                 "evt_next",
                                 RetryPacing::Backoff,
@@ -2437,6 +2582,20 @@ impl EventLogSubscription {
         self.channels[0].signal_event.0 as isize
     }
 
+    /// Test-only: whether the first channel is dormant.
+    #[cfg(test)]
+    pub(super) fn first_channel_is_dormant(&self) -> bool {
+        self.channels[0].is_dormant()
+    }
+
+    /// Test-only: make every dormant channel's recheck due at the next pull.
+    #[cfg(test)]
+    pub(super) fn make_dormant_rechecks_due(&mut self) {
+        for channel in self.channels.iter_mut().filter(|c| c.is_dormant()) {
+            channel.dormant_recheck_at = Some(std::time::Instant::now());
+        }
+    }
+
     /// Test-only: rebuild every channel immediately, ignoring backoff.
     ///
     /// Lets the handle-accounting test force N rebuilds without waiting out the
@@ -2586,22 +2745,40 @@ impl EventLogSubscription {
     /// Returns (total_channels, active_channels) for health reporting.
     pub fn channel_health_summary(&self) -> (usize, usize) {
         let total = self.channels.len();
-        // A channel is considered active if its subscription handle is non-null
-        let active = self.channels.iter().filter(|c| c.is_live()).count();
+        // Active means working: a subscription that reads, or an empty channel
+        // that has nothing to read.
+        let active = self
+            .channels
+            .iter()
+            .filter(|c| c.is_live() || c.is_dormant())
+            .count();
         (total, active)
+    }
+
+    /// Read every dormant channel's count for the status file about to be
+    /// written. Blocking Win32 calls, like [`Self::status_snapshot`].
+    pub(super) fn confirm_dormant_channels(&mut self) {
+        for channel_sub in self.channels.iter_mut().filter(|c| c.is_dormant()) {
+            channel_sub.confirm_dormant();
+        }
     }
 
     /// Collect the per-channel facts for the status file.
     ///
-    /// Reads every configured channel's newest record directly, so the figure
-    /// holds on an idle host too, where the pull loop reads nothing.
+    /// Reads every subscribed channel's newest record directly, so the figure
+    /// holds on an idle host too, where the pull loop reads nothing. A dormant
+    /// channel was empty when last read, so it has no newest record to report.
     ///
     /// Blocking Win32 calls, so this runs on a blocking thread with the rest of
     /// the subscription, never beside a pull.
     pub(super) fn status_snapshot(&self) -> StatusSnapshot {
         let mut snapshot = StatusSnapshot::new(chrono::Utc::now());
         for channel_sub in &self.channels {
-            let newest = super::render::newest_record_id(&channel_sub.channel);
+            let newest = if channel_sub.is_dormant() {
+                None
+            } else {
+                super::render::newest_record_id(&channel_sub.channel)
+            };
             snapshot
                 .channels
                 .insert(channel_sub.channel.clone(), channel_sub.status(newest));
@@ -8257,5 +8434,328 @@ mod tests {
         assert_eq!(after.polls_on_budget, 1);
         assert_eq!(after.last_budget_poll_at, before.last_budget_poll_at);
         assert_eq!(after.last_drained_at, before.last_drained_at);
+    }
+
+    // ---------------------------------------------------------------------
+    // Dormant channels.
+    // ---------------------------------------------------------------------
+
+    /// Scripts the record counts dormancy reads. `None` is a failed read. Once
+    /// the script runs out the real channel answers, and Application has records.
+    struct RecordCountGuard;
+
+    impl RecordCountGuard {
+        fn install(_seams: &SeamSession, counts: &[Option<u64>]) -> Self {
+            *super::super::render::RECORD_COUNT_SCRIPT.lock().unwrap() =
+                Some(counts.iter().copied().collect());
+            Self
+        }
+    }
+
+    impl Drop for RecordCountGuard {
+        fn drop(&mut self) {
+            *super::super::render::RECORD_COUNT_SCRIPT.lock().unwrap() = None;
+        }
+    }
+
+    fn dormancy_checks() -> usize {
+        super::super::render::DORMANCY_CHECKS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn future_only_application_config() -> WindowsEventLogConfig {
+        WindowsEventLogConfig {
+            read_existing_events: false,
+            ..application_config()
+        }
+    }
+
+    /// No slot is taken, and the status file reads a working channel at the
+    /// head: stamped from the first read, with no failure in it.
+    #[tokio::test]
+    async fn an_empty_channel_holds_no_subscription_and_reads_caught_up() {
+        let _seams = SeamSession::acquire();
+        let flag_log = FlagLog::install(&_seams);
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0)]);
+        let subscription = subscription_from(&application_config()).await;
+
+        assert!(flag_log.flags().is_empty(), "EvtSubscribe was never called");
+        assert!(subscription.first_channel_is_dormant());
+        assert_eq!(subscription.first_channel_handle_balance(), 0);
+        assert_eq!(subscription.channel_health_summary(), (1, 1));
+
+        let status = application_status(&subscription);
+        assert!(!status.subscribed);
+        assert!(status.dormant);
+        assert!(status.last_drained_at.is_some());
+        assert_eq!(status.polls_at_head, 1);
+        assert_eq!(status.unavailable_since, None);
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.retry_attempt, 0);
+        assert_eq!(status.skipped_reason, None);
+        assert_eq!(status.newest_record_id, None);
+    }
+
+    /// The whole life of a channel: quiet until the recheck is due, one more
+    /// read of zero, then records. It subscribes from the oldest record even
+    /// where the configuration reads future events only, and the backlog that
+    /// arrived while it held no slot is delivered in the same pull.
+    #[tokio::test]
+    async fn a_dormant_channel_reads_from_the_oldest_record_once_it_has_one() {
+        let _seams = SeamSession::acquire();
+        let flag_log = FlagLog::install(&_seams);
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0), Some(0), Some(3)]);
+        let mut subscription = subscription_from(&future_only_application_config()).await;
+
+        assert!(subscription.pull_events(5).unwrap().is_empty());
+        assert_eq!(dormancy_checks(), 1, "not due, so not read");
+
+        subscription.make_dormant_rechecks_due();
+        assert!(subscription.pull_events(5).unwrap().is_empty());
+        assert_eq!(dormancy_checks(), 2);
+        assert!(subscription.first_channel_is_dormant());
+        assert_eq!(application_status(&subscription).polls_at_head, 2);
+
+        subscription.make_dormant_rechecks_due();
+        let delivered = subscription.pull_events(5).unwrap();
+        assert_eq!(dormancy_checks(), 3);
+        assert_eq!(delivered.len(), 5, "the channel's records, from the oldest");
+        assert!(!subscription.first_channel_is_dormant());
+        assert!(subscription.first_channel_is_live());
+        assert_eq!(flag_log.flags(), vec![EvtSubscribeStartAtOldestRecord.0]);
+    }
+
+    /// A slot refused at the wake is the ordinary ladder from there on, and the
+    /// retry still reads from the oldest record, or the record that woke the
+    /// channel would be lost.
+    #[tokio::test]
+    async fn a_wake_refused_at_the_limit_retries_from_the_oldest_record() {
+        let _seams = SeamSession::acquire();
+        let flag_log = FlagLog::install(&_seams);
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0), Some(1)]);
+        let mut subscription = subscription_from(&future_only_application_config()).await;
+
+        {
+            let _refused = SubscribeScriptGuard::install(&_seams, &[1723]);
+            subscription.make_dormant_rechecks_due();
+            assert!(subscription.pull_events(5).unwrap().is_empty());
+        }
+        let status = application_status(&subscription);
+        assert!(!status.subscribed);
+        assert!(!status.dormant, "a refused channel is down, not empty");
+        assert_eq!(status.last_error, Some(1723));
+        assert!(status.unavailable_since.is_some());
+
+        subscription.channels[0].retry_at = None;
+        assert_eq!(subscription.pull_events(5).unwrap().len(), 5);
+        assert_eq!(
+            flag_log.flags(),
+            vec![
+                EvtSubscribeStartAtOldestRecord.0,
+                EvtSubscribeStartAtOldestRecord.0
+            ]
+        );
+    }
+
+    /// A channel with records behaves as it always did, and pays for this
+    /// feature exactly one read: the one that found the records.
+    #[tokio::test]
+    async fn a_channel_with_records_is_never_checked_again() {
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        assert_eq!(dormancy_checks(), 1);
+        assert!(subscription.first_channel_is_live());
+
+        drain_all(&mut subscription);
+        subscription.force_rebuild_all();
+        subscription.force_proactive_rebuild_all();
+        subscription.channels[0].next_refresh = std::time::Instant::now();
+        subscription.make_dormant_rechecks_due();
+        subscription.confirm_dormant_channels();
+        _ = subscription.pull_events(5);
+
+        assert_eq!(dormancy_checks(), 1);
+        assert!(!application_status(&subscription).dormant);
+    }
+
+    /// Fail safe: only a read of exactly zero makes a channel dormant.
+    #[tokio::test]
+    async fn an_unreadable_count_subscribes() {
+        let _seams = SeamSession::acquire();
+        let _counts = RecordCountGuard::install(&_seams, &[None]);
+        let subscription = subscription_from(&application_config()).await;
+        assert!(!subscription.first_channel_is_dormant());
+        assert!(subscription.first_channel_is_live());
+    }
+
+    /// The same at the recheck: a channel that was empty and can no longer be
+    /// read must not stay dark on the strength of the old read.
+    #[tokio::test]
+    async fn a_recheck_that_cannot_read_the_count_subscribes() {
+        let _seams = SeamSession::acquire();
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0), None]);
+        let mut subscription = subscription_from(&application_config()).await;
+
+        subscription.make_dormant_rechecks_due();
+        _ = subscription.pull_events(5);
+
+        assert!(!subscription.first_channel_is_dormant());
+        assert!(subscription.first_channel_is_live());
+    }
+
+    /// The status write stamps from a read of its own, so the stamp is as fresh
+    /// as the file whatever the recheck interval.
+    #[tokio::test]
+    async fn the_status_write_stamps_a_dormant_channel_from_a_read_of_zero() {
+        let _seams = SeamSession::acquire();
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0), Some(0)]);
+        let mut subscription = subscription_from(&application_config()).await;
+
+        subscription.confirm_dormant_channels();
+
+        assert_eq!(dormancy_checks(), 2);
+        assert_eq!(application_status(&subscription).polls_at_head, 2);
+        assert!(subscription.first_channel_is_dormant());
+    }
+
+    /// A status write that finds records stamps nothing and decides nothing:
+    /// it pulls the recheck forward, and the next pull wakes the channel.
+    #[tokio::test]
+    async fn a_status_write_that_finds_records_leaves_the_decision_to_the_pull() {
+        let _seams = SeamSession::acquire();
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0), Some(2), Some(2)]);
+        let mut subscription = subscription_from(&application_config()).await;
+
+        subscription.confirm_dormant_channels();
+        let status = application_status(&subscription);
+        assert!(status.dormant);
+        assert_eq!(status.polls_at_head, 1, "records are not a drain");
+
+        assert_eq!(subscription.pull_events(5).unwrap().len(), 5);
+        assert!(!subscription.first_channel_is_dormant());
+    }
+
+    /// The periodic refresh subscribes any channel with no handle, which would
+    /// hand a dormant channel a slot once a day for nothing.
+    #[tokio::test]
+    async fn the_periodic_refresh_leaves_a_dormant_channel_alone() {
+        let _seams = SeamSession::acquire();
+        let flag_log = FlagLog::install(&_seams);
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0)]);
+        let mut subscription = subscription_from(&application_config()).await;
+
+        subscription.channels[0].next_refresh = std::time::Instant::now();
+        _ = subscription.pull_events(5);
+
+        assert!(flag_log.flags().is_empty());
+        assert!(subscription.first_channel_is_dormant());
+    }
+
+    /// A real position in a checkpoint, as the drain would have stored it.
+    async fn stored_position(checkpointer: &Arc<Checkpointer>) -> ChannelPosition {
+        let mut reader =
+            EventLogSubscription::new(&application_config(), Arc::clone(checkpointer), false)
+                .await
+                .unwrap();
+        assert_eq!(reader.pull_events(5).unwrap().len(), 5);
+        reader.channel_position("Application").unwrap()
+    }
+
+    /// Start over `checkpointer` on a channel reading empty, capturing the
+    /// warn-band lines the start logged.
+    async fn start_empty(
+        seams: &SeamSession,
+        checkpointer: &Arc<Checkpointer>,
+    ) -> (EventLogSubscription, Vec<(String, String)>) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let _counts = RecordCountGuard::install(seams, &[Some(0)]);
+        let capture = ErrorCodeCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(collector);
+        let subscription =
+            EventLogSubscription::new(&application_config(), Arc::clone(checkpointer), false)
+                .await
+                .unwrap();
+        let seen = capture.seen.lock().unwrap().clone();
+        (subscription, seen)
+    }
+
+    /// A log cleared under a stored position with a time: the dead-bookmark
+    /// path's first rung, one WARN and no gap, because the boundary tick records
+    /// none. The position is then gone: the next restart reports nothing, and
+    /// the channel reads from its oldest record.
+    #[tokio::test]
+    async fn a_cleared_log_reports_like_a_dead_bookmark_with_a_stored_time() {
+        let _seams = SeamSession::acquire();
+        let (checkpointer, _dir) = create_test_checkpointer().await;
+        let position = stored_position(&checkpointer).await;
+        assert!(position.last_event_time.is_some());
+        checkpointer.set_batch(vec![position]).await.unwrap();
+
+        let (subscription, seen) = start_empty(&_seams, &checkpointer).await;
+
+        assert_eq!(seen, vec![("WARN".to_string(), String::new())]);
+        let status = application_status(&subscription);
+        assert!(status.dormant);
+        assert!(!status.bookmark_positioned);
+        assert_eq!(status.rung, "bookmark");
+        assert!(status.gaps.is_empty());
+        assert_eq!(subscription.channel_position("Application"), None);
+        assert_eq!(checkpointer.get("Application").await, None);
+
+        let (_again, seen) = start_empty(&_seams, &checkpointer).await;
+        assert!(seen.is_empty(), "the clear is reported once: {seen:?}");
+    }
+
+    /// The other arm: with no stored time the path lands on future-only, an
+    /// ERROR and a recorded gap. The rung must not outlive the report, or the
+    /// channel would wake reading future events and lose its first record.
+    #[tokio::test]
+    async fn a_cleared_log_reports_like_a_dead_bookmark_with_no_stored_time() {
+        let _seams = SeamSession::acquire();
+        let (checkpointer, _dir) = create_test_checkpointer().await;
+        let position = stored_position(&checkpointer).await;
+        let bookmark_only = ChannelPosition::bookmark_only(position.channel, position.bookmark_xml);
+        checkpointer.set_batch(vec![bookmark_only]).await.unwrap();
+
+        let (mut subscription, seen) = start_empty(&_seams, &checkpointer).await;
+
+        assert_eq!(
+            seen,
+            vec![("ERROR".to_string(), "resume_future_only".to_string())]
+        );
+        let status = application_status(&subscription);
+        assert_eq!(status.gaps.len(), 1);
+        assert_eq!(status.gaps[0].cause, "future_only");
+        assert_eq!(status.rung, "bookmark");
+
+        let flag_log = FlagLog::install(&_seams);
+        let _counts = RecordCountGuard::install(&_seams, &[Some(1)]);
+        subscription.make_dormant_rechecks_due();
+        assert_eq!(subscription.pull_events(5).unwrap().len(), 5);
+        assert_eq!(flag_log.flags(), vec![EvtSubscribeStartAtOldestRecord.0]);
+    }
+
+    /// A channel that is not empty keeps its bookmark, cleared or not, and the
+    /// strict subscribe and the ladder judge it as they always did.
+    #[tokio::test]
+    async fn a_stored_position_on_a_channel_with_records_resumes_from_it() {
+        let _seams = SeamSession::acquire();
+        let (checkpointer, _dir) = create_test_checkpointer().await;
+        let position = stored_position(&checkpointer).await;
+        let record_id = position.last_record_id;
+        checkpointer.set_batch(vec![position]).await.unwrap();
+
+        let flag_log = FlagLog::install(&_seams);
+        let subscription =
+            EventLogSubscription::new(&application_config(), Arc::clone(&checkpointer), false)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            flag_log.flags(),
+            vec![EvtSubscribeStartAfterBookmark.0 | EvtSubscribeStrict.0]
+        );
+        assert_eq!(application_status(&subscription).last_record_id, record_id);
     }
 }

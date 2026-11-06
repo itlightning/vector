@@ -7,7 +7,7 @@ use metrics::Gauge;
 use windows::Win32::System::EventLog::{
     EVT_HANDLE, EVT_LOG_PROPERTY_ID, EvtClose, EvtGetLogInfo, EvtLogNumberOfLogRecords, EvtNext,
     EvtOpenLog, EvtQuery, EvtQueryChannelPath, EvtQueryReverseDirection, EvtRender,
-    EvtRenderEventXml,
+    EvtRenderEventXml, EvtVarTypeUInt64,
 };
 use windows::core::{HSTRING, w};
 
@@ -176,20 +176,60 @@ fn shrink_decode_buffer(decode_buffer: &mut Vec<u16>) {
 pub(super) static CHANNEL_RECORDS_UPDATES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only answers for [`dormancy_record_count`], one per read, in order.
+/// `None` in the queue is a read that failed. An exhausted queue reads the real
+/// channel.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+pub(super) static RECORD_COUNT_SCRIPT: std::sync::Mutex<
+    Option<std::collections::VecDeque<Option<u64>>>,
+> = std::sync::Mutex::new(None);
+
+/// Test-only count of [`dormancy_record_count`] calls, the observable for "a
+/// channel with records is never checked again".
+#[cfg(test)]
+pub(super) static DORMANCY_CHECKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Reports total records in the channel. SOC teams compare this against
 /// `rate(events_read_total)` to detect ingestion lag.
-/// Best-effort: if any API call fails, the gauge is left unchanged.
+/// Best-effort: if the read fails, the gauge is left unchanged.
 pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
     #[cfg(test)]
     CHANNEL_RECORDS_UPDATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    if let Some(record_count) = channel_record_count(channel) {
+        gauge.set(record_count as f64);
+    }
+}
+
+/// The read a channel's dormancy turns on. See [`channel_record_count`].
+pub(super) fn dormancy_record_count(channel: &str) -> Option<u64> {
+    #[cfg(test)]
+    {
+        DORMANCY_CHECKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let scripted = RECORD_COUNT_SCRIPT
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(std::collections::VecDeque::pop_front);
+        if let Some(count) = scripted {
+            return count;
+        }
+    }
+    channel_record_count(channel)
+}
+
+/// Records the channel holds, or `None` when that cannot be read.
+///
+/// Moves the moment a record lands, on a fresh handle or a cached one. A full,
+/// wrapping log keeps a constant count, so it says nothing about a channel's
+/// progress, only about whether the channel holds anything at all.
+fn channel_record_count(channel: &str) -> Option<u64> {
     let channel_hstring = HSTRING::from(channel);
     let log_handle = unsafe {
         // EvtOpenChannelPath = 1
-        match EvtOpenLog(None, &channel_hstring, 1) {
-            Ok(h) => h,
-            Err(_) => return,
-        }
+        EvtOpenLog(None, &channel_hstring, 1).ok()?
     };
 
     // EVT_VARIANT is 16 bytes: 8 bytes value + 4 bytes count + 4 bytes type
@@ -210,11 +250,17 @@ pub(super) fn update_channel_records(channel: &str, gauge: &Gauge) {
         _ = EvtClose(log_handle);
     }
 
-    if result.is_ok() {
-        // EVT_VARIANT for UInt64: first 8 bytes are the value (little-endian)
-        let record_count = u64::from_le_bytes(buffer[..8].try_into().unwrap_or([0; 8]));
-        gauge.set(record_count as f64);
-    }
+    result.ok()?;
+    record_count_from_variant(&buffer)
+}
+
+/// The count out of a raw `EVT_VARIANT`: 8 bytes of value, a 4 byte count, a 4
+/// byte type. A variant of any other type carries no count, and its zeroed
+/// value must not read as an empty channel.
+fn record_count_from_variant(variant: &[u8; 16]) -> Option<u64> {
+    let (value, rest) = variant.split_first_chunk::<8>()?;
+    let variant_type = u32::from_le_bytes(*rest.last_chunk::<4>()?);
+    (variant_type == EvtVarTypeUInt64.0 as u32).then(|| u64::from_le_bytes(*value))
 }
 
 /// Longest `EvtNext` wait for the newest record. The caller holds the
@@ -315,4 +361,27 @@ fn decode_utf16_buffer(buffer: &[u8], bytes_used: u32, decode_buf: &mut Vec<u16>
     }
 
     String::from_utf16_lossy(&decode_buf[..xml_len])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variant(value: u64, variant_type: u32) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        bytes[12..].copy_from_slice(&variant_type.to_le_bytes());
+        bytes
+    }
+
+    /// Dormancy turns on this read being exactly zero, so a variant that is not
+    /// a count, whose value bytes are zero, has to read as no answer.
+    #[test]
+    fn only_a_uint64_variant_is_a_record_count() {
+        const UINT64: u32 = 10;
+        const NULL: u32 = 0;
+        assert_eq!(record_count_from_variant(&variant(0, UINT64)), Some(0));
+        assert_eq!(record_count_from_variant(&variant(7, UINT64)), Some(7));
+        assert_eq!(record_count_from_variant(&variant(0, NULL)), None);
+    }
 }
