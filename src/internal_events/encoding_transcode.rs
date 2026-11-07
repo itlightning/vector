@@ -19,15 +19,17 @@ impl InternalEvent for DecoderBomRemoval {
 }
 
 #[derive(Debug, NamedInternalEvent)]
-pub struct DecoderMalformedReplacement {
+pub struct DecoderMalformedReplacement<'a> {
     pub from_encoding: &'static str,
+    pub file: Option<&'a str>,
 }
 
-impl InternalEvent for DecoderMalformedReplacement {
+impl InternalEvent for DecoderMalformedReplacement<'_> {
     fn emit(self) {
         warn!(
             message = "Replaced malformed sequences with replacement character while decoding to utf8.",
-            from_encoding = %self.from_encoding
+            from_encoding = %self.from_encoding,
+            file = self.file.unwrap_or(""),
         );
         // NOT the actual number of replacements in the output: there's no easy
         // way to get that from the lib we use here (encoding_rs)

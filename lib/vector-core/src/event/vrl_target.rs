@@ -4,9 +4,12 @@ use std::{
     convert::TryFrom,
     marker::PhantomData,
     num::{NonZero, TryFromIntError},
+    sync::LazyLock,
 };
 
-use lookup::{OwnedTargetPath, OwnedValuePath, PathPrefix, lookup_v2::OwnedSegment};
+use lookup::{
+    OwnedTargetPath, OwnedValuePath, PathPrefix, lookup_v2::OwnedSegment, owned_value_path,
+};
 use snafu::Snafu;
 use vrl::{
     compiler::{ProgramInfo, SecretTarget, Target, value::VrlValueConvert},
@@ -31,6 +34,10 @@ const VALID_METRIC_PATHS_GET: &str =
 /// The longest path is 2, and we need to check that a third segment doesn't exist as we don't want
 /// fields such as `.tags.host.thing`.
 const MAX_METRIC_PATH_DEPTH: usize = 3;
+
+/// The metadata path the source component id is readable at.
+static SOURCE_ID_PATH: LazyLock<OwnedValuePath> =
+    LazyLock::new(|| owned_value_path!("vector", "source_id"));
 
 /// An adapter to turn `Event`s into `vrl_lib::Target`s.
 #[allow(clippy::large_enum_variant)]
@@ -384,7 +391,21 @@ impl Target for VrlTarget {
                 }
                 VrlTarget::Metric { value, .. } => target_get_metric(&target_path.path, value),
             },
-            PathPrefix::Metadata => Ok(self.metadata().value().get(&target_path.path)),
+            PathPrefix::Metadata => {
+                let metadata = self.metadata();
+                if let Some(value) = metadata.value().get(&target_path.path) {
+                    return Ok(Some(value));
+                }
+                // The source component id lives on the metadata struct rather than in the
+                // metadata value map, so resolve it here. Reading it works under either log
+                // namespace, and it is read-only because every path under `%vector` is a
+                // read-only path at compile time. `%vector` read as a whole does not carry
+                // it, the same way it does not carry the other struct-held metadata.
+                if target_path.path == *SOURCE_ID_PATH {
+                    return Ok(metadata.source_id_value());
+                }
+                Ok(None)
+            }
         }
     }
 

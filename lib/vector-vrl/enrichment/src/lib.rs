@@ -1,5 +1,6 @@
 #![deny(warnings)]
 
+pub mod claim_enrichment_table_record;
 pub mod find_enrichment_table_records;
 pub mod get_enrichment_table_record;
 pub mod tables;
@@ -7,6 +8,8 @@ pub mod tables;
 #[cfg(test)]
 mod test_util;
 mod vrl_util;
+
+use std::num::NonZeroU64;
 
 use dyn_clone::DynClone;
 use indoc::indoc;
@@ -77,6 +80,10 @@ pub enum Error {
     Internal { source: InternalError },
     #[snafu(display("Table {table} not loaded"))]
     TableNotLoaded { table: String },
+    #[snafu(display("Table does not support claims"))]
+    ClaimNotSupported,
+    #[snafu(display("Table is full, claim not stored"))]
+    ClaimNotStored,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Snafu)]
@@ -146,14 +153,63 @@ pub trait Table: DynClone {
     fn extract_state(&self) -> Option<Box<dyn std::any::Any + Send + Sync>> {
         None
     }
+
+    /// Checks and marks `claim.key` in one step, so the next claim on the key sees this one even
+    /// before the table publishes its writes to readers.
+    ///
+    /// # Errors
+    /// Errors if this table cannot be written from a transform.
+    fn claim(&self, _claim: &Claim<'_>) -> Result<ClaimOutcome, Error> {
+        Err(Error::ClaimNotSupported)
+    }
 }
 
 dyn_clone::clone_trait_object!(Table);
+
+/// One atomic check-and-mark of a key in a table a transform can write.
+///
+/// A claim opens a window when the key has no row inside a window: no row at all, or one in its
+/// carry period. The window then stays fixed: later claims never move its deadline. The row
+/// outlives the window by `ttl_secs - window_secs`, the carry period, so the claim that opens the
+/// next window, with its own `window_secs` and `ttl_secs`, can still read how many the previous
+/// window suppressed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Claim<'a> {
+    pub key: &'a str,
+    /// Applies only when this claim opens the window.
+    pub window_secs: NonZeroU64,
+    /// How long the row lives from the window's start. Applies only when this claim opens the
+    /// window; a value below `window_secs` is read as `window_secs`.
+    pub ttl_secs: u64,
+    /// How many claims in one window pass. This claim's own cap, compared against the count so far.
+    pub cap: NonZeroU64,
+    /// Stored when this claim opens the window and returned to every claim in it.
+    pub value: Option<&'a Value>,
+}
+
+/// What one [`Claim`] found and did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimOutcome {
+    /// This claim is among the first `cap` of its window.
+    pub pass: bool,
+    /// This claim opened the window.
+    pub first: bool,
+    /// This claim's position in its window, counting from 1.
+    pub count: u64,
+    /// Set only on the claim that opens a window: how many claims the previous window of this key
+    /// did not pass, when the opening claim found its row in the carry period. Zero otherwise.
+    pub suppressed_prev: u64,
+    /// The window in force, which is the one the opening claim asked for.
+    pub window_secs: u64,
+    /// The value the opening claim stored, or null.
+    pub value: Value,
+}
 
 pub fn vrl_functions() -> Vec<Box<dyn Function>> {
     vec![
         Box::new(get_enrichment_table_record::GetEnrichmentTableRecord) as _,
         Box::new(find_enrichment_table_records::FindEnrichmentTableRecords) as _,
+        Box::new(claim_enrichment_table_record::ClaimEnrichmentTableRecord) as _,
     ]
 }
 

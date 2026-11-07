@@ -45,6 +45,12 @@ impl Decoder {
     }
 
     pub fn decode_to_utf8(&mut self, input: Bytes) -> Bytes {
+        self.decode_to_utf8_with_file(input, None)
+    }
+
+    /// Decode `input` to UTF-8, optionally attributing malformed-replacement
+    /// warnings to `file`.
+    pub fn decode_to_utf8_with_file(&mut self, input: Bytes, file: Option<&str>) -> Bytes {
         let mut total_read_from_input = 0;
         let mut total_had_errors = false;
 
@@ -68,7 +74,8 @@ impl Decoder {
 
         if total_had_errors {
             emit!(DecoderMalformedReplacement {
-                from_encoding: self.inner.encoding().name()
+                from_encoding: self.inner.encoding().name(),
+                file,
             });
         }
 

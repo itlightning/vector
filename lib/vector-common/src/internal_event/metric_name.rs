@@ -45,6 +45,8 @@ pub enum CounterName {
     EventsDiscardedTotal,
     FilesAddedTotal,
     FilesDeletedTotal,
+    FileEncodingDetectedTotal,
+    FileEncodingRejectedTotal,
     FilesResumedTotal,
     FilesUnwatchedTotal,
     GrpcServerMessagesReceivedTotal,
@@ -93,6 +95,7 @@ pub enum CounterName {
     SqsS3EventRecordIgnoredTotal,
     ComponentAllocatedBytesTotal,
     ComponentDeallocatedBytesTotal,
+    MemoryEnrichmentTableEvictionsTotal,
     MemoryEnrichmentTableFailedInsertions,
     MemoryEnrichmentTableFailedReads,
     MemoryEnrichmentTableFlushesTotal,
@@ -101,6 +104,13 @@ pub enum CounterName {
     MemoryEnrichmentTableTtlExpirations,
     ComponentCpuUsageNsTotal,
     DatadogLogsReservedAttributeConflictsTotal,
+    WindowsEventLogSubscriptionsTotal,
+    WindowsEventLogEventsReadTotal,
+    WindowsEventLogEventsFilteredTotal,
+    WindowsEventLogRenderErrorsTotal,
+    WindowsEventLogCacheHitsTotal,
+    WindowsEventLogCacheMissesTotal,
+    WindowsEventLogCheckpointWritesTotal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, AsRefStr, EnumIter)]
@@ -211,6 +221,9 @@ pub enum GaugeName {
     MemoryEnrichmentTableByteSize,
     TagCardinalityTrackedKeys,
     SecurityConfinementDisabled,
+    WindowsEventLogSubscriptionActive,
+    WindowsEventLogLastEventTimestampSeconds,
+    WindowsEventLogChannelRecordsTotal,
 }
 
 impl GaugeName {
@@ -255,6 +268,11 @@ impl GaugeName {
             Self::MemoryEnrichmentTableByteSize => "memory_enrichment_table_byte_size",
             Self::TagCardinalityTrackedKeys => "tag_cardinality_tracked_keys",
             Self::SecurityConfinementDisabled => "security_confinement_disabled",
+            Self::WindowsEventLogSubscriptionActive => "windows_event_log_subscription_active",
+            Self::WindowsEventLogLastEventTimestampSeconds => {
+                "windows_event_log_last_event_timestamp_seconds"
+            }
+            Self::WindowsEventLogChannelRecordsTotal => "windows_event_log_channel_records_total",
         }
     }
 }
@@ -308,6 +326,8 @@ impl CounterName {
             Self::EventsDiscardedTotal => "events_discarded_total",
             Self::FilesAddedTotal => "files_added_total",
             Self::FilesDeletedTotal => "files_deleted_total",
+            Self::FileEncodingDetectedTotal => "file_encoding_detected_total",
+            Self::FileEncodingRejectedTotal => "file_encoding_rejected_total",
             Self::FilesResumedTotal => "files_resumed_total",
             Self::FilesUnwatchedTotal => "files_unwatched_total",
             Self::GrpcServerMessagesReceivedTotal => "grpc_server_messages_received_total",
@@ -358,6 +378,7 @@ impl CounterName {
             Self::SqsS3EventRecordIgnoredTotal => "sqs_s3_event_record_ignored_total",
             Self::ComponentAllocatedBytesTotal => "component_allocated_bytes_total",
             Self::ComponentDeallocatedBytesTotal => "component_deallocated_bytes_total",
+            Self::MemoryEnrichmentTableEvictionsTotal => "memory_enrichment_table_evictions_total",
             Self::MemoryEnrichmentTableFailedInsertions => {
                 "memory_enrichment_table_failed_insertions"
             }
@@ -369,6 +390,15 @@ impl CounterName {
             Self::MemoryEnrichmentTableReadsTotal => "memory_enrichment_table_reads_total",
             Self::MemoryEnrichmentTableTtlExpirations => "memory_enrichment_table_ttl_expirations",
             Self::ComponentCpuUsageNsTotal => "component_cpu_usage_ns_total",
+            Self::WindowsEventLogSubscriptionsTotal => "windows_event_log_subscriptions_total",
+            Self::WindowsEventLogEventsReadTotal => "windows_event_log_events_read_total",
+            Self::WindowsEventLogEventsFilteredTotal => "windows_event_log_events_filtered_total",
+            Self::WindowsEventLogRenderErrorsTotal => "windows_event_log_render_errors_total",
+            Self::WindowsEventLogCacheHitsTotal => "windows_event_log_cache_hits_total",
+            Self::WindowsEventLogCacheMissesTotal => "windows_event_log_cache_misses_total",
+            Self::WindowsEventLogCheckpointWritesTotal => {
+                "windows_event_log_checkpoint_writes_total"
+            }
             Self::DatadogLogsReservedAttributeConflictsTotal => {
                 "datadog_logs_reserved_attribute_conflicts_total"
             }

@@ -14,23 +14,28 @@ use vector_lib::{
     config::{LegacyKey, LogNamespace},
     configurable::configurable_component,
     file_source::{
+        DetectViaKind, EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode,
         file_server::{FileServer, Line, calculate_ignore_before},
         paths_provider::{Glob, MatchOptions},
     },
     file_source_common::{
         Checkpointer, FileFingerprint, FingerprintStrategy, Fingerprinter, ReadFrom, ReadFromConfig,
+        StatusWriter,
     },
     finalizer::OrderedFinalizer,
     lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path},
 };
 use vrl::value::Kind;
 
-use super::util::{EncodingConfig, MultilineConfig};
+use super::util::{CharsetMode, EncodingConfig, MultilineConfig};
 use crate::{
     SourceSender,
     config::{
         DataType, SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
         log_schema,
+    },
+    encoding_detect::{
+        AutoDetectConfig, DetectOutcome, DetectVia, detect_charset, detect_charset_idle_force,
     },
     encoding_transcode::{Decoder, Encoder},
     event::{BatchNotifier, BatchStatus, LogEvent},
@@ -59,7 +64,7 @@ enum BuildError {
 /// Configuration for the `file` source.
 #[serde_as]
 #[configurable_component(source("file", "Collect logs from files."))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Array of file patterns to include. [Globbing](https://vector.dev/docs/reference/configuration/sources/file/#globbing) is supported.
@@ -243,6 +248,25 @@ pub struct FileConfig {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     pub rotate_wait: Duration,
+
+    /// How often the source rewrites its status file.
+    ///
+    /// The status file describes what the source discovered and where it has read to,
+    /// as facts, for anything that needs to reason about this source's progress without
+    /// re-deriving the checkpoint file's content fingerprints. It is rewritten whole on
+    /// this cadence from the source's own read loop, so its freshness is also evidence
+    /// that the loop is running.
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    #[configurable(metadata(docs::type_unit = "seconds"))]
+    #[serde(default = "default_status_interval", rename = "status_interval_secs")]
+    pub status_interval: Duration,
+
+    /// Where to write the status file.
+    ///
+    /// Defaults to `file_source_status.json` inside the source's data directory.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "/var/lib/vector/file_source_status.json"))]
+    pub status_path: Option<PathBuf>,
 }
 
 fn default_max_line_bytes() -> usize {
@@ -275,6 +299,10 @@ fn default_line_delimiter() -> String {
 
 const fn default_rotate_wait() -> Duration {
     Duration::from_secs(u64::MAX / 2)
+}
+
+const fn default_status_interval() -> Duration {
+    Duration::from_secs(vector_lib::file_source_common::status::DEFAULT_STATUS_INTERVAL_SECS)
 }
 
 /// Configuration for how files should be identified.
@@ -383,6 +411,8 @@ impl Default for FileConfig {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            status_interval: default_status_interval(),
+            status_path: None,
         }
     }
 }
@@ -419,6 +449,15 @@ impl SourceConfig for FileConfig {
 
         let log_namespace = cx.log_namespace(self.log_namespace);
 
+        // Single validation pass; `charset: auto` yields the resolved detection
+        // tunables consumed below.
+        let resolved_auto = match self.encoding.as_ref() {
+            Some(encoding) => encoding.validate_and_resolve()?,
+            None => None,
+        };
+
+        let resolved_encoding = resolve_file_encoding(self, resolved_auto)?;
+
         Ok(file_source(
             self,
             data_dir,
@@ -426,6 +465,7 @@ impl SourceConfig for FileConfig {
             cx.out,
             acknowledgements,
             log_namespace,
+            resolved_encoding,
         ))
     }
 
@@ -480,6 +520,54 @@ impl SourceConfig for FileConfig {
     }
 }
 
+/// Resolved line delimiter and encoding mode for `FileServer` (computed once at build).
+pub struct ResolvedFileEncoding {
+    pub line_delimiter: Bytes,
+    pub mode: FileEncodingMode,
+}
+
+fn resolve_file_encoding(
+    config: &FileConfig,
+    resolved_auto: Option<AutoDetectConfig>,
+) -> crate::Result<ResolvedFileEncoding> {
+    match config.encoding.as_ref() {
+        Some(encoding) => match encoding.charset {
+            CharsetMode::Auto => {
+                // `validate_and_resolve` returns the auto config for `charset: auto`;
+                // a missing value here is a caller bug surfaced as a config error
+                // rather than a panic.
+                let Some(auto) = resolved_auto else {
+                    return Err("charset auto requires resolved auto-detection settings".into());
+                };
+                let detector = std::sync::Arc::new(AutoFileEncodingDetector {
+                    auto,
+                    line_delimiter: config.line_delimiter.clone(),
+                    sanitize_utf8: encoding.sanitize_utf8,
+                });
+                Ok(ResolvedFileEncoding {
+                    line_delimiter: Bytes::from(config.line_delimiter.clone()),
+                    mode: FileEncodingMode::Auto { detector },
+                })
+            }
+            CharsetMode::Explicit(explicit) => {
+                let delim = Encoder::new(explicit).encode_from_utf8(&config.line_delimiter);
+                Ok(ResolvedFileEncoding {
+                    line_delimiter: delim,
+                    mode: FileEncodingMode::Fixed {
+                        encoding_name: Some(explicit.name()),
+                    },
+                })
+            }
+        },
+        None => Ok(ResolvedFileEncoding {
+            line_delimiter: Bytes::from(config.line_delimiter.clone()),
+            mode: FileEncodingMode::Fixed {
+                encoding_name: None,
+            },
+        }),
+    }
+}
+
 pub fn file_source(
     config: &FileConfig,
     data_dir: PathBuf,
@@ -487,6 +575,7 @@ pub fn file_source(
     mut out: SourceSender,
     acknowledgements: bool,
     log_namespace: LogNamespace,
+    resolved_encoding: ResolvedFileEncoding,
 ) -> super::Source {
     // the include option must be specified but also must contain at least one entry.
     if config.include.is_empty() {
@@ -522,17 +611,22 @@ pub fn file_source(
     )
     .expect("invalid glob patterns");
 
-    let encoding_charset = config.encoding.clone().map(|e| e.charset);
-
-    // if file encoding is specified, need to convert the line delimiter (present as utf8)
-    // to the specified encoding, so that delimiter-based line splitting can work properly
-    let line_delimiter_as_bytes = match encoding_charset {
-        Some(e) => Encoder::new(e).encode_from_utf8(&config.line_delimiter),
-        None => Bytes::from(config.line_delimiter.clone()),
-    };
+    let ResolvedFileEncoding {
+        line_delimiter: line_delimiter_as_bytes,
+        mode: encoding_mode,
+    } = resolved_encoding;
 
     let checkpointer = Checkpointer::new(&data_dir);
     let strategy = config.fingerprint.clone().into();
+    let status_path = config
+        .status_path
+        .clone()
+        .unwrap_or_else(|| StatusWriter::default_path(&data_dir));
+    let include_patterns = config
+        .include
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
 
     let file_server = FileServer {
         paths_provider,
@@ -542,6 +636,7 @@ pub fn file_source(
         ignore_before,
         max_line_bytes: config.max_line_bytes,
         line_delimiter: line_delimiter_as_bytes,
+        encoding_mode,
         data_dir,
         glob_minimum_cooldown,
         fingerprinter: Fingerprinter::new(strategy, config.max_line_bytes, config.ignore_not_found),
@@ -549,6 +644,9 @@ pub fn file_source(
         remove_after: config.remove_after_secs.map(Duration::from_secs),
         emitter,
         rotate_wait: config.rotate_wait,
+        include_patterns,
+        status_path,
+        status_interval: config.status_interval,
     };
 
     let event_metadata = EventMetadata {
@@ -600,7 +698,9 @@ pub fn file_source(
     Box::pin(async move {
         info!(message = "Starting file server.", include = ?include, exclude = ?exclude);
 
-        let mut encoding_decoder = encoding_charset.map(Decoder::new);
+        // One decoder per detected/fixed charset name (shared across files).
+        let mut encoding_decoders: std::collections::HashMap<&'static str, Decoder> =
+            std::collections::HashMap::new();
 
         // sizing here is just a guess
         let (tx, rx) = futures::channel::mpsc::channel::<Vec<Line>>(2);
@@ -613,11 +713,21 @@ pub fn file_source(
                     file: &line.filename,
                     include_file_metric_tag,
                 });
-                // transcode each line from the file's encoding charset to utf8
-                line.text = match encoding_decoder.as_mut() {
-                    Some(d) => d.decode_to_utf8(line.text),
-                    None => line.text,
-                };
+                // Transcode each line from the file's encoding charset to utf8.
+                // `line.encoding` is a charset name the file source obtained from
+                // `Encoding::name()` (auto-detected or an explicit charset), which is always a
+                // valid Encoding Standard label, so `for_label` round-trips it losslessly; the
+                // `unwrap_or` is unreachable and only avoids a panic path.
+                // (The name crosses the file-source boundary as `&str` to keep that crate free
+                // of `encoding_rs`; see `lib/file-source/src/encoding.rs`.)
+                if let Some(encoding_name) = line.encoding {
+                    let decoder = encoding_decoders.entry(encoding_name).or_insert_with(|| {
+                        let encoding = encoding_rs::Encoding::for_label(encoding_name.as_bytes())
+                            .unwrap_or(encoding_rs::UTF_8);
+                        Decoder::new(encoding)
+                    });
+                    line.text = decoder.decode_to_utf8_with_file(line.text, Some(&line.filename));
+                }
                 line
             });
 
@@ -735,23 +845,113 @@ fn wrap_with_line_agg(
                 (
                     line.filename,
                     line.text,
-                    (line.file_id, line.start_offset, line.end_offset),
+                    (
+                        line.file_id,
+                        line.start_offset,
+                        line.end_offset,
+                        line.encoding,
+                    ),
                 )
             }),
             logic,
         )
         .map(
-            |(filename, text, (file_id, start_offset, initial_end), lastline_context)| Line {
-                text,
-                filename,
-                file_id,
-                start_offset,
-                end_offset: lastline_context.map_or(initial_end, |(_, _, lastline_end_offset)| {
-                    lastline_end_offset
-                }),
+            |(filename, text, (file_id, start_offset, initial_end, encoding), lastline_context)| {
+                Line {
+                    text,
+                    filename,
+                    file_id,
+                    start_offset,
+                    end_offset: lastline_context
+                        .map_or(initial_end, |(_, _, lastline_end_offset, _)| {
+                            lastline_end_offset
+                        }),
+                    encoding,
+                }
             },
         ),
     )
+}
+
+/// Bridges file-source auto-detection to Vector's charset detector + delimiter encoder.
+struct AutoFileEncodingDetector {
+    auto: AutoDetectConfig,
+    line_delimiter: String,
+    /// When true, UTF-8-decided files are decoded (never zero-copy) so malformed
+    /// bytes are replaced with U+FFFD and every emitted line is valid UTF-8.
+    sanitize_utf8: bool,
+}
+
+impl FileEncodingDetector for AutoFileEncodingDetector {
+    fn max_peek_bytes(&self) -> usize {
+        self.auto.max_bytes
+    }
+
+    fn idle_timeout_secs(&self) -> u64 {
+        self.auto.idle_timeout_secs
+    }
+
+    fn detect(&self, sniff: &[u8], waive_min: bool) -> EncodingDetectOutcome {
+        let outcome = if waive_min {
+            detect_charset_idle_force(sniff, &self.auto)
+        } else {
+            detect_charset(sniff, &self.auto)
+        };
+        match outcome {
+            DetectOutcome::Pending => EncodingDetectOutcome::Pending,
+            DetectOutcome::Decided { encoding, via } => {
+                let bom_skip_bytes = encoding_rs::Encoding::for_bom(sniff)
+                    .filter(|(enc, _)| *enc == encoding_rs::UTF_8)
+                    .map(|(_, len)| len as u16)
+                    .unwrap_or(0);
+                // Zero-copy only when the sniff proved the bytes are UTF-8 (a UTF-8
+                // BOM or strict validation). A fallback decision means the window was
+                // NOT valid UTF-8 even when the fallback charset is UTF-8, so those
+                // files must flow through the decoder to get U+FFFD substitution and
+                // the malformed-input warning, matching explicit `charset: utf-8`.
+                // `sanitize_utf8` opts proven-UTF-8 files into the same decoder path
+                // to guarantee valid UTF-8 output beyond the detection window.
+                let zero_copy_utf8 = encoding == encoding_rs::UTF_8
+                    && matches!(via, DetectVia::Bom | DetectVia::Utf8Valid)
+                    && !self.sanitize_utf8;
+                EncodingDetectOutcome::Decided {
+                    encoding_name: if zero_copy_utf8 {
+                        None
+                    } else {
+                        Some(encoding.name())
+                    },
+                    via: via.as_str(),
+                    via_kind: detect_via_kind(via),
+                    line_delimiter: if zero_copy_utf8 {
+                        Bytes::from(self.line_delimiter.clone())
+                    } else {
+                        Encoder::new(encoding).encode_from_utf8(&self.line_delimiter)
+                    },
+                    bom_skip_bytes: if zero_copy_utf8 { bom_skip_bytes } else { 0 },
+                }
+            }
+            DetectOutcome::Rejected {
+                encoding,
+                via,
+                ratio,
+            } => EncodingDetectOutcome::Rejected {
+                encoding_name: encoding.name(),
+                via: via.as_str(),
+                ratio,
+            },
+        }
+    }
+}
+
+/// Maps the detector-internal `DetectVia` to the typed kind that crosses the
+/// file-source boundary (the string label in events stays separate).
+const fn detect_via_kind(via: DetectVia) -> DetectViaKind {
+    match via {
+        DetectVia::Bom => DetectViaKind::Bom,
+        DetectVia::Utf16Heuristic => DetectViaKind::Utf16Heuristic,
+        DetectVia::Utf8Valid => DetectViaKind::Utf8Valid,
+        DetectVia::Fallback => DetectViaKind::Fallback,
+    }
 }
 
 struct EventMetadata {
@@ -831,7 +1031,7 @@ mod tests {
         collections::HashSet,
         fs::{self, File},
         future::Future,
-        io::{Seek, Write},
+        io::{BufWriter, Seek, Write},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -839,6 +1039,7 @@ mod tests {
     };
 
     use encoding_rs::UTF_16LE;
+    use flate2::{Compression, write::GzEncoder};
     use indoc::indoc;
     use similar_asserts::assert_eq;
     use tempfile::tempdir;
@@ -948,7 +1149,7 @@ mod tests {
             "#,
         })
         .unwrap();
-        assert_eq!(config.encoding, Some(EncodingConfig { charset: UTF_16LE }));
+        assert_eq!(config.encoding, Some(EncodingConfig::explicit(UTF_16LE)));
 
         let config: FileConfig = serde_yaml::from_str(indoc! {
             r#"
@@ -2322,7 +2523,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = file::FileConfig {
             include: vec![PathBuf::from("tests/data/utf-16le.log")],
-            encoding: Some(EncodingConfig { charset: UTF_16LE }),
+            encoding: Some(EncodingConfig::explicit(UTF_16LE)),
             ..test_default_file_config(&dir)
         };
 
@@ -2475,6 +2676,1605 @@ mod tests {
         }
     }
 
+    fn utf16le_bytes(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    enum TestLogSinkInner {
+        Plain(File),
+        Gzip(GzEncoder<BufWriter<File>>),
+        Finished,
+    }
+
+    struct TestLogSink {
+        inner: TestLogSinkInner,
+    }
+
+    impl Write for TestLogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match &mut self.inner {
+                TestLogSinkInner::Plain(file) => file.write(buf),
+                TestLogSinkInner::Gzip(encoder) => encoder.write(buf),
+                TestLogSinkInner::Finished => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "gzip stream finished",
+                )),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            match &mut self.inner {
+                TestLogSinkInner::Plain(file) => file.flush(),
+                TestLogSinkInner::Gzip(encoder) => {
+                    encoder.flush()?;
+                    encoder.get_mut().flush()?;
+                    encoder.get_mut().get_mut().sync_all()?;
+                    Ok(())
+                }
+                TestLogSinkInner::Finished => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for TestLogSink {
+        fn drop(&mut self) {
+            if let TestLogSinkInner::Gzip(encoder) =
+                std::mem::replace(&mut self.inner, TestLogSinkInner::Finished)
+            {
+                let _ = encoder.finish();
+            }
+        }
+    }
+
+    impl TestLogSink {
+        fn create(path: &std::path::Path, gzip: bool) -> std::io::Result<Self> {
+            if gzip {
+                let file = File::create(path)?;
+                let encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+                Ok(Self {
+                    inner: TestLogSinkInner::Gzip(encoder),
+                })
+            } else {
+                Ok(Self {
+                    inner: TestLogSinkInner::Plain(File::create(path)?),
+                })
+            }
+        }
+    }
+
+    fn write_complete_gzip_file(path: &std::path::Path, data: &[u8]) {
+        let file = File::create(path).unwrap();
+        let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap();
+    }
+
+    /// Append one complete gzip member to `path`, creating the file if needed.
+    /// Appending members is the only way a gzip file can grow observably: a
+    /// member is not decodable until its trailer is written, and the reader
+    /// never picks up bytes added to a file it has already read to EOF, so
+    /// each growth step must be a self-contained member that is on disk
+    /// before the reader first reaches it.
+    fn append_gzip_member(path: &std::path::Path, data: &[u8]) {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+        encoder.write_all(data).unwrap();
+        let mut writer = encoder.finish().unwrap();
+        writer.flush().unwrap();
+    }
+
+    /// Write `data` as the entire file contents (truncating any existing file),
+    /// plain or gzip-compressed. For plain files a whole-file rewrite also
+    /// models growth: reads go through the file handle's offset, so a
+    /// still-Pending watcher drains the rewritten content once it decides. For
+    /// gzip a rewrite is only safe while no watcher exists: the watcher
+    /// buffers the creation-time compressed bytes when it probes for the gzip
+    /// magic, so rewriting a watched gzip file leaves its reader replaying the
+    /// old generation. Watched gzip files grow via `append_gzip_member`.
+    fn write_whole(path: &std::path::Path, data: &[u8], gzip: bool) {
+        if gzip {
+            write_complete_gzip_file(path, data);
+        } else {
+            std::fs::write(path, data).unwrap();
+        }
+    }
+
+    macro_rules! encoding_auto_plain_and_gzip {
+        ($plain:ident, $gzip:ident, $impl_fn:ident) => {
+            #[tokio::test]
+            async fn $plain() {
+                $impl_fn(false).await;
+            }
+
+            #[tokio::test]
+            async fn $gzip() {
+                $impl_fn(true).await;
+            }
+        };
+    }
+
+    async fn encoding_auto_mixed_glob_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let utf8_path = dir.path().join("utf8.log");
+        let utf16_path = dir.path().join("utf16.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut utf8 = TestLogSink::create(&utf8_path, gzip).unwrap();
+                    // Meet min_bytes with UTF-8 content.
+                    let line = format!("{}\n", "u".repeat(64));
+                    write!(&mut utf8, "{line}").unwrap();
+                    utf8.flush().unwrap();
+                }
+
+                {
+                    let mut utf16 = TestLogSink::create(&utf16_path, gzip).unwrap();
+                    let payload = utf16le_bytes(&format!("{}\n", "v".repeat(64)));
+                    utf16.write_all(&payload).unwrap();
+                    utf16.flush().unwrap();
+                }
+
+                // Both files emit one line; wait for them rather than a fixed sleep.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('u')),
+            "expected utf-8 file lines, got {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('v')),
+            "expected utf-16 file lines, got {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\0')),
+            "decoded lines must not contain NUL, got {received:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_mixed_glob,
+        test_encoding_auto_mixed_glob_gzip,
+        encoding_auto_mixed_glob_impl
+    );
+
+    async fn encoding_auto_rotation_redetect_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("app.log")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("app.log");
+        let rotated = dir.path().join("app.log.1");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                let first = format!("{}\n", "a".repeat(64));
+                write!(&mut file, "{first}").unwrap();
+                file.flush().unwrap();
+            }
+            sleep_500_millis().await;
+
+            // Rotate: move old file aside, create new file with different encoding.
+            std::fs::rename(&path, &rotated).unwrap();
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                let payload = utf16le_bytes(&format!("{}\n", "b".repeat(64)));
+                file.write_all(&payload).unwrap();
+                file.flush().unwrap();
+            }
+            sleep(Duration::from_millis(800)).await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('a')),
+            "missing first-generation utf-8 lines: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('b')),
+            "missing rotated utf-16 lines: {received:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_rotation_redetect,
+        test_encoding_auto_rotation_redetect_gzip,
+        encoding_auto_rotation_redetect_impl
+    );
+
+    // Rename rotation where the rotated name still matches the glob: the Pending
+    // watcher first sees an inode mismatch at its old path (stays Pending, never
+    // Rejected), then the glob pass remaps it to the rotated path where it
+    // decides and drains its content.
+    #[tokio::test]
+    async fn test_encoding_auto_rotation_in_glob_remaps_and_drains() {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(64),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("app.log");
+        let rotated = dir.path().join("app.log.rotated");
+        // Staged outside the glob (subdirectories are not matched).
+        let staging = dir.path().join(".data").join("gen2.log");
+        let decoy = dir.path().join("decoy.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // Sub-min but newline-terminated: fingerprints, stays Pending.
+                std::fs::write(&path, b"tiny gen one\n").unwrap();
+                {
+                    let mut decoy_file = File::create(&decoy).unwrap();
+                    writeln!(&mut decoy_file, "{}", "d".repeat(70)).unwrap();
+                }
+                // Causal checkpoint: decoy emission proves a full server pass ran
+                // with generation one still Pending.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+                // Rotate without ever leaving the path absent: hard-link the old
+                // inode to the rotated name, then atomically replace the path with
+                // generation two. The old watcher can therefore only observe a
+                // same-path inode mismatch (never NotFound) until the glob pass
+                // remaps it to the rotated name.
+                std::fs::hard_link(&path, &rotated).unwrap();
+                std::fs::write(&staging, format!("{}\n", "r".repeat(70))).unwrap();
+                std::fs::rename(&staging, &path).unwrap();
+
+                // Grow the rotated file past min_bytes with a second complete
+                // line; the unchanged first line keeps the fingerprint matching
+                // the old watcher.
+                let mut tail = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&rotated)
+                    .unwrap();
+                writeln!(&mut tail, "{}", "k".repeat(70)).unwrap();
+                tail.flush().unwrap();
+
+                // decoy + generation two + both rotated lines.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 4, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m == "tiny gen one"),
+            "rotated file must drain its pre-rotation line after remap: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('k')),
+            "rotated file must drain its post-rotation line: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('r')),
+            "generation two must emit through its own watcher: {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\u{FFFD}')),
+            "nothing may be rejected or mangled during rotation: {received:?}"
+        );
+    }
+
+    async fn encoding_auto_empty_grow_utf16_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("grow.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // Empty file: below min, must stay Pending.
+                write_whole(&path, b"", gzip);
+                sleep(Duration::from_millis(300)).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+                // Grow past min with a complete UTF-16 line.
+                let payload = utf16le_bytes(&format!("{}\n", "g".repeat(64)));
+                write_whole(&path, &payload, gzip);
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received.len(), 1);
+        assert!(received[0].contains('g'));
+        assert!(!received[0].contains('\0'));
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_empty_grow_utf16,
+        test_encoding_auto_empty_grow_utf16_gzip,
+        encoding_auto_empty_grow_utf16_impl
+    );
+
+    async fn encoding_auto_binary_rejected_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let bin_path = dir.path().join("bin.dat");
+        let good_path = dir.path().join("good.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut good = TestLogSink::create(&good_path, gzip).unwrap();
+                let line = format!("{}\n", "ok".repeat(32));
+                write!(&mut good, "{line}").unwrap();
+                good.flush().unwrap();
+            }
+
+            {
+                let mut file = TestLogSink::create(&bin_path, gzip).unwrap();
+                let mut bytes = vec![0u8; 256];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(37).wrapping_add(0x80);
+                }
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().all(|m| m.contains("ok")),
+            "only the utf-8 companion file should emit, got {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\u{FFFD}')),
+            "rejected binary must not contribute replacement-filled lines: {received:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_binary_rejected,
+        test_encoding_auto_binary_rejected_gzip,
+        encoding_auto_binary_rejected_impl
+    );
+
+    async fn encoding_auto_ratio_zero_allows_binary_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                max_replacement_ratio: Some(0.0),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("bin.dat");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    // Invalid UTF-8 that still frames on `\n` under fallback UTF-8.
+                    let mut bytes = vec![0x80u8; 64];
+                    bytes.push(b'\n');
+                    file.write_all(&bytes).unwrap();
+                    file.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        assert!(
+            !received.is_empty(),
+            "ratio 0 must not reject; got no events"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_ratio_zero_allows_binary,
+        test_encoding_auto_ratio_zero_allows_binary_gzip,
+        encoding_auto_ratio_zero_allows_binary_impl
+    );
+
+    async fn encoding_auto_bom_stripped_from_event_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(128),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("bom.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                file.write_all(&[0xef, 0xbb, 0xbf]).unwrap();
+                writeln!(&mut file, "hello bom").unwrap();
+                file.flush().unwrap();
+            }
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received, vec!["hello bom".to_string()]);
+        assert!(!received[0].starts_with('\u{feff}'));
+        assert!(!received[0].as_bytes().starts_with(&[0xef, 0xbb, 0xbf]));
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_bom_stripped_from_event,
+        test_encoding_auto_bom_stripped_from_event_gzip,
+        encoding_auto_bom_stripped_from_event_impl
+    );
+
+    async fn encoding_auto_utf16le_bom_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                // High min proves the BOM decides regardless of window size.
+                auto_detect_min_bytes: Some(1024),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("bom16.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    file.write_all(&[0xff, 0xfe]).unwrap();
+                    file.write_all(&utf16le_bytes("hello utf sixteen\n"))
+                        .unwrap();
+                    file.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received, vec!["hello utf sixteen".to_string()]);
+        assert!(!received[0].contains('\u{feff}'));
+        assert!(!received[0].contains('\0'));
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_utf16le_bom,
+        test_encoding_auto_utf16le_bom_gzip,
+        encoding_auto_utf16le_bom_impl
+    );
+
+    #[tokio::test]
+    async fn test_encoding_auto_resume_mid_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("resume.log");
+        let data_dir = dir.path().join(".data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let make_config = |include: Vec<PathBuf>| file::FileConfig {
+            include,
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            data_dir: Some(data_dir.clone()),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            fingerprint: FingerprintConfig::Checksum {
+                ignored_header_bytes: 0,
+                lines: 1,
+            },
+            internal_metrics: FileInternalMetricsConfig {
+                include_file_tag: true,
+            },
+            ..Default::default()
+        };
+
+        // First run: ingest both UTF-16 lines with acks so checkpoints advance.
+        {
+            let mut file = File::create(&path).unwrap();
+            let line1 = utf16le_bytes(&format!("{}\n", "r".repeat(40)));
+            let line2 = utf16le_bytes(&format!("{}\n", "s".repeat(40)));
+            file.write_all(&line1).unwrap();
+            file.write_all(&line2).unwrap();
+            file.flush().unwrap();
+
+            let received = run_file_source(
+                &make_config(vec![path.clone()]),
+                true,
+                Acks,
+                LogNamespace::Legacy,
+                None,
+                sleep_500_millis(),
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            assert!(msgs.iter().any(|m| m.contains('r')));
+            assert!(msgs.iter().any(|m| m.contains('s')));
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+
+        // Second run: append a third line; peek-restore must not re-emit prior lines
+        // or NUL-mangle UTF-16 after re-detecting from offset 0.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let line3 = utf16le_bytes(&format!("{}\n", "t".repeat(40)));
+            file.write_all(&line3).unwrap();
+            file.flush().unwrap();
+
+            let received = run_file_source(
+                &make_config(vec![path.clone()]),
+                false,
+                NoAcks,
+                LogNamespace::Legacy,
+                None,
+                sleep_500_millis(),
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            assert!(
+                msgs.iter().any(|m| m.contains('t')),
+                "expected newly appended line after resume, got {msgs:?}"
+            );
+            assert!(
+                msgs.iter().all(|m| !m.contains('r') && !m.contains('s')),
+                "must not re-read checkpointed lines after peek-restore, got {msgs:?}"
+            );
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+    }
+
+    async fn encoding_auto_fallback_charset_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                // Prove the knob: a single-byte fallback can frame raw `\n` bytes that
+                // are neither UTF-8 nor UTF-16.
+                fallback_charset: Some(encoding_rs::WINDOWS_1252),
+                auto_detect_min_bytes: Some(32),
+                // Disable reject so inconclusive windows still ingest via fallback.
+                max_replacement_ratio: Some(0.0),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        // Invalid UTF-8, not BOM, and not UTF-16 NUL-parity: forces fallback_charset.
+        let path = dir.path().join("fallback.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    let mut bytes = vec![0x80u8; 80];
+                    bytes.push(b'\n');
+                    assert!(std::str::from_utf8(&bytes).is_err());
+                    file.write_all(&bytes).unwrap();
+                    file.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+            },
+        )
+        .await;
+
+        assert!(
+            !received.is_empty(),
+            "fallback must still ingest when reject disabled"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_fallback_charset,
+        test_encoding_auto_fallback_charset_gzip,
+        encoding_auto_fallback_charset_impl
+    );
+
+    async fn encoding_auto_pending_until_min_then_emit_impl(gzip: bool) {
+        // Lifecycle: stay Pending across sub-min appends; only emit after size crosses min.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(64),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("drip.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // Empty file: below min.
+                write_whole(&path, b"", gzip);
+                sleep(Duration::from_millis(200)).await;
+                assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+                // Sub-min UTF-16, newline-terminated so the file fingerprints and
+                // gets a watcher: "stays Pending" is then enforced by the encoding
+                // gate, not by the fingerprinter refusing to watch. Once watched,
+                // a gzip file must grow by appended members (a rewrite would leave
+                // the watcher replaying its buffered generation-one bytes), while
+                // plain growth keeps the whole-file rewrite model.
+                if gzip {
+                    append_gzip_member(&path, &utf16le_bytes("abcdefghij\n"));
+                } else {
+                    write_whole(&path, &utf16le_bytes("abcdefghij\n"), false);
+                }
+                sleep(Duration::from_millis(400)).await;
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    0,
+                    "must stay Pending below auto_detect_min_bytes"
+                );
+
+                // Cross min with a second complete line (same first line keeps the
+                // fingerprint stable).
+                if gzip {
+                    append_gzip_member(&path, &utf16le_bytes(&format!("{}\n", "k".repeat(40))));
+                } else {
+                    let mut payload = utf16le_bytes("abcdefghij\n");
+                    payload.extend(utf16le_bytes(&format!("{}\n", "k".repeat(40))));
+                    write_whole(&path, &payload, false);
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert_eq!(received.len(), 2, "both lines drain after deciding");
+        assert_eq!(received[0], "abcdefghij");
+        assert!(received[1].contains('k'));
+        assert!(received.iter().all(|m| !m.contains('\0')));
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_pending_until_min_then_emit,
+        test_encoding_auto_pending_until_min_then_emit_gzip,
+        encoding_auto_pending_until_min_then_emit_impl
+    );
+
+    async fn encoding_auto_ratio_under_threshold_allows_impl(gzip: bool) {
+        // Sparse invalid UTF-8 → fallback decode with some U+FFFD, ratio well under 0.33.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("sparse_bad.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                let mut bytes = vec![b'a'; 90];
+                bytes.extend(std::iter::repeat(0x80u8).take(10));
+                bytes.push(b'\n');
+                assert!(std::str::from_utf8(&bytes).is_err());
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
+            sleep_500_millis().await;
+        })
+        .await;
+
+        // Assert on raw message bytes: `to_string_lossy` would introduce U+FFFD at
+        // display time and mask whether the decode path actually sanitized the line.
+        let received = extract_messages_value(received);
+        assert_eq!(
+            received.len(),
+            1,
+            "under-threshold FFFD must not Reject: {received:?}"
+        );
+        let bytes = received[0].as_bytes().expect("message must be bytes");
+        let text = std::str::from_utf8(bytes)
+            .expect("fallback-decided UTF-8 must be decoded, not passed through raw");
+        assert!(
+            text.contains('a'),
+            "expected ASCII payload to survive: {text:?}"
+        );
+        assert!(
+            text.contains('\u{FFFD}'),
+            "fixture should surface replacements (proves allow-path, not reject): {text:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_ratio_under_threshold_allows,
+        test_encoding_auto_ratio_under_threshold_allows_gzip,
+        encoding_auto_ratio_under_threshold_allows_impl
+    );
+
+    async fn encoding_auto_sanitize_utf8_replaces_invalid_impl(gzip: bool) {
+        // A file detected as UTF-8 can still contain invalid bytes past the
+        // detection window (capped at 64 bytes here, inside the clean first
+        // line). With `sanitize_utf8` those lines are decoded (U+FFFD
+        // substitution) instead of passed through raw. The plain variant grows
+        // the file after the decision; the gzip variant writes the malformed
+        // tail up front because a gzip reader latches EOF once it has decoded
+        // every complete member on disk and never sees later appends.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                auto_detect_max_bytes: Some(64),
+                sanitize_utf8: true,
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("sanitize.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                // Valid UTF-8 filling the whole detection window: detection
+                // decides via strict validation and never sees the bad bytes.
+                let clean = format!("{}\n", "a".repeat(64));
+                write!(&mut file, "{clean}").unwrap();
+                if gzip {
+                    file.write_all(b"bad \x80\x81 bytes\n").unwrap();
+                    drop(file);
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+                } else {
+                    file.flush().unwrap();
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+
+                    // Invalid bytes arrive only after the file was decided as UTF-8.
+                    file.write_all(b"bad \x80\x81 bytes\n").unwrap();
+                    file.flush().unwrap();
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+                }
+            },
+        )
+        .await;
+
+        // Raw-bytes assertions: `to_string_lossy` would fabricate U+FFFD at display
+        // time and hide an unsanitized pass-through.
+        let received = extract_messages_value(received);
+        assert_eq!(received.len(), 2, "expected both lines: {received:?}");
+        for value in &received {
+            let bytes = value.as_bytes().expect("message must be bytes");
+            std::str::from_utf8(bytes)
+                .expect("sanitize_utf8 must guarantee valid UTF-8 output lines");
+        }
+        let second = std::str::from_utf8(received[1].as_bytes().unwrap()).unwrap();
+        assert!(
+            second.contains('\u{FFFD}'),
+            "invalid bytes must be replaced at decode time: {second:?}"
+        );
+        assert!(second.starts_with("bad ") && second.ends_with(" bytes"));
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_sanitize_utf8_replaces_invalid,
+        test_encoding_auto_sanitize_utf8_replaces_invalid_gzip,
+        encoding_auto_sanitize_utf8_replaces_invalid_impl
+    );
+
+    #[tokio::test]
+    async fn test_encoding_auto_sanitize_utf8_bom_matches_explicit_utf8() {
+        // A UTF-8 BOM file with an invalid byte: `sanitize_utf8` must route it
+        // through the decoder so the BOM is stripped and the invalid byte gets
+        // U+FFFD, identical to what an explicit `charset: utf-8` run produces.
+        const FIXTURE: &[u8] = b"\xEF\xBB\xBFbom line \x80 tail\n";
+
+        async fn run_once(encoding: EncodingConfig) -> Vec<Value> {
+            let dir = tempdir().unwrap();
+            let config = file::FileConfig {
+                include: vec![dir.path().join("*")],
+                encoding: Some(encoding),
+                ..test_default_file_config(&dir)
+            };
+            let path = dir.path().join("bom.log");
+            write_whole(&path, FIXTURE, false);
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let received = run_file_source(
+                &config,
+                false,
+                NoAcks,
+                LogNamespace::Legacy,
+                Some(Arc::clone(&counter)),
+                async {
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                },
+            )
+            .await;
+            extract_messages_value(received)
+        }
+
+        let auto = run_once(EncodingConfig {
+            sanitize_utf8: true,
+            ..EncodingConfig::auto()
+        })
+        .await;
+        let explicit = run_once(EncodingConfig::explicit(encoding_rs::UTF_8)).await;
+
+        assert_eq!(auto.len(), 1, "expected one sanitized line: {auto:?}");
+        assert_eq!(auto, explicit, "auto+sanitize must match explicit utf-8");
+
+        let bytes = auto[0].as_bytes().expect("message must be bytes");
+        let text = std::str::from_utf8(bytes).expect("sanitized line must be valid UTF-8");
+        assert!(
+            !text.starts_with('\u{FEFF}'),
+            "BOM must be stripped: {text:?}"
+        );
+        assert!(
+            text.contains('\u{FFFD}'),
+            "invalid byte must be replaced: {text:?}"
+        );
+        assert!(text.starts_with("bom line ") && text.ends_with(" tail"));
+    }
+
+    async fn encoding_auto_ignored_header_bytes_compatible_impl(gzip: bool) {
+        // Fingerprint skips a fixed header; encoding auto still peeks at offset 0.
+        // UTF-16 header + body keeps detection on the UTF-16 ladder for the whole sniff.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hdr.log");
+        let data_dir = dir.path().join(".data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let phase2_data_dir = dir.path().join(".data_phase2");
+        fs::create_dir_all(&phase2_data_dir).unwrap();
+
+        // "HEADER!!!\n" is 10 UTF-16 code units → 20 bytes.
+        const HEADER_BYTES: usize = 20;
+        let header_a = utf16le_bytes("HEADER!!!\n");
+        let header_b = utf16le_bytes("HEADER###\n");
+        assert_eq!(header_a.len(), HEADER_BYTES);
+        assert_eq!(header_b.len(), HEADER_BYTES);
+
+        let make_config = |include: Vec<PathBuf>, data_dir: PathBuf| file::FileConfig {
+            include,
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            data_dir: Some(data_dir),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            fingerprint: FingerprintConfig::Checksum {
+                ignored_header_bytes: HEADER_BYTES,
+                lines: 1,
+            },
+            internal_metrics: FileInternalMetricsConfig {
+                include_file_tag: true,
+            },
+            ..Default::default()
+        };
+
+        {
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                file.write_all(&header_a).unwrap();
+                file.write_all(&utf16le_bytes(&format!("{}\n", "p".repeat(40))))
+                    .unwrap();
+                file.write_all(&utf16le_bytes(&format!("{}\n", "q".repeat(40))))
+                    .unwrap();
+                file.flush().unwrap();
+            }
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let received = run_file_source(
+                &make_config(vec![path.clone()], data_dir.clone()),
+                true,
+                Acks,
+                LogNamespace::Legacy,
+                Some(Arc::clone(&counter)),
+                async {
+                    wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 3, 5_000).await;
+                },
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            // Header line is still ingested (ignore is fingerprint-only).
+            assert!(
+                msgs.iter().any(|m| m.contains("HEADER!!!")),
+                "header line should still be read as content: {msgs:?}"
+            );
+            assert!(msgs.iter().any(|m| m.contains('p')));
+            assert!(msgs.iter().any(|m| m.contains('q')));
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+
+        // Same fingerprint body after a different header; append a new line only.
+        {
+            let body = {
+                let mut b = Vec::new();
+                b.extend_from_slice(&utf16le_bytes(&format!("{}\n", "p".repeat(40))));
+                b.extend_from_slice(&utf16le_bytes(&format!("{}\n", "q".repeat(40))));
+                b.extend_from_slice(&utf16le_bytes(&format!("{}\n", "r".repeat(40))));
+                b
+            };
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                file.write_all(&header_b).unwrap();
+                file.write_all(&body).unwrap();
+                file.flush().unwrap();
+            }
+
+            let received = run_file_source(
+                &make_config(
+                    vec![path.clone()],
+                    if gzip {
+                        phase2_data_dir.clone()
+                    } else {
+                        data_dir.clone()
+                    },
+                ),
+                false,
+                NoAcks,
+                LogNamespace::Legacy,
+                None,
+                sleep_500_millis(),
+            )
+            .await;
+            let msgs = extract_messages_string(received);
+            if gzip {
+                // Gzip checkpoints are not resumed from a non-zero offset; phase two
+                // re-reads the whole member and still auto-detects UTF-16 past the header.
+                assert!(
+                    msgs.iter().any(|m| m.contains('r')),
+                    "gzip rewrite must still emit new body line: {msgs:?}"
+                );
+                assert!(
+                    msgs.iter().any(|m| m.contains("HEADER###")),
+                    "gzip rewrite must still read header as content: {msgs:?}"
+                );
+            } else {
+                assert!(
+                    msgs.iter().any(|m| m.contains('r')),
+                    "checkpoint+fingerprint must resume after header change: {msgs:?}"
+                );
+                assert!(
+                    msgs.iter()
+                        .all(|m| !m.contains('p') && !m.contains('q') && !m.contains("HEADER")),
+                    "must not re-emit checkpointed header/body lines: {msgs:?}"
+                );
+            }
+            assert!(msgs.iter().all(|m| !m.contains('\0')));
+        }
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_ignored_header_bytes_compatible,
+        test_encoding_auto_ignored_header_bytes_compatible_gzip,
+        encoding_auto_ignored_header_bytes_compatible_impl
+    );
+
+    async fn encoding_auto_idle_timeout_force_decide_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_idle_timeout_secs: Some(0),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("idle.log");
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                writeln!(&mut file, "small idle-timeout line").unwrap();
+                file.flush().unwrap();
+            }
+            sleep_500_millis().await;
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains("idle-timeout")),
+            "expected idle-timeout force-decide emit, got {received:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_idle_timeout_force_decide,
+        test_encoding_auto_idle_timeout_force_decide_gzip,
+        encoding_auto_idle_timeout_force_decide_impl
+    );
+
+    async fn encoding_auto_pending_delete_quiet_impl(gzip: bool) {
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_idle_timeout_secs: Some(3600),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("gone.log");
+        let decoy = dir.path().join("ok.log");
+        let decoy2 = dir.path().join("ok2.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut file = TestLogSink::create(&path, gzip).unwrap();
+                    // Newline-terminated so the checksum fingerprinter creates a
+                    // watcher; without one the file never enters the Pending state
+                    // this test exists to exercise.
+                    writeln!(&mut file, "tiny").unwrap();
+                    file.flush().unwrap();
+                }
+
+                // Causal checkpoint: the decoy is written only after the fixture
+                // exists, so its emit proves a full server pass has seen (and
+                // watched) the still-Pending fixture. No timing guess. Each decoy
+                // is a closed, self-contained file: a gzip member only becomes
+                // decodable once its trailer is written, and a gzip reader never
+                // sees lines appended after it reached EOF.
+                {
+                    let mut ok = TestLogSink::create(&decoy, gzip).unwrap();
+                    writeln!(&mut ok, "{}", "z".repeat(1100)).unwrap();
+                    ok.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+
+                std::fs::remove_file(&path).unwrap();
+
+                // Second decoy file: its emit proves at least one further full
+                // pass ran after the deletion, so the zero assert below is not
+                // vacuously early. Distinct content keeps its checksum
+                // fingerprint separate from the first decoy's.
+                {
+                    let mut ok2 = TestLogSink::create(&decoy2, gzip).unwrap();
+                    writeln!(&mut ok2, "{}", "y".repeat(1100)).unwrap();
+                    ok2.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('z')),
+            "first decoy line must emit: {received:?}"
+        );
+        assert!(
+            received.iter().any(|m| m.contains('y')),
+            "second decoy line must emit: {received:?}"
+        );
+        assert!(
+            !received.iter().any(|m| m.contains("tiny")),
+            "deleted Pending file must not emit lines: {received:?}"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_pending_delete_quiet,
+        test_encoding_auto_pending_delete_quiet_gzip,
+        encoding_auto_pending_delete_quiet_impl
+    );
+
+    async fn encoding_auto_remove_after_pending_ships_then_removes_impl(gzip: bool) {
+        // A sub-min Pending file must get its idle-timeout decision (and ship
+        // its content) before remove_after may delete it, even when the grace
+        // period is shorter than the idle timeout. After the decision, the
+        // regular remove_after path reaps the file.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pending_remove.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(0),
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(4096),
+                auto_detect_max_bytes: Some(8192),
+                auto_detect_idle_timeout_secs: Some(1),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(50),
+            ..test_default_file_config(&dir)
+        };
+
+        // Newline-terminated so the fingerprinter creates a watcher and the file
+        // actually reaches the Pending state whose deletion floor is under test.
+        write_whole(&path, b"ships before removal\n", gzip);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // The idle force-decide must fire and ship the line first.
+                // Generous bound: Pending re-peeks are throttled like read
+                // attempts and can take a full throttle interval to land.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 15_000).await;
+                for _ in 0..100 {
+                    if !path.exists() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains("ships before removal")),
+            "sub-min content must decide and ship before removal: {received:?}"
+        );
+        assert!(
+            !path.exists(),
+            "remove_after must delete the file once it shipped"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_remove_after_pending_ships_then_removes,
+        test_encoding_auto_remove_after_pending_ships_then_removes_gzip,
+        encoding_auto_remove_after_pending_ships_then_removes_impl
+    );
+
+    async fn encoding_auto_remove_after_rejected_impl(gzip: bool) {
+        // Rejected files skip reading but must still honor remove_after.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bin.dat");
+        let decoy = dir.path().join("ok.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(0),
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(32),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(50),
+            ..test_default_file_config(&dir)
+        };
+
+        let received = run_file_source(&config, false, NoAcks, LogNamespace::Legacy, None, async {
+            {
+                let mut good = TestLogSink::create(&decoy, gzip).unwrap();
+                writeln!(&mut good, "{}", "ok".repeat(32)).unwrap();
+                good.flush().unwrap();
+            }
+            {
+                let mut file = TestLogSink::create(&path, gzip).unwrap();
+                // High-entropy bytes: invalid UTF-8, not UTF-16-looking, rejected
+                // by the replacement-ratio gate. The pattern contains a 0x0A so
+                // the file fingerprints and gets a watcher.
+                let mut bytes = vec![0u8; 256];
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (i as u8).wrapping_mul(37).wrapping_add(0x80);
+                }
+                file.write_all(&bytes).unwrap();
+                file.flush().unwrap();
+            }
+            for _ in 0..50 {
+                if !path.exists() {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().all(|m| m.contains("ok")),
+            "only the utf-8 companion file should emit: {received:?}"
+        );
+        assert!(!path.exists(), "remove_after must reap Rejected files");
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_encoding_auto_remove_after_rejected,
+        test_encoding_auto_remove_after_rejected_gzip,
+        encoding_auto_remove_after_rejected_impl
+    );
+
+    async fn remove_after_fixed_charset_ships_then_removes_impl(gzip: bool) {
+        // Reap-parity sibling: the same short file that stays quiet under auto
+        // detection (Pending) ships its content under a fixed charset and is then
+        // removed after the grace period.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pending_remove.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(1),
+            encoding: Some(EncodingConfig::explicit(encoding_rs::UTF_8)),
+            glob_minimum_cooldown_ms: Duration::from_millis(50),
+            ..test_default_file_config(&dir)
+        };
+
+        write_whole(&path, b"stay pending\n", gzip);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                for _ in 0..100 {
+                    if !path.exists() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains("stay pending")),
+            "fixed charset must read the content before removal: {received:?}"
+        );
+        assert!(
+            !path.exists(),
+            "remove_after must remove the file after it shipped"
+        );
+    }
+
+    encoding_auto_plain_and_gzip!(
+        test_remove_after_fixed_charset_ships_then_removes,
+        test_remove_after_fixed_charset_ships_then_removes_gzip,
+        remove_after_fixed_charset_ships_then_removes_impl
+    );
+
+    // A sub-min Pending file whose mtime predates the `remove_after` grace period
+    // must still get its idle-timeout decision (and ship its content) before any
+    // deletion: the grace clock is anchored on watch start, not on mtime.
+    #[cfg(unix)] // uses unix-specific `futimes` to backdate the mtime
+    #[tokio::test]
+    async fn test_encoding_auto_remove_after_backdated_mtime_ships_first() {
+        use std::{os::unix::io::AsRawFd, time::SystemTime};
+
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*")],
+            remove_after_secs: Some(30),
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_idle_timeout_secs: Some(1),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("old.log");
+        {
+            let mut file = File::create(&path).unwrap();
+            writeln!(&mut file, "backdated but alive").unwrap();
+            file.flush().unwrap();
+
+            // Backdate the mtime well beyond the remove_after grace period.
+            let old = SystemTime::now() - std::time::Duration::from_secs(120);
+            let old_time = libc::timeval {
+                tv_sec: old
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as _,
+                tv_usec: 0,
+            };
+            let old_times = [old_time, old_time];
+            unsafe {
+                libc::futimes(file.as_raw_fd(), old_times.as_ptr());
+            }
+            file.sync_all().unwrap();
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                // Re-peeks of a Pending file are throttled like read attempts, so
+                // the idle decision can take a full throttle interval to land.
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 15_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains("backdated")),
+            "sub-min file must ship via idle decide before remove_after: {received:?}"
+        );
+        assert!(
+            path.exists(),
+            "grace anchored on watch start must not have elapsed yet"
+        );
+    }
+
+    // After a rename rotation the Pending watcher's path can point at a different
+    // file; `remove_after` must never delete that file based on the old watcher's
+    // state and clocks.
+    #[tokio::test]
+    async fn test_encoding_auto_remove_after_skips_replaced_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("watched.log");
+        let decoy = dir.path().join("decoy.log");
+        // Staged outside the glob (subdirectories are not matched).
+        let staging = dir.path().join(".data").join("replacement.log");
+        let config = file::FileConfig {
+            include: vec![dir.path().join("*.log")],
+            remove_after_secs: Some(2),
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(1024),
+                auto_detect_idle_timeout_secs: Some(3600),
+                ..EncodingConfig::auto()
+            }),
+            glob_minimum_cooldown_ms: Duration::from_millis(100),
+            ..test_default_file_config(&dir)
+        };
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                std::fs::write(&path, b"tiny pending\n").unwrap();
+                {
+                    let mut decoy_file = File::create(&decoy).unwrap();
+                    writeln!(&mut decoy_file, "{}", "d".repeat(1100)).unwrap();
+                }
+                // Decoy emission proves a full server pass ran: the watched file
+                // has a watcher by now and stays Pending (sub-min, huge idle).
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+
+                // Atomically replace the watched path with a different file: the
+                // old watcher's inode is unlinked and the path now belongs to the
+                // replacement (which gets its own watcher and emits).
+                std::fs::write(&staging, format!("{}\n", "r".repeat(1100))).unwrap();
+                std::fs::rename(&staging, &path).unwrap();
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+
+                // Outlive the old watcher's grace period; periodic appends keep
+                // the replacement's own remove_after clock fresh.
+                let mut keep_alive = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                for i in 0..10 {
+                    writeln!(&mut keep_alive, "keep alive {i}").unwrap();
+                    keep_alive.flush().unwrap();
+                    sleep(Duration::from_millis(300)).await;
+                }
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('r')),
+            "replacement file must emit through its own watcher: {received:?}"
+        );
+        assert!(
+            !received.iter().any(|m| m.contains("tiny")),
+            "the replaced Pending file was never decided and must not emit: {received:?}"
+        );
+        assert!(
+            path.exists(),
+            "old Pending watcher must not delete the file now occupying its path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_gzip_rotation_while_pending() {
+        // Auto-detect on a gzip stream still below min_bytes, then rotate before
+        // deciding; generation two must emit without rejecting during the inode change.
+        let dir = tempdir().unwrap();
+        let config = file::FileConfig {
+            include: vec![dir.path().join("app.log"), dir.path().join("decoy.log")],
+            encoding: Some(EncodingConfig {
+                auto_detect_min_bytes: Some(64),
+                ..EncodingConfig::auto()
+            }),
+            ..test_default_file_config(&dir)
+        };
+
+        let path = dir.path().join("app.log");
+        let rotated = dir.path().join("app.log.1");
+        let decoy = dir.path().join("decoy.log");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let received = run_file_source(
+            &config,
+            false,
+            NoAcks,
+            LogNamespace::Legacy,
+            Some(Arc::clone(&counter)),
+            async {
+                {
+                    let mut gen1 = TestLogSink::create(&path, true).unwrap();
+                    // Newline-terminated so gen1 fingerprints and actually enters
+                    // Pending; still below min_bytes.
+                    writeln!(&mut gen1, "{}", "x".repeat(20)).unwrap();
+                    gen1.flush().unwrap();
+                }
+                // Causal checkpoint: a decoy written after gen1 emits only once a
+                // full server pass has processed both files, so asserting the
+                // counter afterwards proves gen1 stayed Pending (no timing guess).
+                {
+                    let mut decoy_sink = TestLogSink::create(&decoy, true).unwrap();
+                    writeln!(&mut decoy_sink, "{}", "d".repeat(70)).unwrap();
+                    decoy_sink.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 1, 5_000).await;
+                assert_eq!(
+                    counter.load(Ordering::SeqCst),
+                    1,
+                    "sub-min pending gzip must not emit; only the decoy may"
+                );
+
+                std::fs::rename(&path, &rotated).unwrap();
+
+                {
+                    let mut gen2 = TestLogSink::create(&path, true).unwrap();
+                    let payload = utf16le_bytes(&format!("{}\n", "q".repeat(64)));
+                    gen2.write_all(&payload).unwrap();
+                    gen2.flush().unwrap();
+                }
+                wait_for_atomic_usize_timeout_ms(Arc::clone(&counter), |n| n >= 2, 5_000).await;
+            },
+        )
+        .await;
+
+        let received = extract_messages_string(received);
+        assert!(
+            received.iter().any(|m| m.contains('q')),
+            "rotated generation must emit utf-16 line: {received:?}"
+        );
+        assert!(
+            received.iter().all(|m| !m.contains('\u{FFFD}')),
+            "must not reject during rotation: {received:?}"
+        );
+        assert!(counter.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_encoding_auto_validation_errors() {
+        let err = EncodingConfig {
+            fallback_charset: Some(encoding_rs::UTF_8),
+            ..EncodingConfig::explicit(UTF_16LE)
+        }
+        .validate_and_resolve();
+        assert!(err.is_err());
+
+        let err = EncodingConfig {
+            sanitize_utf8: true,
+            ..EncodingConfig::explicit(UTF_16LE)
+        }
+        .validate_and_resolve();
+        assert!(err.is_err());
+
+        let ok = EncodingConfig {
+            fallback_charset: Some(encoding_rs::UTF_8),
+            auto_detect_min_bytes: Some(64),
+            auto_detect_max_bytes: Some(1024),
+            max_replacement_ratio: Some(0.5),
+            sanitize_utf8: true,
+            ..EncodingConfig::auto()
+        }
+        .validate_and_resolve();
+        assert!(ok.is_ok());
+    }
+
     #[tokio::test]
     async fn remove_file() {
         let n = 5;
@@ -2560,6 +4360,12 @@ mod tests {
             let (trigger_shutdown, shutdown, shutdown_done) = ShutdownSignal::new_wired();
             let data_dir = config.data_dir.clone().unwrap();
             let acks = !matches!(acking_mode, NoAcks);
+            let resolved_auto = config
+                .encoding
+                .as_ref()
+                .and_then(|e| e.validate_and_resolve().expect("test config"));
+            let resolved_encoding =
+                file::resolve_file_encoding(config, resolved_auto).expect("test config");
 
             tokio::spawn(file::file_source(
                 config,
@@ -2568,6 +4374,7 @@ mod tests {
                 tx,
                 acks,
                 log_namespace,
+                resolved_encoding,
             ));
 
             let result = if let Some(counter) = event_counter {

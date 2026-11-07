@@ -37,7 +37,7 @@ use std::{
 use arc_swap::ArcSwap;
 use vrl::value::{ObjectMap, Value};
 
-use super::{Condition, Error, IndexHandle, InternalError, Table};
+use super::{Claim, ClaimOutcome, Condition, Error, IndexHandle, InternalError, Table};
 use crate::Case;
 
 /// A hashmap of name => implementation of an enrichment table.
@@ -265,6 +265,25 @@ impl TableSearch {
                     table: table.to_string(),
                 }),
                 Some(table) => table.find_table_rows(case, condition, select, wildcard, index),
+            }
+        } else {
+            Err(Error::Internal {
+                source: InternalError::FinishLoadNotCalled,
+            })
+        }
+    }
+
+    /// Checks and marks a key in the given table in one step.
+    ///
+    /// If we are in the writing stage, this function will return an error.
+    pub fn claim(&self, table: &str, claim: &Claim<'_>) -> Result<ClaimOutcome, Error> {
+        let tables = self.0.load();
+        if let Some(ref tables) = **tables {
+            match tables.get(table) {
+                None => Err(Error::TableNotLoaded {
+                    table: table.to_string(),
+                }),
+                Some(table) => table.claim(claim),
             }
         } else {
             Err(Error::Internal {

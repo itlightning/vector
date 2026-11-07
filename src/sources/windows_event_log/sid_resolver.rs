@@ -1,39 +1,34 @@
-use std::num::NonZeroUsize;
-
-use lru::LruCache;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::{LookupAccountSidW, PSID, SID_NAME_USE};
 use windows::core::{HSTRING, PWSTR};
 
-/// Maximum number of SID-to-account name mappings to cache.
-const SID_CACHE_CAPACITY: usize = 4096;
-
 /// Resolves Windows SID strings (e.g. "S-1-5-18") to human-readable account
 /// names (e.g. "NT AUTHORITY\SYSTEM") using the Windows `LookupAccountSidW` API.
 ///
-/// Results are cached in an LRU cache to avoid repeated lookups for the same SID.
-pub struct SidResolver {
-    cache: LruCache<String, Option<String>>,
-}
+/// The cache behind this is process-global and bounded (see `shared_cache`): a
+/// SID means the same thing to every source, so one shared copy is both smaller
+/// and warmer than one copy per source.
+pub struct SidResolver;
 
 impl SidResolver {
-    pub fn new() -> Self {
-        Self {
-            cache: LruCache::new(NonZeroUsize::new(SID_CACHE_CAPACITY).unwrap()),
-        }
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Resolve a SID string to "DOMAIN\Username" format.
     /// Returns `None` if the SID cannot be resolved (unknown account, invalid SID, etc.).
     /// Caches both successful and failed lookups.
-    pub fn resolve(&mut self, sid_string: &str) -> Option<String> {
-        if let Some(cached) = self.cache.get(sid_string) {
-            return cached.clone();
+    /// The lookup runs OUTSIDE the map lock. `LookupAccountSidW` can reach a
+    /// domain controller, and holding a process-global lock across that would
+    /// stall every source in the process on one slow name resolution.
+    pub fn resolve(&self, sid_string: &str) -> Option<String> {
+        if let Some(cached) = super::shared_cache::sid_lookup(sid_string) {
+            return cached;
         }
 
         let result = lookup_sid(sid_string);
-        self.cache.put(sid_string.to_string(), result.clone());
+        super::shared_cache::sid_store(sid_string, result.clone());
         result
     }
 }
@@ -55,7 +50,7 @@ fn lookup_sid(sid_string: &str) -> Option<String> {
     let mut domain_len: u32 = 0;
     let mut sid_type = SID_NAME_USE::default();
 
-    let _ = unsafe {
+    _ = unsafe {
         LookupAccountSidW(
             None,
             psid,
@@ -69,7 +64,7 @@ fn lookup_sid(sid_string: &str) -> Option<String> {
 
     if name_len == 0 {
         unsafe {
-            let _ = LocalFree(HLOCAL(psid.0));
+            _ = LocalFree(HLOCAL(psid.0));
         }
         return None;
     }
@@ -92,7 +87,7 @@ fn lookup_sid(sid_string: &str) -> Option<String> {
 
     // Free the PSID allocated by ConvertStringSidToSidW
     unsafe {
-        let _ = LocalFree(HLOCAL(psid.0));
+        _ = LocalFree(HLOCAL(psid.0));
     }
 
     if result.is_err() {
@@ -115,7 +110,7 @@ mod tests {
 
     #[test]
     fn test_sid_resolver_caches_results() {
-        let mut resolver = SidResolver::new();
+        let resolver = SidResolver::new();
         // Well-known SID: S-1-5-18 = NT AUTHORITY\SYSTEM
         let first = resolver.resolve("S-1-5-18");
         let second = resolver.resolve("S-1-5-18");
@@ -124,14 +119,14 @@ mod tests {
 
     #[test]
     fn test_invalid_sid_returns_none() {
-        let mut resolver = SidResolver::new();
+        let resolver = SidResolver::new();
         assert!(resolver.resolve("not-a-sid").is_none());
         assert!(resolver.resolve("").is_none());
     }
 
     #[test]
     fn test_well_known_sids() {
-        let mut resolver = SidResolver::new();
+        let resolver = SidResolver::new();
 
         // S-1-5-18 = SYSTEM
         if let Some(name) = resolver.resolve("S-1-5-18") {

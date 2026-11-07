@@ -54,6 +54,28 @@ pub enum WildcardMatching {
     Relaxed,
 }
 
+/// The process priority class to settle at once the topology is running.
+#[configurable_component]
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SteadyPriority {
+    /// Below normal (`BELOW_NORMAL_PRIORITY_CLASS`).
+    BelowNormal,
+
+    /// Normal (`NORMAL_PRIORITY_CLASS`).
+    Normal,
+}
+
+impl SteadyPriority {
+    /// The configuration spelling, for logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BelowNormal => "below_normal",
+            Self::Normal => "normal",
+        }
+    }
+}
+
 /// Global configuration options.
 //
 // If this is modified, make sure those changes are reflected in the `ConfigBuilder::append`
@@ -194,6 +216,16 @@ pub struct GlobalOptions {
     /// `find_vector_metrics`, and `aggregate_vector_metrics` functions.
     #[serde(default, skip_serializing_if = "crate::serde::is_default")]
     pub metrics_storage_refresh_period: Option<f64>,
+
+    /// The process priority class Vector settles at once its topology is running. Windows only.
+    ///
+    /// Startup (config load, compilation, topology build) runs at the priority class the
+    /// process was started with, and the class changes once, after "Vector has started". A
+    /// config reload runs at the settled class. Unset leaves the priority class unchanged.
+    /// Ignored on other platforms.
+    #[serde(default, skip_serializing_if = "crate::serde::is_default")]
+    #[configurable(metadata(docs::advanced))]
+    pub steady_priority: Option<SteadyPriority>,
 }
 
 impl_generate_config_from_default!(GlobalOptions);
@@ -298,6 +330,10 @@ impl GlobalOptions {
             errors.push("conflicting values for 'expire_metrics_secs' found".to_owned());
         }
 
+        if conflicts(self.steady_priority.as_ref(), with.steady_priority.as_ref()) {
+            errors.push("conflicting values for 'steady_priority' found".to_owned());
+        }
+
         let data_dir = if self.data_dir.is_none() || self.data_dir == default_data_dir() {
             with.data_dir
         } else if with.data_dir != default_data_dir() && self.data_dir != with.data_dir {
@@ -348,6 +384,7 @@ impl GlobalOptions {
                 metrics_storage_refresh_period: self
                     .metrics_storage_refresh_period
                     .or(with.metrics_storage_refresh_period),
+                steady_priority: self.steady_priority.or(with.steady_priority),
             })
         } else {
             Err(errors)
@@ -506,6 +543,31 @@ mod tests {
             Err(vec![
                 "conflicting values for 'expire_metrics_secs' found".into()
             ])
+        );
+    }
+
+    #[test]
+    fn parses_and_merges_steady_priority() {
+        let merge = |a, b| merge("steady_priority", a, b, |result| result.steady_priority);
+
+        assert_eq!(merge(None, None), Ok(None));
+        assert_eq!(
+            merge(Some("below_normal"), None),
+            Ok(Some(SteadyPriority::BelowNormal))
+        );
+        assert_eq!(
+            merge(None, Some("normal")),
+            Ok(Some(SteadyPriority::Normal))
+        );
+        assert_eq!(
+            merge(Some("normal"), Some("below_normal")),
+            Err(vec![
+                "conflicting values for 'steady_priority' found".into()
+            ])
+        );
+        assert!(
+            toml::from_str::<GlobalOptions>(r#"steady_priority = "idle""#).is_err(),
+            "an unknown class is a config error, not a silent no-op"
         );
     }
 

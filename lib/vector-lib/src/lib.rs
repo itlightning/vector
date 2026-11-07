@@ -39,8 +39,8 @@ pub mod config {
     pub use vector_core::config::{
         AcknowledgementsConfig, DataType, GlobalOptions, Input, LegacyKey, LogNamespace, LogSchema,
         MEMORY_BUFFER_DEFAULT_MAX_EVENTS, OutputId, SourceAcknowledgementsConfig, SourceOutput,
-        Tags, Telemetry, TransformOutput, WildcardMatching, clone_input_definitions,
-        init_log_schema, init_telemetry, log_schema, proxy, telemetry,
+        SteadyPriority, Tags, Telemetry, TransformOutput, WildcardMatching,
+        clone_input_definitions, init_log_schema, init_telemetry, log_schema, proxy, telemetry,
     };
 }
 

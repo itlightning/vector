@@ -6,6 +6,7 @@ pub mod checkpointer;
 mod fingerprinter;
 pub mod internal_events;
 mod metadata_ext;
+pub mod status;
 
 use vector_config::configurable_component;
 
@@ -14,6 +15,10 @@ pub use self::{
     fingerprinter::{FileFingerprint, FingerprintStrategy, Fingerprinter},
     internal_events::FileSourceInternalEvents,
     metadata_ext::{AsyncFileInfo, PortableFileExt},
+    status::{
+        DEFAULT_STATUS_INTERVAL_SECS, FileSourceStatus, FileState, FileStatus,
+        MAX_STATUS_INTERVAL_SECS, STATUS_FILE_NAME, StatusWriter,
+    },
 };
 
 pub type FilePosition = u64;
