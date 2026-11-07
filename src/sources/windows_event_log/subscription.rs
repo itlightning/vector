@@ -205,13 +205,16 @@ pub(super) static EVT_NEXT_RETURNED_TOTAL: std::sync::atomic::AtomicU64 =
 pub(super) static EVT_SUBSCRIBE_FLAG_LOG: std::sync::Mutex<Option<Vec<u32>>> =
     std::sync::Mutex::new(None);
 
-/// How often a dormant channel's record count is read again.
+/// The longest a dormant channel's record count goes unread.
 ///
-/// This is how late the first record on an empty channel can be seen, and all
-/// the wait can cost: the channel is then read from its oldest record, so
-/// nothing is lost unless the log wraps within the interval. A read costs about
-/// 124 us per channel, measured on 182 channels of Server 2025 (22 ms a round),
-/// so a minute leaves the service alone and still sees a first record promptly.
+/// Every status write reads the count too and restarts this wait, so at a status
+/// interval under a minute this timer never fires: at the default 30 s the status
+/// writes are the only reads, two a minute, and a first record is seen within
+/// 30 s. The timer is the backstop for a slower status interval.
+///
+/// A late look costs only the wait: the channel is then read from its oldest
+/// record, so nothing is lost unless the log wraps first. A read costs about
+/// 124 us per channel, measured on 182 channels of Server 2025 (22 ms a round).
 const DORMANT_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The code a strict subscribe gets from a bookmark on a cleared channel, measured
@@ -709,10 +712,11 @@ struct ChannelSubscription {
     skipped_this_generation: Option<SkipReason>,
     /// When the next periodic refresh is due.
     next_refresh: std::time::Instant,
-    /// `Some` while the channel is dormant: it held no records when last read,
-    /// so it gives its slot of the service's machine-wide subscription limit
-    /// back, and has its count read again at this instant. `None` from the
-    /// moment a read shows anything else, for the rest of the process.
+    /// `Some` while the channel is dormant: a read found it empty, so it gives
+    /// its slot of the service's machine-wide subscription limit back, and has
+    /// its count read again at this instant. A status write that finds anything
+    /// else moves this instant to now, and the next pull reads again and sets
+    /// `None`, for the rest of the process.
     dormant_recheck_at: Option<std::time::Instant>,
     /// `TimeCreated` of the most recent event, for the triage fields on the
     /// onset and recovery edges.
@@ -852,7 +856,7 @@ impl ChannelSubscription {
     /// a kept bookmark would not.
     fn enter_dormant(&mut self) -> Result<(), WindowsEventLogError> {
         if self.bookmark_positioned {
-            self.note_bookmark_dead(CLEARED_BOOKMARK_CODE);
+            self.note_log_cleared();
         }
         self.bookmark = BookmarkManager::new(&self.channel)?;
         self.resume.forget_position();
@@ -869,15 +873,25 @@ impl ChannelSubscription {
         Ok(())
     }
 
+    /// Read a dormant channel's count, whoever is asking, and report whether it
+    /// is still empty. A read of zero stamps the channel and restarts the
+    /// recheck wait, so no read is repeated by the other caller.
+    fn read_dormant_count(&mut self, now: std::time::Instant) -> bool {
+        if super::render::dormancy_record_count(&self.channel) == Some(0) {
+            self.dormant_recheck_at = Some(now + DORMANT_RECHECK_INTERVAL);
+            self.note_reached_head();
+            return true;
+        }
+        false
+    }
+
     /// Read a dormant channel's count again, and report whether it woke.
     ///
     /// Only a read of exactly zero keeps it dormant. Records or a failed read
     /// both end dormancy for good: the channel subscribes, and from then on the
     /// ordinary retry ladder owns it, so this read can never hold a channel dark.
     fn recheck_dormant(&mut self, now: std::time::Instant) -> bool {
-        if super::render::dormancy_record_count(&self.channel) == Some(0) {
-            self.dormant_recheck_at = Some(now + DORMANT_RECHECK_INTERVAL);
-            self.note_reached_head();
+        if self.read_dormant_count(now) {
             return false;
         }
         self.dormant_recheck_at = None;
@@ -894,10 +908,9 @@ impl ChannelSubscription {
     /// the status interval, so one recheck interval is too old on a fast beat.
     /// Any answer but zero is left to the next pull, which owns that decision.
     fn confirm_dormant(&mut self) {
-        if super::render::dormancy_record_count(&self.channel) == Some(0) {
-            self.note_reached_head();
-        } else {
-            self.dormant_recheck_at = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        if !self.read_dormant_count(now) {
+            self.dormant_recheck_at = Some(now);
         }
     }
 
@@ -1084,12 +1097,52 @@ impl ChannelSubscription {
     /// The stored position no longer resolves: step the ladder, record the hole
     /// and announce it.
     fn note_bookmark_dead(&mut self, code: u32) {
+        if let Some(rung) = self.step_bookmark_dead() {
+            self.log_rung_advance(rung, code, "bookmark_dead");
+        }
+    }
+
+    /// The same move for a stored position on an empty channel, reported with
+    /// the code a strict subscribe would have got. With no stored time the rung
+    /// is the terminal one, but the channel does not stay there: it reads from
+    /// its oldest record, so the announcement says that instead.
+    fn note_log_cleared(&mut self) {
+        match self.step_bookmark_dead() {
+            Some(Rung::FutureOnly) => self.log_future_only(
+                format!(
+                    "Windows Event Log channel was cleared and has no stored time to \
+                     resume by; its earlier records are gone, and it reads from its \
+                     oldest record once it has one (channel={}).",
+                    self.channel
+                ),
+                CLEARED_BOOKMARK_CODE,
+                "bookmark_dead",
+            ),
+            Some(rung) => self.log_rung_advance(rung, CLEARED_BOOKMARK_CODE, "bookmark_dead"),
+            None => {}
+        }
+    }
+
+    /// Take the dead-position step, returning the rung if the ladder moved.
+    fn step_bookmark_dead(&mut self) -> Option<Rung> {
         let previous = self.resume.rung;
         let rung = self.resume.bookmark_dead();
         self.bookmark_positioned = false;
-        if self.note_rung_move(previous, rung) {
-            self.log_rung_advance(rung, code, "bookmark_dead");
-        }
+        self.note_rung_move(previous, rung).then_some(rung)
+    }
+
+    /// The ERROR the terminal rung announces itself with.
+    fn log_future_only(&self, message: String, code: u32, reason: &str) {
+        error!(
+            message = message,
+            error_code = "resume_future_only",
+            // The backlog is unreadable from any position we still hold.
+            error_type = error_type::READER_FAILED,
+            channel = %self.channel,
+            reason = reason,
+            win32_error = code,
+            internal_log_rate_limit = false,
+        );
     }
 
     /// Announce a resume-ladder move. Every rung is deliberate data loss and
@@ -1097,19 +1150,14 @@ impl ChannelSubscription {
     /// therefore an ERROR.
     fn log_rung_advance(&self, rung: Rung, code: u32, reason: &str) {
         if rung == Rung::FutureOnly {
-            error!(
-                message = format!(
+            self.log_future_only(
+                format!(
                     "Windows Event Log channel fell back to future-events-only; \
                      backlog for this channel is not recoverable (channel={}).",
                     self.channel
                 ),
-                error_code = "resume_future_only",
-                // The backlog is unreadable from any position we still hold.
-                error_type = error_type::READER_FAILED,
-                channel = %self.channel,
-                reason = reason,
-                win32_error = code,
-                internal_log_rate_limit = false,
+                code,
+                reason,
             );
         } else {
             warn!(
@@ -1344,9 +1392,9 @@ impl ChannelSubscription {
     /// list. Its state is already visible in the reported rung, which stays on
     /// that step for as long as the channel is there.
     ///
-    /// The lossless steps also record nothing, which is decided by the recorder
-    /// and not here, so every call site reports uniformly and none of them has
-    /// to remember which steps lose data.
+    /// The steps that open no known hole also record nothing, which is decided
+    /// by the recorder and not here, so every call site reports uniformly and
+    /// none of them has to remember which steps lose data.
     fn note_rung_move(&mut self, previous: Rung, rung: Rung) -> bool {
         if previous == rung {
             return false;
@@ -1462,6 +1510,17 @@ impl ChannelSubscription {
             return;
         }
         let unidentified = std::mem::take(&mut self.unidentified_since_last_seen);
+        // A time resume re-reads ids it already passed, and its floor leaves
+        // holes among them where an earlier stamp sits. Those records were
+        // handed over the first time, so only ids past the last one seen are
+        // judged.
+        if matches!(self.resume.rung, Rung::TimeAdvance(_))
+            && self
+                .last_record_id_seen
+                .is_some_and(|last| record_id <= last)
+        {
+            return;
+        }
         match evaluate_gap(
             self.last_record_id_seen,
             record_id,
@@ -2934,7 +2993,7 @@ impl Drop for EventLogSubscription {
 #[cfg(test)]
 mod tests {
     use super::super::recovery::TimeRung;
-    use super::super::test_seams::SeamSession;
+    use super::super::test_seams::{RecordCountGuard, SeamSession};
     use super::*;
 
     async fn create_test_checkpointer() -> (Arc<Checkpointer>, tempfile::TempDir) {
@@ -5372,7 +5431,11 @@ mod tests {
                  cycle"
             );
         }
-        for record_id in &before {
+        // The log is live: a record it overwrote since `before` was read is not
+        // one this source lost.
+        let mut after = subscription_from(&application_config()).await;
+        let held: std::collections::HashSet<u64> = drain_all(&mut after).into_iter().collect();
+        for record_id in before.iter().filter(|id| held.contains(id)) {
             assert!(
                 seen.contains(record_id),
                 "record {record_id} was readable before the cycle and was never \
@@ -5638,7 +5701,7 @@ mod tests {
         assert_eq!(
             factory("*").query_for(&resume),
             (
-                "*[System[TimeCreated[@SystemTime>='2026-08-07T12:00:00.000Z']]]".to_string(),
+                "*[System[TimeCreated[@SystemTime>='2026-08-07T11:59:58.000Z']]]".to_string(),
                 QueryOrigin::Generated
             ),
             "a time rung over a wildcard base subscribes with the generated \
@@ -5655,7 +5718,7 @@ mod tests {
             composed,
             "<QueryList><Query Id=\"0\" Path=\"Application\">\
              <Select Path=\"Application\">*[System[EventID=4624]]</Select>\
-             <Suppress Path=\"Application\">*[System[TimeCreated[@SystemTime&lt;'2026-08-07T12:00:00.000Z']]]</Suppress>\
+             <Suppress Path=\"Application\">*[System[TimeCreated[@SystemTime&lt;'2026-08-07T11:59:58.000Z']]]</Suppress>\
              </Query></QueryList>",
             "the floor rides in a Suppress clause and the operator XPath is untouched"
         );
@@ -5896,7 +5959,7 @@ mod tests {
     fn suppress_composition_table() {
         const OPEN: &str = "<QueryList><Query Id=\"0\" Path=\"Security\"><Select>*</Select>";
         const CLOSE: &str = "</Query></QueryList>";
-        const FLOOR: &str = "<Suppress>*[System[TimeCreated[@SystemTime&lt;'2026-08-07T12:00:00.000Z']]]</Suppress>";
+        const FLOOR: &str = "<Suppress>*[System[TimeCreated[@SystemTime&lt;'2026-08-07T11:59:58.000Z']]]</Suppress>";
         let auditing = "Microsoft-Windows-Security-Auditing";
         let bookmark = ResumeState::new(true);
         let time = time_rung_resume();
@@ -5918,7 +5981,7 @@ mod tests {
                 "no rules, time rung: today's floor predicate, unchanged",
                 suppress_factory("Security", "*", Vec::new()),
                 &time,
-                "*[System[TimeCreated[@SystemTime>='2026-08-07T12:00:00.000Z']]]".to_string(),
+                "*[System[TimeCreated[@SystemTime>='2026-08-07T11:59:58.000Z']]]".to_string(),
                 QueryOrigin::Generated,
             ),
             (
@@ -7604,27 +7667,73 @@ mod tests {
         );
     }
 
-    /// The boundary-tick rung re-reads a millisecond and loses nothing.
-    ///
-    /// It is the only lossless rung, and it is lossless BECAUSE it over-reads:
-    /// the XPath floors to the millisecond, so events already sent can come
-    /// back. Trimming that overlap is exactly what the deleted admission gate
-    /// did, and what cost real events.
-    #[tokio::test]
-    async fn the_boundary_tick_rung_loses_no_records() {
-        let _seams = SeamSession::acquire();
-        let mut subscription = subscription_from(&application_config()).await;
+    /// Every record Application holds, as `(id, TimeCreated)`, read from the
+    /// oldest by a subscription of its own.
+    async fn application_records() -> Vec<(u64, chrono::DateTime<chrono::Utc>)> {
+        let mut reader = subscription_from(&application_config()).await;
+        let mut records = Vec::new();
+        for _ in 0..64 {
+            let batch = reader.pull_events(usize::MAX).unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
+            records.extend(batch.iter().map(|e| (e.record_id, e.time_created)));
+        }
+        records
+    }
 
-        let first: Vec<u64> = subscription
-            .pull_events(50)
-            .unwrap_or_default()
+    /// The first position where a later record, close behind it in the log,
+    /// carries a stamp up to a second earlier: the record the overlap exists
+    /// for. Returns that position and the later record.
+    fn stamped_behind(
+        records: &[(u64, chrono::DateTime<chrono::Utc>)],
+    ) -> Option<(usize, (u64, chrono::DateTime<chrono::Utc>))> {
+        records
             .iter()
-            .map(|event| event.record_id)
-            .collect();
-        assert_eq!(first.len(), 50, "this test resumes mid-backlog");
+            .enumerate()
+            .find_map(|(position, (_, time))| {
+                let earliest = *time - chrono::Duration::seconds(1);
+                records[position + 1..]
+                    .iter()
+                    .take(64)
+                    .find(|(_, later)| {
+                        *later >= earliest && *later < *time - chrono::Duration::milliseconds(1)
+                    })
+                    .map(|later| (position, *later))
+            })
+    }
 
-        // Bookmark death: the ladder takes the time rung, floored to the
-        // millisecond of the last event sent.
+    /// The boundary-tick rung delivers every record stamped at or after its
+    /// floor, whatever the log holds.
+    ///
+    /// It holds that contract BECAUSE it over-reads: events already sent come
+    /// back, and trimming them is exactly what the deleted admission gate did,
+    /// and what cost real events. Records are asserted by stamp and not by id
+    /// order, because a later record can be stamped earlier, and one stamped
+    /// before the floor is outside the contract. Where the log has a record
+    /// stamped behind its neighbors, the resume stops just before it, so the
+    /// overlap is what delivers it.
+    ///
+    /// The log is live, so a record it overwrote during the test proves nothing.
+    #[tokio::test]
+    async fn the_boundary_tick_rung_delivers_every_record_at_or_after_its_floor() {
+        let _seams = SeamSession::acquire();
+        let baseline = application_records().await;
+        let behind = stamped_behind(&baseline);
+        let wanted = behind.map_or(50, |(position, _)| position + 1);
+        assert!(baseline.len() >= wanted, "this test resumes mid-backlog");
+
+        let mut subscription = subscription_from(&application_config()).await;
+        let mut delivered = 0;
+        while delivered < wanted {
+            let batch = subscription
+                .pull_events(wanted - delivered)
+                .unwrap_or_default();
+            assert!(!batch.is_empty(), "this test resumes mid-backlog");
+            delivered += batch.len();
+        }
+
+        // Bookmark death: the ladder takes the time rung.
         {
             let _guard = SubscribeScriptGuard::install(&_seams, &[15011]);
             subscription.force_rebuild_all();
@@ -7634,17 +7743,67 @@ mod tests {
             "the premise is the time rung, not another bookmark resume"
         );
 
-        let after = drain_all(&mut subscription);
-        let seen: std::collections::HashSet<u64> =
-            first.iter().chain(after.iter()).copied().collect();
-        let last = seen.iter().copied().max().expect("records were delivered");
-        let missing: Vec<u64> = (first[0]..=last).filter(|id| !seen.contains(id)).collect();
+        let floor = subscription.channels[0]
+            .resume
+            .time_floor()
+            .expect("the time rung has a floor");
+        if let Some((_, (id, time))) = behind {
+            assert!(
+                time >= floor,
+                "record {id} stamped {time} is the one the overlap is for, and \
+                 the floor {floor} passed over it"
+            );
+        }
+
+        let after: std::collections::HashSet<u64> =
+            drain_all(&mut subscription).into_iter().collect();
+        let held: std::collections::HashSet<u64> = application_records()
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let missing: Vec<u64> = baseline
+            .iter()
+            .filter(|(id, time)| *time >= floor && held.contains(id) && !after.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
         assert!(
             missing.is_empty(),
-            "the boundary-tick rung must lose nothing between the last event \
-             sent and the resume. {} records went missing, first ten {:?}",
+            "the boundary-tick rung must deliver every record stamped at or after \
+             its floor {floor}. {} went missing, first ten {:?}",
             missing.len(),
             missing.iter().take(10).collect::<Vec<_>>()
+        );
+    }
+
+    /// A time resume re-reads ids it already passed, and a record stamped under
+    /// the floor leaves a hole among them. That record was handed over the first
+    /// time, so the hole is not a gap, while one past the last id seen still is.
+    #[tokio::test]
+    async fn a_time_resume_judges_only_ids_past_the_last_one_seen() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let _seams = SeamSession::acquire();
+        let mut subscription = subscription_from(&application_config()).await;
+        assert_eq!(subscription.pull_events(5).unwrap_or_default().len(), 5);
+        let channel = &mut subscription.channels[0];
+        channel.resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+        let last = channel.last_record_id_seen.expect("five records were read");
+
+        let capture = ErrorCodeCapture::default();
+        let collector = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(collector);
+
+        for id in [last - 4, last - 2, last, last + 1] {
+            channel.observe_record_id(id);
+        }
+        assert!(capture.seen.lock().unwrap().is_empty());
+        assert_eq!(channel.last_record_id_seen, Some(last + 1));
+
+        channel.observe_record_id(last + 3);
+        assert_eq!(
+            *capture.seen.lock().unwrap(),
+            vec![("WARN".to_string(), "record_id_gap_expected".to_string())]
         );
     }
 
@@ -7904,12 +8063,12 @@ mod tests {
         }
     }
 
-    /// The first time rung is an escalation that loses nothing, so it must
-    /// report nothing.
+    /// The first time rung is an escalation that opens no hole it can name, so
+    /// it must report none.
     ///
     /// It is the step most easily mistaken for a lossy one, because every other
-    /// escalation on the ladder does lose data. Reporting a hole here would
-    /// send a reader hunting for records that were all delivered.
+    /// escalation on the ladder opens a window. Reporting a hole here would send
+    /// a reader hunting for records that were delivered.
     #[tokio::test]
     async fn the_boundary_tick_rung_records_no_gap() {
         let _seams = SeamSession::acquire();
@@ -7930,9 +8089,9 @@ mod tests {
         );
         assert!(
             subscription.first_channel_gaps().is_empty(),
-            "the first time rung steps the floor by zero and re-reads the last \
-             event's millisecond, so it can duplicate but never skip. It must \
-             record no gap: {:?}",
+            "the first time rung's floor sits behind the last event, so it \
+             duplicates and opens no hole it can name. It must record no gap: \
+             {:?}",
             subscription.first_channel_gaps()
         );
     }
@@ -7942,7 +8101,7 @@ mod tests {
     ///
     /// Walked as one ladder rather than as separate cases, because the ordering
     /// is the property: a widening window is recorded per step, and the
-    /// lossless first step never appears among them.
+    /// first step, which opens no window, never appears among them.
     #[tokio::test]
     async fn each_lossy_rung_records_its_own_gap() {
         let _seams = SeamSession::acquire();
@@ -7971,7 +8130,7 @@ mod tests {
             causes,
             vec!["+1s", "+10s", "+60s", "+5m", "+30m", "future_only"],
             "one gap per lossy step, in ladder order, and no entry for the \
-             lossless first step"
+             first step"
         );
 
         for gap in &gaps {
@@ -8440,24 +8599,6 @@ mod tests {
     // Dormant channels.
     // ---------------------------------------------------------------------
 
-    /// Scripts the record counts dormancy reads. `None` is a failed read. Once
-    /// the script runs out the real channel answers, and Application has records.
-    struct RecordCountGuard;
-
-    impl RecordCountGuard {
-        fn install(_seams: &SeamSession, counts: &[Option<u64>]) -> Self {
-            *super::super::render::RECORD_COUNT_SCRIPT.lock().unwrap() =
-                Some(counts.iter().copied().collect());
-            Self
-        }
-    }
-
-    impl Drop for RecordCountGuard {
-        fn drop(&mut self) {
-            *super::super::render::RECORD_COUNT_SCRIPT.lock().unwrap() = None;
-        }
-    }
-
     fn dormancy_checks() -> usize {
         super::super::render::DORMANCY_CHECKS.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -8617,6 +8758,22 @@ mod tests {
         assert!(subscription.first_channel_is_dormant());
     }
 
+    /// A status read of zero stands in for the recheck, so a channel is not read
+    /// again by the pull on top of the status write.
+    #[tokio::test]
+    async fn a_status_read_of_zero_restarts_the_recheck_wait() {
+        let _seams = SeamSession::acquire();
+        let _counts = RecordCountGuard::install(&_seams, &[Some(0), Some(0)]);
+        let mut subscription = subscription_from(&application_config()).await;
+
+        subscription.make_dormant_rechecks_due();
+        subscription.confirm_dormant_channels();
+        assert!(subscription.pull_events(5).unwrap().is_empty());
+
+        assert_eq!(dormancy_checks(), 2, "the entry read and the status read");
+        assert!(subscription.first_channel_is_dormant());
+    }
+
     /// A status write that finds records stamps nothing and decides nothing:
     /// it pulls the recheck forward, and the next pull wakes the channel.
     #[tokio::test]
@@ -8660,24 +8817,62 @@ mod tests {
         reader.channel_position("Application").unwrap()
     }
 
+    /// Captures the text of every ERROR.
+    #[derive(Clone, Default)]
+    struct ErrorMessageCapture {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct MessageVisitor<'a>(&'a mut Vec<String>);
+
+    impl tracing::field::Visit for MessageVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorMessageCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                event.record(&mut MessageVisitor(&mut self.messages.lock().unwrap()));
+            }
+        }
+    }
+
     /// Start over `checkpointer` on a channel reading empty, capturing the
-    /// warn-band lines the start logged.
+    /// warn-band lines the start logged and the text of its ERRORs.
     async fn start_empty(
         seams: &SeamSession,
         checkpointer: &Arc<Checkpointer>,
-    ) -> (EventLogSubscription, Vec<(String, String)>) {
+    ) -> (EventLogSubscription, Vec<(String, String)>, Vec<String>) {
         use tracing_subscriber::layer::SubscriberExt;
 
         let _counts = RecordCountGuard::install(seams, &[Some(0)]);
         let capture = ErrorCodeCapture::default();
-        let collector = tracing_subscriber::registry().with(capture.clone());
+        let errors = ErrorMessageCapture::default();
+        let collector = tracing_subscriber::registry()
+            .with(capture.clone())
+            .with(errors.clone());
         let _default = tracing::subscriber::set_default(collector);
         let subscription =
             EventLogSubscription::new(&application_config(), Arc::clone(checkpointer), false)
                 .await
                 .unwrap();
         let seen = capture.seen.lock().unwrap().clone();
-        (subscription, seen)
+        let messages = errors.messages.lock().unwrap().clone();
+        (subscription, seen, messages)
     }
 
     /// A log cleared under a stored position with a time: the dead-bookmark
@@ -8692,7 +8887,7 @@ mod tests {
         assert!(position.last_event_time.is_some());
         checkpointer.set_batch(vec![position]).await.unwrap();
 
-        let (subscription, seen) = start_empty(&_seams, &checkpointer).await;
+        let (subscription, seen, _) = start_empty(&_seams, &checkpointer).await;
 
         assert_eq!(seen, vec![("WARN".to_string(), String::new())]);
         let status = application_status(&subscription);
@@ -8703,7 +8898,7 @@ mod tests {
         assert_eq!(subscription.channel_position("Application"), None);
         assert_eq!(checkpointer.get("Application").await, None);
 
-        let (_again, seen) = start_empty(&_seams, &checkpointer).await;
+        let (_again, seen, _) = start_empty(&_seams, &checkpointer).await;
         assert!(seen.is_empty(), "the clear is reported once: {seen:?}");
     }
 
@@ -8718,11 +8913,17 @@ mod tests {
         let bookmark_only = ChannelPosition::bookmark_only(position.channel, position.bookmark_xml);
         checkpointer.set_batch(vec![bookmark_only]).await.unwrap();
 
-        let (mut subscription, seen) = start_empty(&_seams, &checkpointer).await;
+        let (mut subscription, seen, messages) = start_empty(&_seams, &checkpointer).await;
 
         assert_eq!(
             seen,
             vec![("ERROR".to_string(), "resume_future_only".to_string())]
+        );
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].contains("reads from its oldest record")
+                && !messages[0].contains("future-events-only"),
+            "the channel reads from its oldest record, and the line must say so: {messages:?}"
         );
         let status = application_status(&subscription);
         assert_eq!(status.gaps.len(), 1);

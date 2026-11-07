@@ -110,6 +110,23 @@ impl Drop for SeamSession {
     }
 }
 
+/// Scripts the record counts dormancy reads. `None` is a failed read. Once the
+/// script runs out the real channel answers, and Application has records.
+pub(super) struct RecordCountGuard;
+
+impl RecordCountGuard {
+    pub(super) fn install(_seams: &SeamSession, counts: &[Option<u64>]) -> Self {
+        *render::RECORD_COUNT_SCRIPT.lock().unwrap() = Some(counts.iter().copied().collect());
+        Self
+    }
+}
+
+impl Drop for RecordCountGuard {
+    fn drop(&mut self) {
+        *render::RECORD_COUNT_SCRIPT.lock().unwrap() = None;
+    }
+}
+
 fn lock_owner() -> MutexGuard<'static, Option<ThreadId>> {
     SEAM_OWNER
         .lock()

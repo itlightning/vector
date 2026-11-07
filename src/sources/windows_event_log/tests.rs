@@ -963,6 +963,66 @@ async fn the_status_file_is_written_at_the_derived_default_path() {
     }
 }
 
+/// The first status file under `data_dir`, parsed, once one is complete.
+fn status_file_under(data_dir: &std::path::Path) -> Option<serde_json::Value> {
+    std::fs::read_dir(data_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("windows_event_log_status.json"))
+        .find_map(|path| serde_json::from_slice(&std::fs::read(path).ok()?).ok())
+}
+
+/// The running source, not the pieces: the reader takes a module's oldest drain
+/// stamp, so each status file must carry a dormant channel's fresh read. The
+/// entry stamps once and the recheck is a minute off, so only the status write's
+/// own read can move the count within this wait.
+#[tokio::test]
+async fn each_status_write_of_the_running_source_reads_a_dormant_channel() {
+    use super::test_seams::{RecordCountGuard, SeamSession};
+
+    let seams = SeamSession::acquire();
+    let _counts = RecordCountGuard::install(&seams, &[Some(0); 64]);
+    let data_dir = tempfile::tempdir().expect("failed to create temp data_dir");
+    let mut config = create_test_config();
+    config.data_dir = Some(data_dir.path().to_path_buf());
+    config.channels = vec!["Application".to_string()];
+    config.status_interval_secs = 1;
+    config.event_timeout_ms = 200;
+
+    let key = crate::config::ComponentKey::from("wel_dormant");
+    let (tx, _rx) = crate::SourceSender::new_test();
+    let (cx, shutdown) = crate::config::SourceContext::new_shutdown(&key, tx);
+    let source = config.build(cx).await.expect("source should build");
+    let running = tokio::spawn(source);
+
+    let channel = |status: &serde_json::Value| status["channels"]["Application"].clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        last = status_file_under(data_dir.path()).map(|status| channel(&status));
+        if last
+            .as_ref()
+            .is_some_and(|c| c["polls_at_head"].as_u64() >= Some(3))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown
+        .shutdown_all(Some(tokio::time::Instant::now() + Duration::from_secs(5)))
+        .await;
+    running.await.expect("source task").expect("source run");
+
+    let last = last.expect("a status file was written");
+    assert!(
+        last["polls_at_head"].as_u64() >= Some(3),
+        "the status writes did not read the channel: {last}"
+    );
+    assert_eq!(last["dormant"], true, "{last}");
+    assert_eq!(last["subscribed"], false, "{last}");
+}
+
 // ================================================================================================
 // SECURITY TESTS - Critical security attack vector validation
 // ================================================================================================
