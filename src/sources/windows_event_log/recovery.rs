@@ -124,12 +124,25 @@ pub(super) enum Rung {
     FutureOnly,
 }
 
+/// How far before the last event sent the first time rung resumes.
+///
+/// `TimeCreated` is stamped before a record reaches the log, so a later record
+/// can carry an earlier stamp. Measured over 30000 records of a Windows 11
+/// Application log, a floor on the last event's own millisecond passed over a
+/// later record at 9 % of positions, one second back at 0.03 %, and two seconds
+/// back at none, for about three records read twice per resume.
+///
+/// A clock step wider than this still beats it.
+const BOUNDARY_TICK_OVERLAP: Duration = Duration::from_secs(2);
+
 /// Time-window rungs in ascending order of data loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TimeRung {
-    /// Switch from bookmark resume to time-query resume without moving the
-    /// floor. The only lossless rung: it re-reads the last event's own
-    /// millisecond, so it can duplicate but can never skip.
+    /// Switch from bookmark resume to time-query resume, with the floor
+    /// [`BOUNDARY_TICK_OVERLAP`] before the last event's millisecond. Delivers
+    /// every record stamped at or after that floor, so it duplicates what the
+    /// overlap covers. A later record stamped before the floor is missed: the
+    /// overlap narrows that case and does not close it.
     BoundaryTick,
     OneSecond,
     TenSeconds,
@@ -146,7 +159,8 @@ impl TimeRung {
             // one: a last event in the final 100ns of a millisecond would push
             // the sum over the boundary and drop the rest of that millisecond.
             // The rung earns its place by switching from bookmark resume to
-            // time-query resume, not by moving the floor.
+            // time-query resume, not by moving the floor forward; the overlap
+            // back is `time_floor`'s.
             Self::BoundaryTick => Duration::ZERO,
             Self::OneSecond => Duration::from_secs(1),
             Self::TenSeconds => Duration::from_secs(10),
@@ -357,21 +371,23 @@ impl ResumeState {
     /// The lower bound for the generated XPath predicate, floored to the
     /// millisecond.
     ///
-    /// Flooring makes the query **over-deliver**, never under-deliver. Nothing
-    /// trims the excess: the admission gate that used to do so discarded real
-    /// events and was deleted. The duplicates it re-delivers are bounded
-    /// by one millisecond of the channel and are accepted, because loss is
-    /// unrecoverable and duplication is not.
+    /// Flooring makes the query over-deliver. On the first time rung so does
+    /// [`BOUNDARY_TICK_OVERLAP`]. Nothing trims the excess: the admission gate
+    /// that used to do so discarded real events and was deleted. The duplicates
+    /// are bounded by that overlap of the channel and are accepted, because
+    /// loss is unrecoverable and duplication is not.
     pub(super) fn time_floor(&self) -> Option<DateTime<Utc>> {
         let base = self.last_event_time?;
-        let advance = match self.rung {
-            Rung::TimeAdvance(t) => t.advance_by(),
-            _ => Duration::ZERO,
+        let moved = match self.rung {
+            Rung::TimeAdvance(TimeRung::BoundaryTick) => {
+                base - chrono::Duration::from_std(BOUNDARY_TICK_OVERLAP).ok()?
+            }
+            Rung::TimeAdvance(t) => base + chrono::Duration::from_std(t.advance_by()).ok()?,
+            _ => base,
         };
-        let advanced = base + chrono::Duration::from_std(advance).ok()?;
         // Floor to the millisecond.
-        let nanos = advanced.timestamp_subsec_nanos();
-        Some(advanced - chrono::Duration::nanoseconds(i64::from(nanos % 1_000_000)))
+        let nanos = moved.timestamp_subsec_nanos();
+        Some(moved - chrono::Duration::nanoseconds(i64::from(nanos % 1_000_000)))
     }
 
     /// Consume the one-shot poison skip, if it is armed.
@@ -709,14 +725,23 @@ mod tests {
     }
 
     /// The XPath floors to the millisecond so it over-delivers, and nothing
-    /// trims the excess. The re-delivered events are bounded by one
-    /// millisecond of the channel, which is the accepted cost.
+    /// trims the excess.
     #[test]
     fn time_floor_floors_to_the_millisecond() {
         let mut resume = ResumeState::new(true);
         resume.observe_event(ts(1_700_000_000, 123_456_700), 1);
         let floor = resume.time_floor().unwrap();
         assert_eq!(floor.timestamp_subsec_nanos(), 123_000_000);
+    }
+
+    /// The first time rung's floor, written out by hand: 1_700_000_000.1234567
+    /// less two seconds is 1_699_999_998.1234567, floored to the millisecond.
+    #[test]
+    fn the_first_time_rung_resumes_two_seconds_before_the_last_event() {
+        let mut resume = ResumeState::new(true);
+        resume.observe_event(ts(1_700_000_000, 123_456_700), 1);
+        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
+        assert_eq!(resume.time_floor(), Some(ts(1_699_999_998, 123_000_000)));
     }
 
     /// The stored time and the stored record number are inputs
@@ -1038,7 +1063,6 @@ mod tests {
         let base = ts(1_700_000_000, 0);
 
         for (rung, expected_advance) in [
-            (TimeRung::BoundaryTick, Duration::ZERO),
             (TimeRung::OneSecond, Duration::from_secs(1)),
             (TimeRung::TenSeconds, Duration::from_secs(10)),
             (TimeRung::OneMinute, Duration::from_secs(60)),
@@ -1055,8 +1079,8 @@ mod tests {
                 "{rung:?} resumed BEFORE the last good event ({floor} < {base}); \
                  that is mass re-delivery, not an escape"
             );
-            // Floored to the millisecond, so the boundary tick lands exactly on
-            // the base and every other rung lands its full window ahead.
+            // Floored to the millisecond, so each rung lands its full window
+            // ahead.
             let expected = base + chrono::Duration::from_std(expected_advance).unwrap()
                 - chrono::Duration::nanoseconds(i64::from(
                     expected_advance.subsec_nanos() % 1_000_000,
@@ -1073,8 +1097,8 @@ mod tests {
     /// would silently multiply the loss by sixty on a path that only fires
     /// when a channel is already unwell.
     ///
-    /// The first rung is the one that must stay lossless: with a zero step and
-    /// a millisecond floor, it lands ON the last event's millisecond.
+    /// The first rung skips nothing: its width is the overlap, behind the last
+    /// event's millisecond.
     #[test]
     fn each_time_rung_skips_exactly_its_own_width() {
         // A sub-millisecond base, so a rung that forgot to floor would be
@@ -1083,7 +1107,7 @@ mod tests {
         let floor_of_base = ts(1_700_000_000, 123_000_000);
 
         let widths = [
-            (TimeRung::BoundaryTick, 0i64),
+            (TimeRung::BoundaryTick, -2_000i64),
             (TimeRung::OneSecond, 1_000),
             (TimeRung::TenSeconds, 10_000),
             (TimeRung::OneMinute, 60_000),
@@ -1100,21 +1124,10 @@ mod tests {
             assert_eq!(
                 skipped.num_milliseconds(),
                 expected_skip_ms,
-                "{rung:?} must skip exactly {expected_skip_ms}ms past the last \
+                "{rung:?} must land exactly {expected_skip_ms}ms from the last \
                  event's millisecond; a wider window is unrecoverable loss"
             );
         }
-
-        // Stated separately because it is the claim the ladder rests on: the
-        // first rung is the only lossless one.
-        let mut resume = ResumeState::new(true);
-        resume.observe_event(base, 1);
-        resume.rung = Rung::TimeAdvance(TimeRung::BoundaryTick);
-        assert!(
-            resume.time_floor().unwrap() <= base,
-            "the first rung must re-read the last event's own millisecond, so \
-             it can duplicate but can never skip"
-        );
     }
 
     /// Duplicates are guaranteed by construction on the first time rung.

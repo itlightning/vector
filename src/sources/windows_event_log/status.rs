@@ -85,10 +85,12 @@ pub(super) struct GapRecord {
 pub(super) struct ChannelStatus {
     /// A live subscription handle exists for this channel.
     pub(super) subscribed: bool,
-    /// The channel held no records when last read, so it holds no subscription.
-    /// Not a failure: [`Self::last_drained_at`] is stamped by each read of zero,
-    /// so a channel that stops being read ages like any other, and a false here
-    /// beside a false [`Self::subscribed`] is what means unavailable.
+    /// A read found the channel empty, so it holds no subscription, and no pull
+    /// has acted on a read of anything else yet: a status write can find records
+    /// and still report this true. Not a failure: [`Self::last_drained_at`] is
+    /// stamped by each read of zero, so a channel that stops being read ages
+    /// like any other, and a false here beside a false [`Self::subscribed`] is
+    /// what means unavailable.
     ///
     /// Additive: absent means a writer that subscribes to every channel.
     #[serde(default)]
@@ -247,14 +249,16 @@ impl StatusSnapshot {
 /// Whether landing on this ladder step loses data, and whether the loss is
 /// countable.
 ///
-/// The first time step is the one exception among the escalations: it re-reads
-/// the last event's own millisecond, so it can deliver a duplicate but can
-/// never skip a record. It must never produce a gap entry, because a reported
-/// hole that does not exist is as misleading as an unreported one.
+/// The first time step is the one exception among the escalations: its floor
+/// sits behind the last event sent, so it opens no hole it can name. It delivers
+/// every record stamped at or after that floor and can miss a later record
+/// stamped before it, which record-id gap detection reports where it runs. A gap
+/// entry here would report a hole nobody knows exists, as misleading as an
+/// unreported one.
 const fn gap_shape(rung: Rung) -> Option<(bool, Option<u64>)> {
     match rung {
-        // No loss: the bookmark resume is exact and isolating the batch only
-        // changes how many records are read at a time.
+        // The bookmark resume is exact and isolating the batch only changes how
+        // many records are read at a time.
         Rung::Bookmark | Rung::IsolateOne => None,
         Rung::TimeAdvance(TimeRung::BoundaryTick) => None,
         // Exactly one record, by definition of the step.
@@ -430,10 +434,10 @@ mod tests {
         DateTime::from_timestamp(secs, 0).unwrap()
     }
 
-    /// The lossless steps must produce nothing. A reported hole that does not
-    /// exist sends a reader chasing data loss that never happened.
+    /// The steps that open no known hole must produce nothing. A reported hole
+    /// that does not exist sends a reader chasing data loss that never happened.
     #[test]
-    fn the_lossless_rungs_record_no_gap() {
+    fn the_rungs_that_open_no_hole_record_no_gap() {
         let from = Some(ts(1_700_000_000));
         let at = ts(1_700_000_010);
         for rung in [
@@ -444,15 +448,15 @@ mod tests {
             assert_eq!(
                 gap_for_rung(rung, from, Some(at), at),
                 None,
-                "{rung:?} loses nothing and must not record a gap"
+                "{rung:?} opens no hole and must not record a gap"
             );
         }
     }
 
-    /// The boundary tick specifically. It steps the floor by zero and re-reads
-    /// the last event's own millisecond, so it can duplicate and can never
-    /// skip. Stated on its own because it is the step most easily mistaken for
-    /// a lossy one: it is an escalation, and every other escalation loses data.
+    /// The boundary tick specifically. Its floor sits behind the last event, so
+    /// it duplicates and opens no hole it can name. Stated on its own because it
+    /// is the step most easily mistaken for a lossy one: it is an escalation,
+    /// and every other escalation loses data.
     #[test]
     fn the_boundary_tick_never_produces_a_gap() {
         let at = ts(1_700_000_010);
@@ -462,7 +466,7 @@ mod tests {
                 Some(ts(1_700_000_000)),
                 // Even resuming at a floor later than the last event, which is
                 // what a bug in the floor arithmetic would look like, the step
-                // itself is defined as lossless and reports nothing.
+                // itself reports nothing.
                 Some(ts(1_700_000_005)),
                 at
             ),
