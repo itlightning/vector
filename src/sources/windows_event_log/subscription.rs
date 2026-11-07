@@ -8595,10 +8595,6 @@ mod tests {
         assert_eq!(after.last_drained_at, before.last_drained_at);
     }
 
-    // ---------------------------------------------------------------------
-    // Dormant channels.
-    // ---------------------------------------------------------------------
-
     fn dormancy_checks() -> usize {
         super::super::render::DORMANCY_CHECKS.load(std::sync::atomic::Ordering::SeqCst)
     }
