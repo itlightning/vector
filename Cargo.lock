@@ -13592,7 +13592,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 [[package]]
 name = "vrl"
 version = "0.33.1"
-source = "git+https://github.com/itlightning/vrl.git?rev=b675acea035ea76363c7689f59baee312f45979d#b675acea035ea76363c7689f59baee312f45979d"
+source = "git+https://github.com/itlightning/vrl.git?rev=db0a7c4016f6ea2bc463fc455731b4a18e1397fa#db0a7c4016f6ea2bc463fc455731b4a18e1397fa"
 dependencies = [
  "aes 0.9.1",
  "aes-siv",
