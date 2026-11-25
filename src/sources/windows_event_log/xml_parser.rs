@@ -19,8 +19,9 @@ pub(super) enum XmlStep<'x> {
     /// A run of character data and references between two other events, trimmed at both
     /// ends when the pass trims, references resolved. `None` when the run holds a
     /// reference that does not resolve (an unknown entity, a bare `&`), which drops that
-    /// one value and lets the pass go on.
-    Text(Option<String>),
+    /// one value and lets the pass go on. Borrowed from the input when the run is one
+    /// fragment with nothing to resolve.
+    Text(Option<Cow<'x, str>>),
     Eof,
     /// Comments, processing instructions, declarations: no pass reads them.
     Other,
@@ -34,10 +35,20 @@ pub(super) enum XmlStep<'x> {
 /// fragments instead of values. A run is gathered raw, then trimmed of XML whitespace and
 /// unescaped as one string, and a run that trims to nothing is skipped, as a trimmed run
 /// of whitespace is.
+///
+/// Matches quick-xml 0.31's trimmed-and-unescaped text with one exception: a numeric
+/// character reference padded with leading zeros past 0.31's digit limit
+/// (`&#x0000041;`) now resolves where 0.31 dropped the value. Rendered event XML never
+/// pads references.
 pub(super) struct TextRuns<'x> {
     reader: Reader<&'x [u8]>,
     trim: bool,
-    raw: String,
+    /// The run's only fragment so far, still borrowed from the input.
+    first: Option<Cow<'x, str>>,
+    /// The run once a second fragment joins it.
+    joined: Option<String>,
+    /// The last joined run's buffer, reused by the next one.
+    spare: String,
     pending: Option<XmlEvent<'x>>,
 }
 
@@ -50,7 +61,9 @@ impl<'x> TextRuns<'x> {
         Self {
             reader,
             trim,
-            raw: String::new(),
+            first: None,
+            joined: None,
+            spare: String::new(),
             pending: None,
         }
     }
@@ -62,14 +75,23 @@ impl<'x> TextRuns<'x> {
                 None => self.reader.read_event()?,
             };
             match event {
-                XmlEvent::Text(text) => self.raw.push_str(&text.decode()?),
+                XmlEvent::Text(text) => {
+                    let fragment = text.decode()?;
+                    if self.in_run() {
+                        self.join().push_str(&fragment);
+                    } else {
+                        self.first = Some(fragment);
+                    }
+                }
                 XmlEvent::GeneralRef(reference) => {
-                    self.raw.push('&');
-                    self.raw.push_str(&reference.decode()?);
-                    self.raw.push(';');
+                    let name = reference.decode()?;
+                    let run = self.join();
+                    run.push('&');
+                    run.push_str(&name);
+                    run.push(';');
                 }
                 event => {
-                    if self.raw.is_empty() {
+                    if !self.in_run() {
                         return Ok(Self::step(event));
                     }
                     self.pending = Some(event);
@@ -81,18 +103,44 @@ impl<'x> TextRuns<'x> {
         }
     }
 
-    /// The gathered run, `None` when trimming leaves nothing to report.
-    fn take_run(&mut self) -> Option<Option<String>> {
-        let raw = std::mem::take(&mut self.raw);
-        let run = if self.trim {
-            raw.trim_matches(is_xml_whitespace)
-        } else {
-            raw.as_str()
-        };
-        if run.is_empty() {
-            return None;
+    fn in_run(&self) -> bool {
+        self.first.is_some() || self.joined.is_some()
+    }
+
+    /// The joined run, moving a lone first fragment into it.
+    fn join(&mut self) -> &mut String {
+        let first = self.first.take();
+        let run = self.joined.get_or_insert_with(|| {
+            let mut buf = std::mem::take(&mut self.spare);
+            buf.clear();
+            buf
+        });
+        if let Some(first) = first {
+            run.push_str(&first);
         }
-        Some(quick_xml::escape::unescape(run).ok().map(Cow::into_owned))
+        run
+    }
+
+    /// The gathered run, `None` when trimming leaves nothing to report.
+    fn take_run(&mut self) -> Option<Option<Cow<'x, str>>> {
+        let trim = self.trim;
+        if let Some(first) = self.first.take() {
+            return match first {
+                Cow::Borrowed(s) => {
+                    let run = trimmed(s, trim);
+                    (!run.is_empty()).then(|| quick_xml::escape::unescape(run).ok())
+                }
+                Cow::Owned(s) => {
+                    let run = trimmed(&s, trim);
+                    (!run.is_empty()).then(|| owned_unescape(run))
+                }
+            };
+        }
+        let joined = self.joined.take()?;
+        let run = trimmed(&joined, trim);
+        let text = (!run.is_empty()).then(|| owned_unescape(run));
+        self.spare = joined;
+        text
     }
 
     fn step(event: XmlEvent<'x>) -> XmlStep<'x> {
@@ -110,6 +158,22 @@ impl<'x> TextRuns<'x> {
 /// XML's whitespace characters (`S` in the XML 1.0 grammar).
 const fn is_xml_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// `s` without XML whitespace at either end when `trim` is set.
+fn trimmed(s: &str, trim: bool) -> &str {
+    if trim {
+        s.trim_matches(is_xml_whitespace)
+    } else {
+        s
+    }
+}
+
+/// Unescape a run that does not borrow from the input, so the result owns its text.
+fn owned_unescape<'x>(run: &str) -> Option<Cow<'x, str>> {
+    quick_xml::escape::unescape(run)
+        .ok()
+        .map(|text| Cow::Owned(text.into_owned()))
 }
 
 /// Truncate a string at a UTF-8 safe boundary, appending a suffix.
@@ -1772,14 +1836,14 @@ mod tests {
 
     #[test]
     fn a_value_with_many_references_counts_as_one_text_for_the_iteration_cap() {
-        // 300 references in one value, then a second value. The pass stops after 500
+        // 600 references in one value, then a second value. The pass stops after 500
         // reads; the run of text and references is one read, so the second value is
-        // still reached.
-        let many = "&amp;".repeat(300);
+        // still reached. Counting each reference as a read would stop inside the first.
+        let many = "&amp;".repeat(600);
         let result = event_data(&format!(
             r#"<Data Name="many">{many}</Data><Data Name="after">ok</Data>"#
         ));
-        assert_eq!(result.structured_data["many"], "&".repeat(300));
+        assert_eq!(result.structured_data["many"], "&".repeat(600));
         assert_eq!(result.structured_data["after"], "ok");
     }
 

@@ -740,7 +740,7 @@ fn check_suppress_query(query: &str, rules: &[SuppressRule]) -> Result<(), TestC
                 in_suppress = false;
             }
             Ok(XmlStep::Text(text)) if in_suppress => {
-                clauses.push(text.expect("text unescapes"));
+                clauses.push(text.expect("text unescapes").into_owned());
             }
             Ok(XmlStep::Eof) => break,
             Ok(_) => {}
