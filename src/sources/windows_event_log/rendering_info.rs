@@ -28,7 +28,7 @@
 //! detection: forwarded record IDs interleave many originating machines, so
 //! they are not monotonic and every batch would otherwise look like a gap.
 
-use quick_xml::{Reader, events::Event as XmlEvent};
+use super::xml_parser::{TextRuns, XmlStep};
 
 /// Rendered display fields parsed out of an event's `<RenderingInfo>` element.
 ///
@@ -72,9 +72,7 @@ enum Target {
 /// returned even when every sub-element is absent, because the presence of the
 /// element, not its contents, is what makes the publisher call unsafe.
 pub(super) fn parse(xml: &str) -> Option<RenderingInfoFields> {
-    let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
-    let mut buf = Vec::new();
+    let mut reader = TextRuns::new(xml, true);
 
     let mut present = false;
     let mut in_rendering_info = false;
@@ -89,8 +87,8 @@ pub(super) fn parse(xml: &str) -> Option<RenderingInfoFields> {
         }
         iterations += 1;
 
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => {
+        match reader.next() {
+            Ok(XmlStep::Start(ref e)) => {
                 let local = e.name().local_name();
                 let local = local.as_ref();
 
@@ -110,19 +108,19 @@ pub(super) fn parse(xml: &str) -> Option<RenderingInfoFields> {
                 }
             }
             // A self-closing <RenderingInfo/> still means rendered delivery.
-            Ok(XmlEvent::Empty(ref e)) if e.name().local_name().as_ref() == b"RenderingInfo" => {
+            Ok(XmlStep::Empty(ref e)) if e.name().local_name().as_ref() == b"RenderingInfo" => {
                 present = true;
             }
-            Ok(XmlEvent::Text(ref e)) => {
+            Ok(XmlStep::Text(text)) => {
                 if in_rendering_info
                     && target != Target::None
-                    && let Ok(text) = e.unescape()
+                    && let Some(text) = text
                     && text_buf.len() + text.len() <= MAX_TEXT_BYTES
                 {
                     text_buf.push_str(&text);
                 }
             }
-            Ok(XmlEvent::CData(ref e)) => {
+            Ok(XmlStep::CData(ref e)) => {
                 if in_rendering_info
                     && target != Target::None
                     && let Ok(text) = std::str::from_utf8(e.as_ref())
@@ -131,7 +129,7 @@ pub(super) fn parse(xml: &str) -> Option<RenderingInfoFields> {
                     text_buf.push_str(text);
                 }
             }
-            Ok(XmlEvent::End(ref e)) => {
+            Ok(XmlStep::End(ref e)) => {
                 let local = e.name().local_name();
                 let local = local.as_ref();
                 if local == b"RenderingInfo" {
@@ -144,12 +142,10 @@ pub(super) fn parse(xml: &str) -> Option<RenderingInfoFields> {
                     text_buf.clear();
                 }
             }
-            Ok(XmlEvent::Eof) => break,
+            Ok(XmlStep::Eof) => break,
             Err(_) => break,
             _ => {}
         }
-
-        buf.clear();
     }
 
     present.then_some(fields)

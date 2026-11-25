@@ -1,11 +1,116 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
 use chrono::{DateTime, Utc};
-use quick_xml::{Reader, events::Event as XmlEvent};
+use quick_xml::{
+    Reader,
+    events::{BytesCData, BytesEnd, BytesStart, Event as XmlEvent},
+};
 use vector_lib::{counter, internal_event::CounterName};
 
 use super::config::WindowsEventLogConfig;
 use super::error::*;
+
+/// One read from a [`TextRuns`] pass: an XML event, or a whole run of element text.
+pub(super) enum XmlStep<'x> {
+    Start(BytesStart<'x>),
+    Empty(BytesStart<'x>),
+    End(BytesEnd<'x>),
+    CData(BytesCData<'x>),
+    /// A run of character data and references between two other events, trimmed at both
+    /// ends when the pass trims, references resolved. `None` when the run holds a
+    /// reference that does not resolve (an unknown entity, a bare `&`), which drops that
+    /// one value and lets the pass go on.
+    Text(Option<String>),
+    Eof,
+    /// Comments, processing instructions, declarations: no pass reads them.
+    Other,
+}
+
+/// An XML reader whose element text comes back as one [`XmlStep::Text`] per run.
+///
+/// quick-xml reports each entity or character reference as an event of its own, so
+/// `a &amp; b` arrives as three events. Every pass here wants the whole value: trimming
+/// each fragment would turn it into `a&b`, and the passes' iteration caps would count
+/// fragments instead of values. A run is gathered raw, then trimmed of XML whitespace and
+/// unescaped as one string, and a run that trims to nothing is skipped, as a trimmed run
+/// of whitespace is.
+pub(super) struct TextRuns<'x> {
+    reader: Reader<&'x [u8]>,
+    trim: bool,
+    raw: String,
+    pending: Option<XmlEvent<'x>>,
+}
+
+impl<'x> TextRuns<'x> {
+    pub(super) fn new(xml: &'x str, trim: bool) -> Self {
+        let mut reader = Reader::from_str(xml);
+        // A bare `&` is read as text, so the run holding it fails to unescape and only that
+        // value is dropped, instead of the read failing and ending the pass.
+        reader.config_mut().allow_dangling_amp = true;
+        Self {
+            reader,
+            trim,
+            raw: String::new(),
+            pending: None,
+        }
+    }
+
+    pub(super) fn next(&mut self) -> Result<XmlStep<'x>, quick_xml::Error> {
+        loop {
+            let event = match self.pending.take() {
+                Some(event) => event,
+                None => self.reader.read_event()?,
+            };
+            match event {
+                XmlEvent::Text(text) => self.raw.push_str(&text.decode()?),
+                XmlEvent::GeneralRef(reference) => {
+                    self.raw.push('&');
+                    self.raw.push_str(&reference.decode()?);
+                    self.raw.push(';');
+                }
+                event => {
+                    if self.raw.is_empty() {
+                        return Ok(Self::step(event));
+                    }
+                    self.pending = Some(event);
+                    if let Some(text) = self.take_run() {
+                        return Ok(XmlStep::Text(text));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gathered run, `None` when trimming leaves nothing to report.
+    fn take_run(&mut self) -> Option<Option<String>> {
+        let raw = std::mem::take(&mut self.raw);
+        let run = if self.trim {
+            raw.trim_matches(is_xml_whitespace)
+        } else {
+            raw.as_str()
+        };
+        if run.is_empty() {
+            return None;
+        }
+        Some(quick_xml::escape::unescape(run).ok().map(Cow::into_owned))
+    }
+
+    fn step(event: XmlEvent<'x>) -> XmlStep<'x> {
+        match event {
+            XmlEvent::Start(e) => XmlStep::Start(e),
+            XmlEvent::Empty(e) => XmlStep::Empty(e),
+            XmlEvent::End(e) => XmlStep::End(e),
+            XmlEvent::CData(e) => XmlStep::CData(e),
+            XmlEvent::Eof => XmlStep::Eof,
+            _ => XmlStep::Other,
+        }
+    }
+}
+
+/// XML's whitespace characters (`S` in the XML 1.0 grammar).
+const fn is_xml_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
 
 /// Truncate a string at a UTF-8 safe boundary, appending a suffix.
 pub(crate) fn truncate_utf8(s: &mut String, max_bytes: usize) {
@@ -177,9 +282,7 @@ enum TextTarget {
 /// `extract_provider_name` calls with one `quick_xml::Reader` traversal.
 pub fn parse_system_section(xml: &str) -> SystemFields {
     let mut fields = SystemFields::default();
-    let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
-    let mut buf = Vec::new();
+    let mut reader = TextRuns::new(xml, true);
 
     let mut in_system = false;
     let mut text_target = TextTarget::None;
@@ -194,8 +297,8 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
         }
         iterations += 1;
 
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => {
+        match reader.next() {
+            Ok(XmlStep::Start(ref e)) => {
                 let local = e.name().local_name();
                 let local = local.as_ref();
 
@@ -227,13 +330,12 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
                     }
                 }
             }
-            Ok(XmlEvent::Empty(ref e)) => {
+            Ok(XmlStep::Empty(ref e)) => {
                 if !in_system {
                     if e.name().local_name().as_ref() == b"System" {
                         // Empty <System/> — nothing to extract
                         break;
                     }
-                    buf.clear();
                     continue;
                 }
                 let local = e.name().local_name();
@@ -247,16 +349,16 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
                     _ => {}
                 }
             }
-            Ok(XmlEvent::Text(ref e)) => {
+            Ok(XmlStep::Text(text)) => {
                 if in_system
                     && text_target != TextTarget::None
-                    && let Ok(text) = e.unescape()
+                    && let Some(text) = text
                     && text_buf.len() + text.len() <= 4096
                 {
                     text_buf.push_str(&text);
                 }
             }
-            Ok(XmlEvent::End(ref e)) => {
+            Ok(XmlStep::End(ref e)) => {
                 let local = e.name().local_name();
                 let local = local.as_ref();
                 if local == b"System" {
@@ -270,12 +372,10 @@ pub fn parse_system_section(xml: &str) -> SystemFields {
                     text_buf.clear();
                 }
             }
-            Ok(XmlEvent::Eof) => break,
+            Ok(XmlStep::Eof) => break,
             Err(_) => break,
             _ => {}
         }
-
-        buf.clear();
     }
 
     fields
@@ -594,10 +694,8 @@ fn parse_section(
     // element and never reaches a value.
     // PROVENANCE: OBSERVED fleet data 2026-10-01, merged 4104 blocks lost the
     // space or newline at each fragment seam.
-    let mut reader = Reader::from_str(xml);
-    reader.trim_text(false);
+    let mut reader = TextRuns::new(xml, false);
 
-    let mut buf = Vec::new();
     let mut inside_section = false;
     // Provider leaf flattening applies to UserData only; EventData stays a flat
     // Data list so its extraction is byte-for-byte unchanged.
@@ -621,8 +719,8 @@ fn parse_section(
         }
         iterations += 1;
 
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => {
+        match reader.next() {
+            Ok(XmlStep::Start(ref e)) => {
                 let qname = e.name();
                 if !inside_section && qname.as_ref() == section_name.as_bytes() {
                     inside_section = true;
@@ -654,14 +752,14 @@ fn parse_section(
                     });
                 }
             }
-            Ok(XmlEvent::Empty(_)) => {
+            Ok(XmlStep::Empty(_)) => {
                 // Self-closing element carries no text, so it is never a
                 // value-bearing leaf, but it does make its parent a wrapper.
                 if inside_section && let Some(top) = stack.last_mut() {
                     top.had_child = true;
                 }
             }
-            Ok(XmlEvent::End(ref e)) => {
+            Ok(XmlStep::End(ref e)) => {
                 if inside_section {
                     if let Some(frame) = stack.pop() {
                         if frame.is_data {
@@ -686,21 +784,19 @@ fn parse_section(
                     }
                 }
             }
-            Ok(XmlEvent::Text(ref e)) => {
+            Ok(XmlStep::Text(text)) => {
                 if inside_section
                     && let Some(top) = stack.last_mut()
-                    && let Ok(text) = e.unescape()
+                    && let Some(text) = text
                     && top.text.len() + text.len() <= MAX_VALUE_SIZE
                 {
                     top.text.push_str(&text);
                 }
             }
-            Ok(XmlEvent::Eof) => break,
+            Ok(XmlStep::Eof) => break,
             Err(_) => break,
             _ => {}
         }
-
-        buf.clear();
     }
 }
 
@@ -724,36 +820,33 @@ fn extract_binary(xml: &str, max_len: usize) -> Option<String> {
         max_len.min(MAX_VALUE_SIZE)
     };
 
-    let mut reader = Reader::from_str(xml);
-    reader.trim_text(false);
-    let mut buf = Vec::new();
+    let mut reader = TextRuns::new(xml, false);
     let mut in_event_data = false;
     let mut in_binary = false;
     let mut hex = String::new();
 
     for _ in 0..MAX_ITERATIONS {
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => match e.name().as_ref() {
+        match reader.next() {
+            Ok(XmlStep::Start(ref e)) => match e.name().as_ref() {
                 b"EventData" => in_event_data = true,
                 b"Binary" if in_event_data => in_binary = true,
                 _ => {}
             },
-            Ok(XmlEvent::Text(ref e)) if in_binary => {
-                let text = e.unescape().ok()?;
+            Ok(XmlStep::Text(text)) if in_binary => {
+                let text = text?;
                 if hex.len() + text.len() > max_len {
                     return None;
                 }
                 hex.push_str(&text);
             }
-            Ok(XmlEvent::End(ref e)) => match e.name().as_ref() {
+            Ok(XmlStep::End(ref e)) => match e.name().as_ref() {
                 b"Binary" if in_binary => return (!hex.is_empty()).then_some(hex),
                 b"EventData" => return None,
                 _ => {}
             },
-            Ok(XmlEvent::Eof) | Err(_) => return None,
+            Ok(XmlStep::Eof) | Err(_) => return None,
             _ => {}
         }
-        buf.clear();
     }
     None
 }
@@ -764,10 +857,8 @@ fn extract_binary(xml: &str, max_len: usize) -> Option<String> {
 /// This function is retained for one-off lookups outside the hot path.
 #[cfg(test)]
 pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
-    let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    let mut reader = TextRuns::new(xml, true);
 
-    let mut buf = Vec::new();
     let mut inside_target = false;
     let mut current_element = String::new();
 
@@ -781,8 +872,8 @@ pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
         }
         iterations += 1;
 
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(ref e)) => {
+        match reader.next() {
+            Ok(XmlStep::Start(ref e)) => {
                 let name = e.name();
                 let element_name = String::from_utf8_lossy(name.as_ref());
                 if element_name == tag {
@@ -790,29 +881,27 @@ pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
                     current_element.clear();
                 }
             }
-            Ok(XmlEvent::Text(ref e)) if inside_target => match e.unescape() {
-                Ok(text) => {
+            Ok(XmlStep::Text(text)) if inside_target => match text {
+                Some(text) => {
                     if current_element.len() + text.len() > 4096 {
                         warn!(message = "XML element text too long, truncating.");
                         break;
                     }
                     current_element.push_str(&text);
                 }
-                Err(_) => return None,
+                None => return None,
             },
-            Ok(XmlEvent::End(ref e)) => {
+            Ok(XmlStep::End(ref e)) => {
                 let name = e.name();
                 let element_name = String::from_utf8_lossy(name.as_ref());
                 if element_name == tag && inside_target {
                     return Some(current_element.trim().to_string());
                 }
             }
-            Ok(XmlEvent::Eof) => break,
+            Ok(XmlStep::Eof) => break,
             Err(_) => return None,
             _ => {}
         }
-
-        buf.clear();
     }
 
     None

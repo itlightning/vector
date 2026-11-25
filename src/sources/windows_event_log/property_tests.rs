@@ -717,7 +717,7 @@ fn suppress_rules() -> impl Strategy<Value = Vec<SuppressRule>> {
 /// Checks one composed query: well-formed XML, under the length bound, and
 /// each provider's distinct ids exactly once under that provider.
 fn check_suppress_query(query: &str, rules: &[SuppressRule]) -> Result<(), TestCaseError> {
-    use quick_xml::{Reader, events::Event};
+    use super::xml_parser::{TextRuns, XmlStep};
 
     prop_assert!(
         query.len() < MAX_SUPPRESS_QUERY_CHARS,
@@ -725,25 +725,24 @@ fn check_suppress_query(query: &str, rules: &[SuppressRule]) -> Result<(), TestC
         query.len()
     );
 
-    let mut reader = Reader::from_str(query);
-    reader.check_end_names(true);
+    let mut reader = TextRuns::new(query, false);
     let mut depth = 0usize;
     let mut in_suppress = false;
     let mut clauses = Vec::new();
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
+        match reader.next() {
+            Ok(XmlStep::Start(e)) => {
                 depth += 1;
                 in_suppress = e.name().as_ref() == b"Suppress";
             }
-            Ok(Event::End(_)) => {
+            Ok(XmlStep::End(_)) => {
                 depth -= 1;
                 in_suppress = false;
             }
-            Ok(Event::Text(text)) if in_suppress => {
-                clauses.push(text.unescape().expect("text unescapes").into_owned());
+            Ok(XmlStep::Text(text)) if in_suppress => {
+                clauses.push(text.expect("text unescapes"));
             }
-            Ok(Event::Eof) => break,
+            Ok(XmlStep::Eof) => break,
             Ok(_) => {}
             Err(e) => return Err(TestCaseError::fail(format!("malformed XML: {e}: {query}"))),
         }
