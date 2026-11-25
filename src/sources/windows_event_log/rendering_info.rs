@@ -214,4 +214,20 @@ mod tests {
         assert!(parse("<Event><System>").is_none());
         assert!(parse("").is_none());
     }
+
+    #[test]
+    fn rendered_text_resolves_references_and_joins_cdata() {
+        let xml = r#"<Event><RenderingInfo Culture="en-US">
+            <Message>  Disk &quot;C:&quot; is &lt;90%&gt; full  </Message>
+            <Task>a <![CDATA[<b>]]> c</Task>
+            <Keywords><Keyword>K&amp;1</Keyword><Keyword>bad &foo;</Keyword></Keywords>
+        </RenderingInfo></Event>"#;
+        let fields = parse(xml).expect("RenderingInfo must be detected");
+        assert_eq!(
+            fields.message.as_deref(),
+            Some(r#"Disk "C:" is <90%> full"#)
+        );
+        assert_eq!(fields.task_name.as_deref(), Some("a<b>c"));
+        assert_eq!(fields.keyword_names, vec!["K&1".to_string()]);
+    }
 }

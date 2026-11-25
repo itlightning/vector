@@ -1588,7 +1588,10 @@ mod tests {
         let result = extract_event_data(xml, &config);
 
         assert_eq!(result.structured_data.len(), 1);
-        assert_eq!(result.structured_data.get("A").map(String::as_str), Some("a"));
+        assert_eq!(
+            result.structured_data.get("A").map(String::as_str),
+            Some("a")
+        );
         assert_eq!(result.string_inserts, vec!["first", "second "]);
         assert_eq!(result.user_data.len(), 1);
         assert_eq!(result.user_data.get("U").map(String::as_str), Some(" u"));
@@ -1616,5 +1619,94 @@ mod tests {
             let second = script_block_text(&fragment(2, &script[seam..]));
             assert_eq!(first + &second, script, "seam at byte {seam}");
         }
+    }
+
+    fn event_data(xml_body: &str) -> EventDataResult {
+        let xml = format!("<Event><EventData>{xml_body}</EventData></Event>");
+        extract_event_data(&xml, &WindowsEventLogConfig::default())
+    }
+
+    #[test]
+    fn text_with_references_keeps_inner_spaces_and_trims_the_ends() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System>
+            <Channel>x&#x41;y&#66;</Channel>
+            <Computer>  A &amp; B  </Computer>
+        </System></Event>"#;
+        let fields = parse_system_section(xml);
+        assert_eq!(fields.channel, "xAyB");
+        assert_eq!(fields.computer, "A & B");
+    }
+
+    #[test]
+    fn event_data_values_resolve_references_in_place() {
+        let result = event_data(
+            r#"<Data Name="cmd">  run &quot;a&quot; &amp;&amp; b </Data><Data Name="tag">&lt;t x=&apos;1&apos;&gt;</Data><Data>&#65;&#x42; c</Data>"#,
+        );
+        assert_eq!(result.structured_data["cmd"], r#"  run "a" && b "#);
+        assert_eq!(result.structured_data["tag"], "<t x='1'>");
+        assert_eq!(result.string_inserts, vec!["AB c".to_string()]);
+    }
+
+    #[test]
+    fn event_data_name_attribute_is_read_raw() {
+        // The Name attribute is taken byte for byte, references unresolved.
+        let result = event_data(r#"<Data Name="a&amp;b">v</Data>"#);
+        assert_eq!(result.structured_data["a&amp;b"], "v");
+    }
+
+    #[test]
+    fn an_unknown_entity_empties_only_its_own_value() {
+        let result = event_data(r#"<Data Name="bad">x &foo; y</Data><Data Name="good">ok</Data>"#);
+        assert_eq!(result.structured_data["bad"], "");
+        assert_eq!(result.structured_data["good"], "ok");
+    }
+
+    #[test]
+    fn a_bare_ampersand_empties_only_its_own_value() {
+        let result = event_data(r#"<Data Name="amp">a & b</Data><Data Name="after">ok</Data>"#);
+        assert_eq!(result.structured_data["amp"], "");
+        assert_eq!(result.structured_data["after"], "ok");
+    }
+
+    #[test]
+    fn whitespace_only_values_are_kept_verbatim() {
+        let result = event_data("<Data Name=\"ws\">  \r\n\t </Data><Data> </Data>");
+        assert_eq!(result.structured_data["ws"], "  \r\n\t ");
+        assert_eq!(result.string_inserts, vec![" ".to_string()]);
+    }
+
+    #[test]
+    fn line_breaks_inside_a_value_are_kept_verbatim() {
+        let result = event_data("<Data Name=\"lines\">one\r\ntwo&#13;&#10;three</Data>");
+        assert_eq!(result.structured_data["lines"], "one\r\ntwo\r\nthree");
+    }
+
+    #[test]
+    fn a_value_with_many_references_counts_as_one_text_for_the_iteration_cap() {
+        // 300 references in one value, then a second value. The pass stops after 500
+        // reads; the run of text and references is one read, so the second value is
+        // still reached.
+        let many = "&amp;".repeat(300);
+        let result = event_data(&format!(
+            r#"<Data Name="many">{many}</Data><Data Name="after">ok</Data>"#
+        ));
+        assert_eq!(result.structured_data["many"], "&".repeat(300));
+        assert_eq!(result.structured_data["after"], "ok");
+    }
+
+    #[test]
+    fn binary_payload_is_untrimmed_and_resolved() {
+        let xml = "<Event><EventData><Binary> 0A&#48;B </Binary></EventData></Event>";
+        assert_eq!(extract_binary(xml, 0).as_deref(), Some(" 0A0B "));
+        let bad = "<Event><EventData><Binary>0A&foo;</Binary></EventData></Event>";
+        assert_eq!(extract_binary(bad, 0), None);
+    }
+
+    #[test]
+    fn extract_xml_value_resolves_references_and_refuses_unknown_ones() {
+        let xml = "<Event><System><Computer> a &amp; b </Computer></System></Event>";
+        assert_eq!(extract_xml_value(xml, "Computer").as_deref(), Some("a & b"));
+        let bad = "<Event><System><Computer>a &foo;</Computer></System></Event>";
+        assert_eq!(extract_xml_value(bad, "Computer"), None);
     }
 }
