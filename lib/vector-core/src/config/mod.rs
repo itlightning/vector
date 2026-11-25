@@ -11,7 +11,7 @@ pub mod output_id;
 pub mod proxy;
 mod telemetry;
 
-pub use global_options::{GlobalOptions, WildcardMatching};
+pub use global_options::{GlobalOptions, SteadyPriority, WildcardMatching};
 pub use log_schema::{LogSchema, init_log_schema, log_schema};
 use lookup::{PathPrefix, lookup_v2::ValuePath, path};
 pub use output_id::OutputId;
