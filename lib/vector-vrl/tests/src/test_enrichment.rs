@@ -59,6 +59,21 @@ impl enrichment::Table for TestEnrichmentTable {
     fn needs_reload(&self) -> bool {
         false
     }
+
+    /// Every claim opens a fresh window, as on an empty table.
+    fn claim(
+        &self,
+        claim: &enrichment::Claim<'_>,
+    ) -> Result<enrichment::ClaimOutcome, enrichment::Error> {
+        Ok(enrichment::ClaimOutcome {
+            pass: true,
+            first: true,
+            count: 1,
+            suppressed_prev: 0,
+            window_secs: claim.window_secs.get(),
+            value: claim.value.cloned().unwrap_or(Value::Null),
+        })
+    }
 }
 
 pub(crate) fn test_enrichment_table() -> enrichment::TableRegistry {

@@ -3,14 +3,15 @@ use chrono::{DateTime, Utc};
 use std::{
     io::{self, SeekFrom},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
     fs::File,
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncSeekExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader},
     time::Instant,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use vector_common::constants::GZIP_MAGIC;
 
 use file_source_common::{
@@ -19,8 +20,17 @@ use file_source_common::{
 };
 use vector_common::compression::gzip_multiple_decoder;
 
+use crate::encoding::{
+    DetectViaKind, EncodingDetectOutcome, FileEncodingDetector, FileEncodingMode, FileEncodingState,
+};
+
 const EOF_READ_BACKOFF_MIN: Duration = Duration::from_millis(1);
 const EOF_READ_BACKOFF_MAX: Duration = Duration::from_millis(250);
+
+enum VerifiedPeek {
+    Sniff(Vec<u8>),
+    InodeMismatch,
+}
 
 #[cfg(test)]
 mod tests;
@@ -60,11 +70,22 @@ pub struct FileWatcher {
     reached_eof: bool,
     last_read_attempt: Instant,
     last_read_success: Instant,
+    /// When this watcher was created. Unlike `last_read_success`, which is seeded
+    /// from the file's mtime, this is a wall-clock "we started watching" mark and
+    /// is the floor for any age-based cleanup of files that never shipped a line.
+    watch_start: Instant,
     read_retry_delay: Duration,
     last_seen: Instant,
     max_line_bytes: usize,
     line_delimiter: Bytes,
     buf: BytesMut,
+    encoding_state: FileEncodingState,
+    encoding_detector: Option<Arc<dyn FileEncodingDetector>>,
+    fixed_encoding_name: Option<&'static str>,
+    /// When Pending, set at watcher creation (and again when the underlying
+    /// inode changes); basis for the idle-timeout force-decide.
+    pending_since: Option<Instant>,
+    gzipped: bool,
 }
 
 impl FileWatcher {
@@ -79,6 +100,7 @@ impl FileWatcher {
         ignore_before: Option<DateTime<Utc>>,
         max_line_bytes: usize,
         line_delimiter: Bytes,
+        encoding_mode: &FileEncodingMode,
     ) -> Result<FileWatcher, std::io::Error> {
         let f = File::open(&path).await?;
         let file_info = f.file_info().await?;
@@ -159,6 +181,19 @@ impl FileWatcher {
             .and_then(|diff| Instant::now().checked_sub(diff))
             .unwrap_or_else(Instant::now);
 
+        let (encoding_state, encoding_detector, fixed_encoding_name, pending_since) =
+            match encoding_mode {
+                FileEncodingMode::Fixed { encoding_name } => {
+                    (FileEncodingState::Inactive, None, *encoding_name, None)
+                }
+                FileEncodingMode::Auto { detector } => (
+                    FileEncodingState::Pending,
+                    Some(Arc::clone(detector)),
+                    None,
+                    Some(Instant::now()),
+                ),
+            };
+
         Ok(FileWatcher {
             path,
             findable: true,
@@ -170,12 +205,29 @@ impl FileWatcher {
             reached_eof: false,
             last_read_attempt: ts,
             last_read_success: ts,
+            watch_start: Instant::now(),
             read_retry_delay: EOF_READ_BACKOFF_MIN,
             last_seen: ts,
             max_line_bytes,
             line_delimiter,
             buf: BytesMut::new(),
+            encoding_state,
+            encoding_detector,
+            fixed_encoding_name,
+            pending_since,
+            gzipped,
         })
+    }
+
+    /// Encoding annotation for emitted lines (`None` = already UTF-8 bytes).
+    pub fn line_encoding_name(&self) -> Option<&'static str> {
+        self.encoding_state
+            .encoding_name()
+            .or(self.fixed_encoding_name)
+    }
+
+    pub fn encoding_state(&self) -> &FileEncodingState {
+        &self.encoding_state
     }
 
     pub async fn update_path(&mut self, path: PathBuf) -> io::Result<()> {
@@ -185,6 +237,7 @@ impl FileWatcher {
         if (file_info.portable_dev(), file_info.portable_ino()) != (self.devno, self.inode) {
             let mut reader = BufReader::new(File::open(&path).await?);
             let gzipped = is_gzipped(&mut reader).await?;
+            self.gzipped = gzipped;
             let new_reader: Box<dyn AsyncBufRead + Send + Unpin> = if gzipped {
                 if self.file_position != 0 {
                     Box::new(null_reader())
@@ -200,6 +253,12 @@ impl FileWatcher {
             let file_info = file_handle.file_info().await?;
             self.devno = file_info.portable_dev();
             self.inode = file_info.portable_ino();
+
+            // Fresh underlying file content: re-run auto-detection when enabled.
+            if self.encoding_detector.is_some() {
+                self.encoding_state = FileEncodingState::Pending;
+                self.pending_since = Some(Instant::now());
+            }
         }
         self.reached_eof = false;
         self.read_retry_delay = EOF_READ_BACKOFF_MIN;
@@ -228,6 +287,149 @@ impl FileWatcher {
 
     pub fn get_file_position(&self) -> FilePosition {
         self.file_position
+    }
+
+    /// Whether a Pending file's idle-timeout window has elapsed, meaning the
+    /// detector's force-decide has had its chance to run. `false` while the
+    /// idle decision is still outstanding (or when no Pending window exists).
+    pub fn pending_idle_elapsed(&self) -> bool {
+        match (self.pending_since, &self.encoding_detector) {
+            (Some(since), Some(detector)) => {
+                since.elapsed() >= Duration::from_secs(detector.idle_timeout_secs())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the path still refers to the watched device+inode.
+    ///
+    /// `Ok(false)` means another file (for example a rotation successor) now
+    /// occupies the path; destructive path-based operations must be skipped.
+    pub async fn path_matches_watched_inode(&self) -> io::Result<bool> {
+        let file = File::open(&self.path).await?;
+        let file_info = file.file_info().await?;
+        Ok((file_info.portable_dev(), file_info.portable_ino()) == (self.devno, self.inode))
+    }
+
+    /// Path-open peek with inode verify on the same handle (shared by detect and idle force-decide).
+    async fn verified_peek_sniff(&self, max_bytes: usize) -> io::Result<VerifiedPeek> {
+        let file = File::open(&self.path).await?;
+        let file_info = file.file_info().await?;
+        if (file_info.portable_dev(), file_info.portable_ino()) != (self.devno, self.inode) {
+            return Ok(VerifiedPeek::InodeMismatch);
+        }
+
+        let sniff = if self.gzipped {
+            let decoder = gzip_multiple_decoder(BufReader::new(file));
+            let mut limited = decoder.take(max_bytes as u64);
+            let mut buf = Vec::new();
+            limited.read_to_end(&mut buf).await?;
+            buf
+        } else {
+            // read_to_end on a limited reader: a single read() may return short
+            // and under-fill the sniff window even when more bytes exist.
+            let mut limited = file.take(max_bytes as u64);
+            let mut buf = Vec::new();
+            limited.read_to_end(&mut buf).await?;
+            buf
+        };
+        Ok(VerifiedPeek::Sniff(sniff))
+    }
+
+    async fn skip_bom_on_reader(&mut self, bom_skip_bytes: u16) -> io::Result<()> {
+        if bom_skip_bytes == 0 || self.file_position != 0 {
+            return Ok(());
+        }
+        let mut discard = vec![0u8; bom_skip_bytes as usize];
+        self.reader.read_exact(&mut discard).await?;
+        self.file_position = u64::from(bom_skip_bytes);
+        Ok(())
+    }
+
+    /// Run auto-detection when Pending. Returns whether framing may proceed.
+    pub(super) async fn ensure_encoding_ready<E>(&mut self, emitter: &E) -> io::Result<bool>
+    where
+        E: file_source_common::FileSourceInternalEvents,
+    {
+        if !matches!(self.encoding_state, FileEncodingState::Pending) {
+            return Ok(!matches!(self.encoding_state, FileEncodingState::Rejected));
+        }
+
+        let Some(detector) = self.encoding_detector.clone() else {
+            self.encoding_state = FileEncodingState::Inactive;
+            return Ok(true);
+        };
+
+        let peek = match self.verified_peek_sniff(detector.max_peek_bytes()).await {
+            Ok(VerifiedPeek::InodeMismatch) => {
+                self.last_read_attempt = Instant::now();
+                return Ok(false);
+            }
+            Ok(VerifiedPeek::Sniff(sniff)) => sniff,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.set_dead();
+                return Ok(false);
+            }
+            Err(e) => {
+                // Peek failures (permissions, sharing violations) must not become
+                // per-pass watch errors: with a fixed charset an unreadable file
+                // emits nothing until an actual read fails. Log at debug level and
+                // space out retries via the regular attempt throttle.
+                self.last_read_attempt = Instant::now();
+                debug!(
+                    message = "Charset detection peek failed; will retry.",
+                    file = %self.path.display(),
+                    error = %e,
+                );
+                return Ok(false);
+            }
+        };
+
+        let waive_min = self.pending_idle_elapsed();
+
+        match detector.detect(&peek, waive_min) {
+            EncodingDetectOutcome::Pending => {
+                // Space out re-peeks the same way regular read attempts are spaced;
+                // otherwise a sustained-Pending file is peeked on every server pass.
+                self.last_read_attempt = Instant::now();
+                Ok(false)
+            }
+            EncodingDetectOutcome::Decided {
+                encoding_name,
+                via,
+                via_kind,
+                line_delimiter,
+                bom_skip_bytes,
+            } => {
+                let event_encoding = encoding_name.unwrap_or("UTF-8");
+                emitter.emit_file_encoding_detected(&self.path, event_encoding, via);
+                if via_kind == DetectViaKind::Fallback {
+                    warn!(
+                        message = "File character encoding detection was inconclusive; using fallback charset.",
+                        file = %self.path.display(),
+                        encoding = event_encoding,
+                    );
+                }
+                self.line_delimiter = line_delimiter;
+                self.encoding_state = FileEncodingState::Decided {
+                    encoding_name,
+                    bom_skip_bytes,
+                };
+                self.pending_since = None;
+                self.skip_bom_on_reader(bom_skip_bytes).await?;
+                Ok(true)
+            }
+            EncodingDetectOutcome::Rejected {
+                encoding_name,
+                via: _,
+                ratio,
+            } => {
+                emitter.emit_file_encoding_rejected(&self.path, encoding_name, ratio);
+                self.encoding_state = FileEncodingState::Rejected;
+                self.pending_since = None;
+                Ok(false)
+            }
+        }
     }
 
     /// Read a single line from the underlying file
@@ -337,7 +539,16 @@ impl FileWatcher {
     }
 
     #[inline]
+    pub fn watch_start(&self) -> Instant {
+        self.watch_start
+    }
+
+    #[inline]
     pub fn should_read(&self) -> bool {
+        if matches!(self.encoding_state, FileEncodingState::Rejected) {
+            return false;
+        }
+
         if self.reached_eof && self.last_read_attempt.elapsed() < self.read_retry_delay {
             return false;
         }

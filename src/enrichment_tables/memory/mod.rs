@@ -2,6 +2,7 @@
 
 mod config;
 mod internal_events;
+mod persist;
 mod source;
 mod table;
 
