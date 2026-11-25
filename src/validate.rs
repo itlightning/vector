@@ -167,15 +167,17 @@ pub async fn validate(opts: &Opts, color: bool) -> ExitCode {
         None => return exitcode::CONFIG,
     };
 
-    validated &= validate_transforms(&config, &mut fmt).await;
-
-    if !opts.no_environment {
-        if let Some(tmp_directory) = create_tmp_directory(&mut config, &mut fmt) {
-            validated &= validate_environment(opts, &config, &mut fmt).await;
-            remove_tmp_directory(tmp_directory);
-        } else {
-            validated = false;
-        }
+    // Building the components performs the same per-transform checks against the real enrichment
+    // tables, and reports them with the same text, so the standalone transform phase only earns
+    // its cost when the components are not built at all. Every VRL program in the configuration is
+    // otherwise compiled twice for one verdict.
+    if opts.no_environment {
+        validated &= validate_transforms(&config, &mut fmt).await;
+    } else if let Some(tmp_directory) = create_tmp_directory(&mut config, &mut fmt) {
+        validated &= validate_environment(opts, &config, &mut fmt).await;
+        remove_tmp_directory(tmp_directory);
+    } else {
+        validated = false;
     }
 
     if validated {
@@ -322,6 +324,9 @@ async fn validate_components(
 ) -> Option<TopologyPieces> {
     match TopologyPiecesBuilder::new(config, diff).build().await {
         Ok(pieces) => {
+            // Building every component is what clears the transforms too, so their line is
+            // reported from here and the output keeps its familiar shape.
+            fmt.success("Transforms configuration");
             fmt.success("Component configuration");
             Some(pieces)
         }

@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, Read},
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use snafu::{ResultExt, Snafu};
@@ -24,7 +24,7 @@ use vector_vrl_functions::set_semantic_meaning::MeaningList;
 use vector_vrl_metrics::MetricsStorage;
 use vrl::{
     compiler::{
-        CompileConfig, ExpressionError, Program, TypeState, VrlRuntime,
+        CompileConfig, ExpressionError, Program, RegexCache, TypeState, VrlRuntime,
         runtime::{Runtime, Terminate},
         state::ExternalEnv,
     },
@@ -48,15 +48,99 @@ use crate::{
 };
 
 const DROPPED: &str = "dropped";
-type CacheKey = (TableRegistry, schema::Definition);
-type CacheValue = (Program, String, MeaningList);
+
+/// Name of the VRL function that attaches a semantic meaning to a path
+/// (`vector_vrl_functions::set_semantic_meaning`). Program text is searched for it to decide
+/// whether a compilation can tell us anything we would keep. A match in a comment or a string only
+/// costs a compilation that would have happened anyway.
+const SET_SEMANTIC_MEANING: &str = "set_semantic_meaning";
+
+/// Everything a compiled program depends on, so two compilations sharing a key produce the same
+/// program: the two context values the compiler can store inside the program (the enrichment table
+/// registry and the metrics storage), the initial type state (derived from the merged schema
+/// definition), and the program text.
+///
+/// Both context values are compared by identity: `TableRegistry` through its own pessimistic
+/// `Arc::ptr_eq` `PartialEq`, because its tables are opaque and can be huge, and the metrics
+/// storage through the address of its shared cache. Identity is what correctness needs, because an
+/// enrichment function records its index requirement on the registry it compiled against and
+/// stores a read handle to that registry's tables inside the program, and a metrics function
+/// likewise captures the storage it compiled against, so a program may only be reused against the
+/// same instances.
+type CacheKey = (TableRegistry, usize, schema::Definition, String);
+type CacheValue = (Arc<Program>, String, MeaningList);
+
+struct CachedProgram {
+    key: CacheKey,
+    result: std::result::Result<CacheValue, String>,
+}
+
+/// Memo of compiled VRL programs, shared across config instances for the duration of one build.
+///
+/// A `remap` program is compiled several times while a topology is assembled: once per `outputs()`
+/// call as schema definitions are resolved, once in `validate_env`, and again in `build`. `build`
+/// compiles from a clone of the config, so a cache stored on `self` can never serve it, and
+/// compilation dominates startup for large programs. Keying on the compilation inputs instead of
+/// on the config instance removes those repeats.
+///
+/// The program is held behind an `Arc`, so a hit shares the compiled program with the topology
+/// rather than copying it, and the memo is emptied around every build cycle
+/// ([`clear_compiled_program_cache`]), so nothing is retained speculatively past the cycle that
+/// produced it. Between cycles the only live programs are the ones the running topology holds.
+///
+/// A `Vec` rather than a map because `TableRegistry` is neither hashable nor orderable; the scan is
+/// over a handful of entries and the identity comparisons come first.
+static PROGRAM_CACHE: OnceLock<Mutex<Vec<CachedProgram>>> = OnceLock::new();
+
+fn program_cache() -> &'static Mutex<Vec<CachedProgram>> {
+    PROGRAM_CACHE.get_or_init(Default::default)
+}
+
+/// Compiled regex literals, shared by every VRL compilation in one build cycle.
+///
+/// A compiled `Regex` is roughly 56 KiB of automata and a rendered source pack repeats the same
+/// literals across many programs, so interning them leaves one object per distinct pattern instead
+/// of one per occurrence. Only the cache HANDLE is shared: the rest of a `CompileConfig` is
+/// per-transform (read-only paths, enrichment and metrics context) and must not be.
+///
+/// Its lifetime is the program memo's. It is created on the first compilation of a cycle and
+/// dropped by [`clear_compiled_program_cache`] at both ends of one, because the cache pins every
+/// pattern it has seen: a process-lifetime handle would keep the literals of programs that were
+/// discarded cycles ago. After the drop, only the regexes a live `Program` still holds survive.
+static REGEX_CACHE: OnceLock<Mutex<Option<RegexCache>>> = OnceLock::new();
+
+fn regex_cache_slot() -> &'static Mutex<Option<RegexCache>> {
+    REGEX_CACHE.get_or_init(Default::default)
+}
+
+/// The regex cache for the build cycle in flight, created if this is its first compilation.
+fn regex_cache_handle() -> RegexCache {
+    Arc::clone(
+        regex_cache_slot()
+            .lock()
+            .expect("Data poisoned")
+            .get_or_insert_with(RegexCache::default),
+    )
+}
+
+/// Drops every memoized program and the interned regex literals. Called by the topology builder
+/// around a build or reload cycle: the memo exists to deduplicate compilations *within* one cycle,
+/// and a program compiled for a previous cycle can never be reused anyway, because its key pins the
+/// enrichment registry generation and the config text it was built from. Clearing bounds retention
+/// to the cycle in flight instead of the process lifetime, which matters for the long-running
+/// service; under `vector validate` the process exits immediately and the distinction does not
+/// arise.
+pub fn clear_compiled_program_cache() {
+    program_cache().lock().expect("Data poisoned").clear();
+    *regex_cache_slot().lock().expect("Data poisoned") = None;
+}
 
 /// Configuration for the `remap` transform.
 #[configurable_component(transform(
     "remap",
     "Modify your observability data as it passes through your topology using Vector Remap Language (VRL)."
 ))]
-#[derive(Derivative)]
+#[derive(Clone, Derivative)]
 #[serde(deny_unknown_fields)]
 #[derivative(Default, Debug)]
 pub struct RemapConfig {
@@ -156,53 +240,16 @@ pub struct RemapConfig {
     #[configurable(derived, metadata(docs::hidden))]
     #[serde(default)]
     pub runtime: VrlRuntime,
-
-    #[configurable(derived, metadata(docs::hidden))]
-    #[serde(skip)]
-    #[derivative(Debug = "ignore")]
-    /// Cache can't be `BTreeMap` or `HashMap` because of `TableRegistry`, which doesn't allow us to inspect tables inside it.
-    /// And even if we allowed the inspection, the tables can be huge, resulting in a long comparison or hash computation
-    /// while using `Vec` allows us to use just a shallow comparison
-    pub cache: Mutex<Vec<(CacheKey, std::result::Result<CacheValue, String>)>>,
-}
-
-impl Clone for RemapConfig {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            file: self.file.clone(),
-            files: self.files.clone(),
-            metric_tag_values: self.metric_tag_values,
-            timezone: self.timezone,
-            drop_on_error: self.drop_on_error,
-            drop_on_abort: self.drop_on_abort,
-            reroute_dropped: self.reroute_dropped,
-            runtime: self.runtime,
-            cache: Mutex::new(Default::default()),
-        }
-    }
 }
 
 impl RemapConfig {
-    fn compile_vrl_program(
-        &self,
-        enrichment_tables: TableRegistry,
-        metrics_storage: MetricsStorage,
-        merged_schema_definition: schema::Definition,
-    ) -> Result<(Program, String, MeaningList)> {
-        if let Some((_, res)) = self
-            .cache
-            .lock()
-            .expect("Data poisoned")
-            .iter()
-            .find(|v| v.0.0 == enrichment_tables && v.0.1 == merged_schema_definition)
-        {
-            return res.clone().map_err(Into::into);
-        }
-
-        let source = match (&self.source, &self.file, &self.files) {
-            (Some(source), None, None) => source.to_owned(),
-            (None, Some(path), None) => Self::read_file(path)?,
+    /// The program text, read from `source`, `file` or `files`.
+    ///
+    /// Exactly one of the three must be set; anything else is a configuration error.
+    fn program_source(&self) -> Result<String> {
+        match (&self.source, &self.file, &self.files) {
+            (Some(source), None, None) => Ok(source.to_owned()),
+            (None, Some(path), None) => Self::read_file(path),
             (None, None, Some(paths)) => {
                 let mut combined_source = String::new();
                 for path in paths {
@@ -210,10 +257,39 @@ impl RemapConfig {
                     combined_source.push_str(&content);
                     combined_source.push('\n');
                 }
-                combined_source
+                Ok(combined_source)
             }
-            _ => return Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
-        };
+            _ => Err(Box::new(BuildError::SourceAndOrFileOrFiles)),
+        }
+    }
+
+    fn compile_vrl_program(
+        &self,
+        enrichment_tables: TableRegistry,
+        metrics_storage: MetricsStorage,
+        merged_schema_definition: schema::Definition,
+    ) -> Result<CacheValue> {
+        let source = self.program_source()?;
+
+        // Reading `file`/`files` happens before the lookup because the text is part of the key.
+        // The read is negligible next to a compilation, which is what the memo is protecting.
+        // The text is kept in the key rather than a hash of it: an exact comparison cannot serve
+        // the wrong program, and the memo only lives for one build cycle.
+        let metrics_storage_id = Arc::as_ptr(&metrics_storage.cache) as usize;
+        if let Some(entry) = program_cache()
+            .lock()
+            .expect("Data poisoned")
+            .iter()
+            .find(|entry| {
+                entry.key.1 == metrics_storage_id
+                    && entry.key.3 == source
+                    && entry.key.0 == enrichment_tables
+                    && entry.key.2 == merged_schema_definition
+            })
+        {
+            return entry.result.clone().map_err(Into::into);
+        }
+        let started = std::time::Instant::now();
 
         let state = TypeState {
             local: Default::default(),
@@ -227,21 +303,38 @@ impl RemapConfig {
         config.set_custom(enrichment_tables.clone());
         config.set_custom(metrics_storage);
         config.set_custom(MeaningList::default());
+        // Only the handle crosses transforms; everything else on this config is per-transform.
+        // The returned `CompilationResult.config` is deliberately not kept anywhere: holding it
+        // would retain the whole custom map for as long as the transform lives.
+        config.set_regex_cache(regex_cache_handle());
 
         let res = compile_vrl(&source, &vector_vrl_functions::all(), &state, config)
             .map_err(|diagnostics| format_vrl_diagnostics(&source, diagnostics))
             .map(|result| {
                 (
-                    result.program,
+                    Arc::new(result.program),
                     format_vrl_diagnostics(&source, result.warnings),
                     result.config.get_custom::<MeaningList>().unwrap().clone(),
                 )
             });
 
-        self.cache
-            .lock()
-            .expect("Data poisoned")
-            .push(((enrichment_tables, merged_schema_definition), res.clone()));
+        debug!(
+            message = "Compiled a VRL program.",
+            elapsed_ms = started.elapsed().as_millis(),
+            source_bytes = source.len(),
+            ok = res.is_ok(),
+        );
+        let mut cache = program_cache().lock().expect("Data poisoned");
+        cache.push(CachedProgram {
+            key: (
+                enrichment_tables,
+                metrics_storage_id,
+                merged_schema_definition,
+                source,
+            ),
+            result: res.clone(),
+        });
+        drop(cache);
 
         res.map_err(Into::into)
     }
@@ -308,14 +401,38 @@ impl TransformConfig for RemapConfig {
         // We need to compile the VRL program in order to know the schema definition output of this
         // transform. We ignore any compilation errors, as those are caught by the transform build
         // step.
-        let compiled = self
-            .compile_vrl_program(
+        //
+        // With schema support disabled the caller keeps only the log namespaces and the semantic
+        // meanings of what is returned here (`TransformOutput::schema_definitions`), and the
+        // computed kinds are replaced by the namespace default. A program that sets no meaning
+        // therefore has nothing to contribute that a compilation could reveal, so it is not
+        // compiled and the input meanings are carried through against a permissive kind. A program
+        // that does call `set_semantic_meaning` is still compiled, because its meaning list is the
+        // one part of the result that survives.
+        let compiles_meanings = context.schema.enabled
+            || self
+                .program_source()
+                .map(|source| source.contains(SET_SEMANTIC_MEANING))
+                .unwrap_or(true);
+
+        let compiled = if compiles_meanings {
+            self.compile_vrl_program(
                 context.enrichment_tables.clone(),
                 context.metrics_storage.clone(),
                 merged_definition,
             )
-            .map(|(program, _, meaning_list)| (program.final_type_info().state, meaning_list.0))
-            .map_err(|_| ());
+            .map(|(program, _, meaning_list)| {
+                let state = program.final_type_info().state;
+                (
+                    state.external.target_kind().clone(),
+                    state.external.metadata_kind().clone(),
+                    meaning_list.0,
+                )
+            })
+            .map_err(|_| ())
+        } else {
+            Ok((Kind::any(), Kind::any(), BTreeMap::new()))
+        };
 
         let mut dropped_definitions = HashMap::new();
         let mut default_definitions = HashMap::new();
@@ -323,10 +440,10 @@ impl TransformConfig for RemapConfig {
         for (output_id, input_definition) in input_definitions {
             let default_definition = compiled
                 .clone()
-                .map(|(state, meaning)| {
+                .map(|(event_kind, metadata_kind, meaning)| {
                     let mut new_type_def = Definition::new(
-                        state.external.target_kind().clone(),
-                        state.external.metadata_kind().clone(),
+                        event_kind,
+                        metadata_kind,
                         input_definition.log_namespaces().clone(),
                     );
 
@@ -416,7 +533,9 @@ where
     Runner: VrlRunner,
 {
     component_key: Option<ComponentKey>,
-    program: Program,
+    // Shared with the compilation memo, so a memo hit costs a refcount rather than a copy of the
+    // whole program.
+    program: Arc<Program>,
     timezone: TimeZone,
     drop_on_error: bool,
     drop_on_abort: bool,
@@ -485,7 +604,7 @@ where
     fn new(
         config: RemapConfig,
         context: &TransformContext,
-        program: Program,
+        program: Arc<Program>,
         runner: Runner,
     ) -> crate::Result<Self> {
         Ok(Remap {
@@ -708,6 +827,91 @@ mod tests {
         transforms::{OutputBuffer, test::create_topology},
     };
 
+    /// Context for the definition tests below, which assert on the definitions a compilation
+    /// produces. Those are only kept when schema support is on.
+    fn schema_enabled_context() -> TransformContext {
+        TransformContext {
+            schema: crate::config::schema::Options {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Whether the compilation memo holds a program compiled from this exact text. The memo is
+    /// process wide and other tests compile their own programs into it, so the tests below use
+    /// program text of their own rather than counting entries.
+    fn memo_holds(source: &str) -> bool {
+        program_cache()
+            .lock()
+            .expect("Data poisoned")
+            .iter()
+            .any(|entry| entry.key.3 == source)
+    }
+
+    #[test]
+    fn outputs_skips_compilation_when_definitions_are_discarded() {
+        let source = r#".skip_probe_field = "potato""#;
+        let config = RemapConfig {
+            source: Some(source.to_string()),
+            ..Default::default()
+        };
+        let input = schema::Definition::default_legacy_namespace();
+
+        // Schema support off and no meaning set: nothing a compilation could produce is kept.
+        let outputs = config.outputs(&Default::default(), &[("in".into(), input.clone())]);
+        assert!(!memo_holds(source));
+        assert_eq!(1, outputs.len());
+
+        // Schema support on: the definitions are kept, so the program is compiled.
+        let outputs = config.outputs(&schema_enabled_context(), &[("in".into(), input.clone())]);
+        assert!(memo_holds(source));
+        assert_eq!(
+            Kind::bytes(),
+            outputs[0].schema_definitions(true)[&"in".into()]
+                .event_kind()
+                .at_path(&owned_value_path!("skip_probe_field"))
+        );
+
+        // A program that sets a meaning is compiled either way: its meaning list survives.
+        let meaning_source = r#".meaning_probe_field = "potato"; set_semantic_meaning(.meaning_probe_field, "spud")"#;
+        let with_meaning = RemapConfig {
+            source: Some(meaning_source.to_string()),
+            ..Default::default()
+        };
+        let outputs = with_meaning.outputs(&Default::default(), &[("in".into(), input)]);
+        assert!(memo_holds(meaning_source));
+        assert!(
+            outputs[0].schema_definitions(false)[&"in".into()]
+                .meaning_path("spud")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn outputs_keeps_input_meanings_without_compiling() {
+        // A pass-through program below a component that set a meaning. Skipping the compilation
+        // must carry that meaning through, not fall back to the compile-failure definition.
+        let source = ".passthrough_probe_field = .thing";
+        let config = RemapConfig {
+            source: Some(source.to_string()),
+            ..Default::default()
+        };
+        let input = schema::Definition::default_legacy_namespace().with_event_field(
+            &owned_value_path!("thing"),
+            Kind::bytes(),
+            Some("spud"),
+        );
+
+        let outputs = config.outputs(&Default::default(), &[("in".into(), input.clone())]);
+
+        assert!(!memo_holds(source));
+        let definition = &outputs[0].schema_definitions(false)[&"in".into()];
+        assert_eq!(input.meaning_path("spud"), definition.meaning_path("spud"));
+        assert!(!definition.event_kind().is_never());
+    }
+
     fn test_default_schema_definition() -> schema::Definition {
         schema::Definition::empty_legacy_namespace().with_event_field(
             &owned_value_path!("a default field"),
@@ -845,7 +1049,7 @@ mod tests {
         assert_eq!(get_field_string(&result, "."), "root string");
 
         let mut outputs = conf.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(OutputId::dummy(), initial_definition)],
         );
 
@@ -856,6 +1060,98 @@ mod tests {
         let expected_schema =
             Definition::new(Kind::bytes(), Kind::any_object(), [LogNamespace::Vector]);
         assert_eq!(actual_schema_def, expected_schema);
+    }
+
+    /// The source component id is readable at `%vector.source_id` under the legacy log
+    /// namespace, where the metadata value map holds no `vector` key at all.
+    #[test]
+    fn remap_reads_source_id_legacy_namespace() {
+        let event = {
+            let mut event = LogEvent::from("hello");
+            event
+                .metadata_mut()
+                .set_source_id(Arc::new(ComponentKey::from("src_win_eventlog_apps")));
+            Event::from(event)
+        };
+
+        let conf = RemapConfig {
+            source: Some(".sid = string!(%vector.source_id)".to_string()),
+            ..Default::default()
+        };
+        let mut tform = remap(conf).unwrap();
+        let result = transform_one(&mut tform, event).unwrap();
+
+        assert_eq!(get_field_string(&result, ".sid"), "src_win_eventlog_apps");
+        // Reading the id must not reclassify the event: the namespace is decided by the
+        // presence of a `vector` key in the metadata value map.
+        assert_eq!(result.as_log().namespace(), LogNamespace::Legacy);
+    }
+
+    /// The same path under the Vector log namespace, where the metadata value map does hold a
+    /// `vector` key and the source id is still not one of its entries.
+    #[test]
+    fn remap_reads_source_id_vector_namespace() {
+        let event = {
+            let mut metadata = EventMetadata::default();
+            metadata
+                .value_mut()
+                .insert(&owned_value_path!("vector"), BTreeMap::new());
+            metadata.set_source_id(Arc::new(ComponentKey::from("src_win_eventlog_apps")));
+
+            let mut event = LogEvent::new_with_metadata(metadata);
+            event.insert(event_path!("message"), "hello");
+            Event::from(event)
+        };
+
+        let conf = RemapConfig {
+            source: Some(".sid = string!(%vector.source_id)".to_string()),
+            ..Default::default()
+        };
+        let mut tform = remap(conf).unwrap();
+        let result = transform_one(&mut tform, event).unwrap();
+
+        assert_eq!(get_field_string(&result, ".sid"), "src_win_eventlog_apps");
+        assert_eq!(result.as_log().namespace(), LogNamespace::Vector);
+    }
+
+    /// An event that never passed through a source reads the path as null.
+    #[test]
+    fn remap_reads_missing_source_id_as_null() {
+        let event = Event::from(LogEvent::from("hello"));
+
+        let conf = RemapConfig {
+            source: Some(".sid = %vector.source_id".to_string()),
+            ..Default::default()
+        };
+        let mut tform = remap(conf).unwrap();
+        let result = transform_one(&mut tform, event).unwrap();
+
+        assert_eq!(result.as_log().get(event_path!("sid")), Some(&Value::Null));
+    }
+
+    /// Writing the source id is refused at compile time, the same way writing the source type is.
+    #[test]
+    fn remap_cannot_write_source_id() {
+        let compile_error = |path: &str| {
+            let conf = RemapConfig {
+                source: Some(format!(r#"{path} = "nope""#)),
+                ..Default::default()
+            };
+            remap(conf).unwrap_err().to_string()
+        };
+
+        let source_id_error = compile_error("%vector.source_id");
+        assert!(
+            source_id_error.contains("read-only"),
+            "expected a read-only diagnostic, got: {source_id_error}"
+        );
+        // The two diagnostics differ only in the path, and in the length of the run of
+        // carets under it, which the comparison drops.
+        let without_carets = |text: String| text.replace('^', "");
+        assert_eq!(
+            without_carets(source_id_error.replace("source_id", "source_type")),
+            without_carets(compile_error("%vector.source_type"))
+        );
     }
 
     #[test]
@@ -1531,7 +1827,7 @@ mod tests {
 
         assert_eq!(
             conf.outputs(
-                &Default::default(),
+                &schema_enabled_context(),
                 &[(
                     "test".into(),
                     schema::Definition::new_with_default_metadata(
@@ -1692,7 +1988,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[("in".into(), schema::Definition::default_legacy_namespace())],
         );
 
@@ -1714,7 +2010,7 @@ mod tests {
         );
 
         let outputs2 = transform2.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in1".into(),
                 outputs1[0].schema_definitions(true)[&"in".into()].clone(),
@@ -1761,7 +2057,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -1795,7 +2091,7 @@ mod tests {
         );
 
         let outputs2 = transform2.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in1".into(),
                 outputs1[0].schema_definitions(true)[&"in".into()].clone(),
@@ -1838,7 +2134,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -1878,7 +2174,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -1906,7 +2202,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -1946,7 +2242,7 @@ mod tests {
         };
 
         let outputs1 = transform1.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
@@ -2007,7 +2303,7 @@ mod tests {
         assert_eq!(result.as_log().get(event_path!()), Some(&Value::Null));
 
         let outputs1 = conf.outputs(
-            &Default::default(),
+            &schema_enabled_context(),
             &[(
                 "in".into(),
                 schema::Definition::new_with_default_metadata(
