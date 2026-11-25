@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 use vector_config::component::GenerateConfig;
 use vector_lib::configurable::configurable_component;
@@ -6,7 +9,7 @@ use vector_lib::configurable::configurable_component;
 use crate::{config::SourceAcknowledgementsConfig, serde::bool_or_struct};
 
 // Validation constants
-const MAX_CHANNEL_NAME_LENGTH: usize = 256;
+pub(super) const MAX_CHANNEL_NAME_LENGTH: usize = 256;
 const MAX_XPATH_QUERY_LENGTH: usize = 4096;
 const MAX_FIELD_NAME_LENGTH: usize = 128;
 const MAX_FIELD_COUNT: usize = 100;
@@ -15,6 +18,18 @@ const MAX_CHANNELS: usize = 63; // MAXIMUM_WAIT_OBJECTS (64) minus 1 for shutdow
 const MAX_CONNECTION_TIMEOUT_SECS: u64 = 3600;
 const MAX_EVENT_TIMEOUT_MS: u64 = 60000;
 const MAX_BATCH_SIZE: u32 = 10000;
+const MAX_STATUS_INTERVAL_SECS: u64 = 3600;
+pub(super) const MAX_SUPPRESS_PROVIDERS_PER_CHANNEL: usize = 4;
+pub(super) const MAX_SUPPRESS_IDS_PER_CHANNEL: usize = 64;
+const MAX_SUPPRESS_PROVIDER_LENGTH: usize = 128;
+const MAX_BINARY_PROVIDERS: usize = 16;
+
+/// The `channel` value on internal events raised for a failure that belongs to
+/// the source rather than to any single channel.
+///
+/// Defined once and rejected by `validate`, so a consumer keying on `channel`
+/// can treat it as unambiguous rather than as a name a config might also use.
+pub(super) const SOURCE_LEVEL_CHANNEL: &str = "<source>";
 
 /// Configuration for the `windows_event_log` source.
 #[configurable_component(source(
@@ -183,6 +198,77 @@ pub struct WindowsEventLogConfig {
     #[serde(default = "default_render_message")]
     pub render_message: bool,
 
+    /// Interval in seconds at which each channel subscription is torn down and
+    /// rebuilt from its bookmark.
+    ///
+    /// Rebuilding from a bookmark is clean by construction: no gap and no
+    /// duplicates. The refresh therefore costs close to nothing and bounds
+    /// unknown-unknown degradation on subscriptions that would otherwise live
+    /// for weeks. It is also what retries a channel that was skipped for access
+    /// denied, so a transient ACL change heals within one interval instead of
+    /// requiring a restart.
+    ///
+    /// Set to 0 to disable.
+    #[serde(default = "default_subscription_refresh_secs")]
+    #[configurable(metadata(docs::examples = 86400))]
+    #[configurable(metadata(docs::examples = 3600))]
+    #[configurable(metadata(docs::examples = 0))]
+    pub subscription_refresh_secs: u64,
+
+    /// Where to write the JSON file describing the collection status of each
+    /// channel.
+    ///
+    /// The source rewrites this file on a fixed interval with per channel
+    /// facts: whether a subscription exists, the last event time and record id
+    /// it delivered, the id of the newest record in the channel, the
+    /// current resume position, and any gaps the resume ladder created. Another
+    /// process can poll it to decide whether collection is keeping up.
+    ///
+    /// Defaults to `windows_event_log_status.json` in this source's data
+    /// directory, alongside the checkpoint file. Set this only to put the file
+    /// somewhere else.
+    ///
+    /// The file is written whole each interval through a temporary file and a
+    /// rename, so a reader never sees a partial one.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "C:\\ProgramData\\vector\\wel-status.json"))]
+    #[configurable(metadata(docs::human_name = "Status File Path"))]
+    pub status_path: Option<PathBuf>,
+
+    /// Interval in seconds between status file writes.
+    ///
+    /// Each write costs a small number of Windows API calls per configured
+    /// channel, so the interval is the whole of the cost control.
+    #[serde(default = "default_status_interval_secs")]
+    #[configurable(metadata(docs::examples = 30))]
+    #[configurable(metadata(docs::examples = 60))]
+    pub status_interval_secs: u64,
+
+    /// Event ids the Event Log service drops before delivery, per channel.
+    ///
+    /// Each key must be one of `channels`. A suppressed record is never pulled
+    /// or rendered, so it costs this source nothing. Matching on the provider
+    /// name is case-insensitive. Ignored for a channel whose `event_query` is a
+    /// structured `<QueryList>`.
+    #[serde(default)]
+    #[configurable(metadata(
+        docs::additional_props_description = "The suppress rules for one channel."
+    ))]
+    pub suppress_ids: BTreeMap<String, Vec<SuppressRule>>,
+
+    /// Providers whose records keep their `<Binary>` payload.
+    ///
+    /// A record from a listed provider carries its `<Binary>` element as the
+    /// top-level `binary_data` field: the hex text exactly as Windows renders
+    /// it. Every other record drops it, which is the default for all providers.
+    /// `event_data` is unchanged either way, including a template field named
+    /// `Binary`. Matching on the provider name is case-insensitive, and names
+    /// follow the `suppress_ids` provider rules. A payload longer than a
+    /// nonzero `max_event_data_length` is dropped whole, never truncated.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "Service Control Manager"))]
+    pub binary_providers: Vec<String>,
+
     /// Controls how acknowledgements are handled for this source.
     ///
     /// When enabled, the source will wait for downstream sinks to acknowledge
@@ -196,6 +282,21 @@ pub struct WindowsEventLogConfig {
     #[configurable(derived)]
     #[serde(default, deserialize_with = "bool_or_struct")]
     pub acknowledgements: SourceAcknowledgementsConfig,
+}
+
+/// Event ids from one provider for the Event Log service to suppress.
+#[configurable_component]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SuppressRule {
+    /// Provider name. Letters, digits, space, `.`, `_` and `-`, starting with a
+    /// letter or digit, at most 128 characters.
+    #[configurable(metadata(docs::examples = "Microsoft-Windows-Security-Auditing"))]
+    pub provider: String,
+
+    /// Event ids from this provider to suppress.
+    #[configurable(metadata(docs::examples = 4658))]
+    pub event_ids: Vec<u16>,
 }
 
 /// Event data formatting options for custom field type conversion.
@@ -286,8 +387,40 @@ impl Default for WindowsEventLogConfig {
             max_event_data_length: default_max_event_data_length(),
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
             render_message: default_render_message(),
+            subscription_refresh_secs: default_subscription_refresh_secs(),
+            // No override: the file goes to its default name in the
+            // source's own data directory, which is where a reader looks for
+            // it. The writer runs either way.
+            status_path: None,
+            status_interval_secs: default_status_interval_secs(),
+            suppress_ids: BTreeMap::new(),
+            binary_providers: Vec::new(),
             acknowledgements: Default::default(),
         }
+    }
+}
+
+impl WindowsEventLogConfig {
+    /// Periodic subscription refresh interval.
+    ///
+    /// Zero disables the refresh; it is expressed as an effectively infinite
+    /// interval so the call site has no second code path to get wrong.
+    pub(super) const fn subscription_refresh_interval(&self) -> std::time::Duration {
+        if self.subscription_refresh_secs == 0 {
+            std::time::Duration::from_secs(u64::MAX / 2)
+        } else {
+            std::time::Duration::from_secs(self.subscription_refresh_secs)
+        }
+    }
+
+    /// Whether records from `provider` keep their `<Binary>` payload.
+    ///
+    /// Listed names are ASCII by validation, so an ASCII case fold is the
+    /// whole of case-insensitive matching.
+    pub(super) fn keeps_binary(&self, provider: &str) -> bool {
+        self.binary_providers
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(provider))
     }
 }
 
@@ -341,6 +474,16 @@ impl WindowsEventLogConfig {
             return Err("Checkpoint interval must be between 1 and 3600 seconds".into());
         }
 
+        // The status writer runs on every host, so a zero or absurd interval is
+        // rejected rather than silently coerced.
+        if self.status_interval_secs == 0 || self.status_interval_secs > MAX_STATUS_INTERVAL_SECS {
+            return Err(format!(
+                "Status interval must be between 1 and {} seconds",
+                MAX_STATUS_INTERVAL_SECS
+            )
+            .into());
+        }
+
         // Prevent resource exhaustion via excessive batch sizes
         if self.batch_size == 0 || self.batch_size > MAX_BATCH_SIZE {
             return Err(format!("Batch size must be between 1 and {}", MAX_BATCH_SIZE).into());
@@ -350,6 +493,22 @@ impl WindowsEventLogConfig {
         for channel in &self.channels {
             if channel.trim().is_empty() {
                 return Err("Channel names cannot be empty".into());
+            }
+
+            // `<source>` is the channel value the source-level internal events
+            // carry when a failure belongs to the source rather than to any
+            // one channel. Windows cannot name a channel that, but only
+            // validation makes it a guarantee: without this, a typo'd config
+            // could make a per-channel event indistinguishable from the
+            // source-level sentinel for anything keying on `channel`.
+            if channel.trim() == SOURCE_LEVEL_CHANNEL {
+                return Err(format!(
+                    "Channel name '{}' is reserved: it marks source-level \
+                     failures that belong to no single channel. Use the real \
+                     Windows channel name.",
+                    SOURCE_LEVEL_CHANNEL
+                )
+                .into());
             }
 
             // Prevent excessively long channel names
@@ -535,8 +694,106 @@ impl WindowsEventLogConfig {
             }
         }
 
+        self.validate_suppress_ids()?;
+        self.validate_binary_providers()?;
+
         Ok(())
     }
+
+    /// The bounds keep the composed query inside what the Event Log service
+    /// accepts; the pack builder and the agent enforce the same or tighter ones.
+    fn validate_suppress_ids(&self) -> Result<(), crate::Error> {
+        for (channel, rules) in &self.suppress_ids {
+            if !self.channels.contains(channel) {
+                return Err(format!(
+                    "suppress_ids names channel '{channel}', which is not in channels"
+                )
+                .into());
+            }
+            if rules.is_empty() {
+                return Err(format!("suppress_ids for channel '{channel}' is empty").into());
+            }
+            if rules.len() > MAX_SUPPRESS_PROVIDERS_PER_CHANNEL {
+                return Err(format!(
+                    "suppress_ids for channel '{channel}' names {} providers, maximum is {}",
+                    rules.len(),
+                    MAX_SUPPRESS_PROVIDERS_PER_CHANNEL
+                )
+                .into());
+            }
+            let ids: usize = rules.iter().map(|rule| rule.event_ids.len()).sum();
+            if ids > MAX_SUPPRESS_IDS_PER_CHANNEL {
+                return Err(format!(
+                    "suppress_ids for channel '{channel}' lists {ids} event ids, maximum is {}",
+                    MAX_SUPPRESS_IDS_PER_CHANNEL
+                )
+                .into());
+            }
+            for (index, rule) in rules.iter().enumerate() {
+                if !is_valid_provider_name(&rule.provider) {
+                    return Err(format!(
+                        "suppress_ids provider '{}' for channel '{channel}' is not a valid provider name",
+                        rule.provider
+                    )
+                    .into());
+                }
+                if rule.event_ids.is_empty() {
+                    return Err(format!(
+                        "suppress_ids provider '{}' for channel '{channel}' lists no event ids",
+                        rule.provider
+                    )
+                    .into());
+                }
+                // The service matches providers case-insensitively, so two
+                // spellings of one name are one provider.
+                if rules[..index]
+                    .iter()
+                    .any(|earlier| earlier.provider.eq_ignore_ascii_case(&rule.provider))
+                {
+                    return Err(format!(
+                        "suppress_ids for channel '{channel}' names provider '{}' twice",
+                        rule.provider
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_binary_providers(&self) -> Result<(), crate::Error> {
+        if self.binary_providers.len() > MAX_BINARY_PROVIDERS {
+            return Err(format!(
+                "binary_providers names {} providers, maximum is {MAX_BINARY_PROVIDERS}",
+                self.binary_providers.len()
+            )
+            .into());
+        }
+        for (index, provider) in self.binary_providers.iter().enumerate() {
+            if !is_valid_provider_name(provider) {
+                return Err(format!(
+                    "binary_providers names '{provider}', which is not a valid provider name"
+                )
+                .into());
+            }
+            if self.binary_providers[..index]
+                .iter()
+                .any(|earlier| earlier.eq_ignore_ascii_case(provider))
+            {
+                return Err(format!("binary_providers names provider '{provider}' twice").into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}$`: nothing that needs escaping inside
+/// the XPath string literal a suppress rule's name is composed into.
+fn is_valid_provider_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.len() <= MAX_SUPPRESS_PROVIDER_LENGTH
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
 }
 
 /// Check if a channel name contains glob pattern characters
@@ -591,6 +848,16 @@ const fn default_checkpoint_interval_secs() -> u64 {
 
 const fn default_render_message() -> bool {
     true
+}
+
+/// Default ON at 24 hours.
+const fn default_subscription_refresh_secs() -> u64 {
+    86_400
+}
+
+/// Cadence of the status file when a path is configured.
+const fn default_status_interval_secs() -> u64 {
+    30
 }
 
 #[cfg(test)]
@@ -681,6 +948,11 @@ mod tests {
             max_event_data_length: 0,
             checkpoint_interval_secs: 5,
             render_message: true,
+            subscription_refresh_secs: 86_400,
+            status_path: Some(PathBuf::from("/test/data/status.json")),
+            status_interval_secs: 30,
+            suppress_ids: BTreeMap::new(),
+            binary_providers: vec!["Service Control Manager".to_string()],
             acknowledgements: SourceAcknowledgementsConfig::from(true),
         };
 
@@ -701,6 +973,305 @@ mod tests {
         );
         assert_eq!(config.batch_size, deserialized.batch_size);
         assert_eq!(config.render_message, deserialized.render_message);
+        assert_eq!(config.status_path, deserialized.status_path);
+        assert_eq!(config.binary_providers, deserialized.binary_providers);
+        assert_eq!(
+            config.status_interval_secs,
+            deserialized.status_interval_secs
+        );
+    }
+
+    /// The status path is an override, not a switch. A config that never
+    /// mentions it still gets the file, at the derived location.
+    #[test]
+    fn the_status_path_is_an_optional_override() {
+        let config = WindowsEventLogConfig::default();
+        assert!(config.status_path.is_none());
+        assert_eq!(config.status_interval_secs, 30);
+
+        // An existing deployment's config parses unchanged, and the writer it
+        // never asked for is exactly the point: the reader has no other way to
+        // learn whether this source is collecting.
+        let parsed: WindowsEventLogConfig =
+            toml::from_str("channels = [\"System\"]").expect("minimal config must parse");
+        assert!(parsed.status_path.is_none());
+        assert_eq!(parsed.status_interval_secs, 30);
+    }
+
+    /// The writer runs on every host, so the interval is always meaningful and
+    /// is always checked, whether or not a path was named.
+    #[test]
+    fn a_status_interval_is_always_validated() {
+        let mut config = WindowsEventLogConfig {
+            status_interval_secs: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("Status interval"));
+
+        config.status_interval_secs = 3601;
+        assert!(config.validate().is_err());
+
+        config.status_interval_secs = 30;
+        assert!(config.validate().is_ok());
+
+        config.status_path = Some(PathBuf::from("C:\\ProgramData\\vector\\status.json"));
+        assert!(config.validate().is_ok());
+    }
+
+    fn suppress(provider: &str, event_ids: &[u16]) -> SuppressRule {
+        SuppressRule {
+            provider: provider.to_string(),
+            event_ids: event_ids.to_vec(),
+        }
+    }
+
+    /// Every bound on `suppress_ids`, accepted at the limit and rejected one
+    /// past it. The pack builder and the agent hold the same bounds, so a
+    /// rejection here is a config nothing upstream should produce.
+    #[test]
+    fn suppress_ids_validation_table() {
+        let sixty_four: Vec<u16> = (1..=64).collect();
+        let sixty_five: Vec<u16> = (1..=65).collect();
+        let long_name = format!("P{}", "a".repeat(127));
+        let too_long_name = format!("P{}", "a".repeat(128));
+
+        let rows: Vec<(&str, BTreeMap<String, Vec<SuppressRule>>, bool)> = vec![
+            ("empty map", BTreeMap::new(), true),
+            (
+                "one provider, one id",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("Microsoft-Windows-Security-Auditing", &[4658])],
+                )]),
+                true,
+            ),
+            (
+                "key not in channels",
+                BTreeMap::from([("Application".into(), vec![suppress("P", &[1])])]),
+                false,
+            ),
+            (
+                "no rules for a channel",
+                BTreeMap::from([("Security".into(), Vec::new())]),
+                false,
+            ),
+            (
+                "four providers",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![
+                        suppress("A", &[1]),
+                        suppress("B", &[1]),
+                        suppress("C", &[1]),
+                        suppress("D", &[1]),
+                    ],
+                )]),
+                true,
+            ),
+            (
+                "five providers",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![
+                        suppress("A", &[1]),
+                        suppress("B", &[1]),
+                        suppress("C", &[1]),
+                        suppress("D", &[1]),
+                        suppress("E", &[1]),
+                    ],
+                )]),
+                false,
+            ),
+            (
+                "64 ids",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &sixty_four)])]),
+                true,
+            ),
+            (
+                "65 ids",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &sixty_five)])]),
+                false,
+            ),
+            (
+                "65 ids across two providers",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("A", &sixty_four), suppress("B", &[1])],
+                )]),
+                false,
+            ),
+            (
+                "ids 0 and 65535",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &[0, u16::MAX])])]),
+                true,
+            ),
+            (
+                "no ids",
+                BTreeMap::from([("Security".into(), vec![suppress("A", &[])])]),
+                false,
+            ),
+            (
+                "duplicate provider",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("A", &[1]), suppress("A", &[2])],
+                )]),
+                false,
+            ),
+            (
+                "duplicate provider in another case",
+                BTreeMap::from([(
+                    "Security".into(),
+                    vec![suppress("Ab", &[1]), suppress("aB", &[2])],
+                )]),
+                false,
+            ),
+            (
+                "provider with every allowed character",
+                BTreeMap::from([("Security".into(), vec![suppress("Az09 ._-z", &[1])])]),
+                true,
+            ),
+            (
+                "provider at 128 characters",
+                BTreeMap::from([("Security".into(), vec![suppress(&long_name, &[1])])]),
+                true,
+            ),
+            (
+                "provider at 129 characters",
+                BTreeMap::from([("Security".into(), vec![suppress(&too_long_name, &[1])])]),
+                false,
+            ),
+            (
+                "empty provider",
+                BTreeMap::from([("Security".into(), vec![suppress("", &[1])])]),
+                false,
+            ),
+            (
+                "provider starting with a separator",
+                BTreeMap::from([("Security".into(), vec![suppress("-A", &[1])])]),
+                false,
+            ),
+            (
+                "provider with an apostrophe",
+                BTreeMap::from([("Security".into(), vec![suppress("A'B", &[1])])]),
+                false,
+            ),
+            (
+                "provider with markup",
+                BTreeMap::from([("Security".into(), vec![suppress("A<B", &[1])])]),
+                false,
+            ),
+            (
+                "provider with a non-ASCII letter",
+                BTreeMap::from([("Security".into(), vec![suppress("Aé", &[1])])]),
+                false,
+            ),
+        ];
+
+        for (name, suppress_ids, valid) in rows {
+            let config = WindowsEventLogConfig {
+                channels: vec!["System".to_string(), "Security".to_string()],
+                suppress_ids,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.validate().is_ok(),
+                valid,
+                "{name}: {:?}",
+                config.validate()
+            );
+        }
+    }
+
+    /// Every bound on `binary_providers`, accepted at the limit and rejected one
+    /// past it. Names share the `suppress_ids` provider rules.
+    #[test]
+    fn binary_providers_validation_table() {
+        let sixteen: Vec<String> = (0..16).map(|n| format!("P{n}")).collect();
+        let seventeen: Vec<String> = (0..17).map(|n| format!("P{n}")).collect();
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect();
+
+        let rows: Vec<(&str, Vec<String>, bool)> = vec![
+            ("empty list", Vec::new(), true),
+            ("one provider", names(&["Service Control Manager"]), true),
+            ("sixteen providers", sixteen, true),
+            ("seventeen providers", seventeen, false),
+            ("duplicate provider", names(&["A", "A"]), false),
+            (
+                "duplicate provider in another case",
+                names(&["Ab", "aB"]),
+                false,
+            ),
+            ("empty provider", names(&[""]), false),
+            ("provider with an apostrophe", names(&["A'B"]), false),
+            ("provider with a non-ASCII letter", names(&["Aé"]), false),
+        ];
+
+        for (name, binary_providers, valid) in rows {
+            let config = WindowsEventLogConfig {
+                binary_providers,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.validate().is_ok(),
+                valid,
+                "{name}: {:?}",
+                config.validate()
+            );
+        }
+    }
+
+    /// Absent keeps no payload for any provider; a listed name matches in any case.
+    #[test]
+    fn binary_providers_parse_and_match() {
+        let absent: WindowsEventLogConfig =
+            toml::from_str("channels = [\"System\"]").expect("minimal config must parse");
+        assert!(absent.binary_providers.is_empty());
+        assert!(!absent.keeps_binary("Service Control Manager"));
+
+        let parsed: WindowsEventLogConfig = toml::from_str(
+            "channels = [\"System\"]\n\
+             binary_providers = [\"Service Control Manager\"]\n",
+        )
+        .expect("a provider list must parse");
+        assert!(parsed.validate().is_ok());
+        assert!(parsed.keeps_binary("Service Control Manager"));
+        assert!(parsed.keeps_binary("service control MANAGER"));
+        assert!(!parsed.keeps_binary("Service Control"));
+        assert!(!parsed.keeps_binary("Microsoft-Windows-Kernel-General"));
+    }
+
+    /// Absent is empty, and a rendered rule parses into the typed shape.
+    #[test]
+    fn suppress_ids_parse_from_config() {
+        let absent: WindowsEventLogConfig =
+            toml::from_str("channels = [\"Security\"]").expect("minimal config must parse");
+        assert!(absent.suppress_ids.is_empty());
+
+        let parsed: WindowsEventLogConfig = toml::from_str(
+            "channels = [\"Security\"]\n\
+             [[suppress_ids.Security]]\n\
+             provider = \"microsoft-windows-security-auditing\"\n\
+             event_ids = [4658, 4690]\n",
+        )
+        .expect("a suppress rule must parse");
+        assert_eq!(
+            parsed.suppress_ids["Security"],
+            vec![suppress(
+                "microsoft-windows-security-auditing",
+                &[4658, 4690]
+            )]
+        );
+        assert!(parsed.validate().is_ok());
+
+        let out_of_range = toml::from_str::<WindowsEventLogConfig>(
+            "channels = [\"Security\"]\n\
+             [[suppress_ids.Security]]\n\
+             provider = \"P\"\n\
+             event_ids = [65536]\n",
+        );
+        assert!(out_of_range.is_err(), "an id past 65535 does not parse");
     }
 
     #[test]

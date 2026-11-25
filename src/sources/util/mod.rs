@@ -44,7 +44,7 @@ mod wrappers;
 
 pub use decompression::{max_decompressed_size_bytes, set_max_decompressed_size_bytes};
 #[cfg(feature = "sources-file")]
-pub use encoding_config::EncodingConfig;
+pub use encoding_config::{CharsetMode, EncodingConfig};
 pub use multiline_config::MultilineConfig;
 #[cfg(all(
     unix,

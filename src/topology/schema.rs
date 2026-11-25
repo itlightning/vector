@@ -14,8 +14,17 @@ pub enum Error {
     ContainsNever,
 }
 
-/// The cache is used whilst building up the topology.
-/// TODO: Describe more, especially why we have a bool in the key.
+/// Memo of the definitions reaching a set of inputs, used whilst building up the topology.
+///
+/// Walking an input set means walking every upstream component of every input, and a component
+/// feeding several downstream components is reached once per route, so without a memo the same
+/// chain is rebuilt over and over. Each walker fills this on the way out of a set of inputs and
+/// reads it on the way in, and all three walkers share it: they resolve an input set the same way,
+/// differing only in which of them they recurse through.
+///
+/// The key carries `schema_enabled` because it selects which half of a component's output the
+/// walkers keep, so the same inputs yield different definitions under each setting. Entries live
+/// only as long as the walk that created them.
 type Cache = HashMap<(bool, Vec<OutputId>), Vec<(OutputId, Definition)>>;
 
 pub fn possible_definitions(
@@ -91,6 +100,11 @@ pub fn possible_definitions(
         }
     }
 
+    cache.insert(
+        (config.schema_enabled(), inputs.to_vec()),
+        definitions.clone(),
+    );
+
     Ok(definitions)
 }
 
@@ -119,7 +133,6 @@ pub(super) fn expanded_definitions(
     }
 
     let mut definitions: Vec<(OutputId, Definition)> = vec![];
-    let mut merged_cache = HashMap::default();
 
     for input in inputs {
         let key = &input.component;
@@ -161,7 +174,7 @@ pub(super) fn expanded_definitions(
         // a new pipeline.
         } else if let Some(inputs) = config.transform_inputs(key) {
             let input_definitions =
-                possible_definitions(inputs, config, enrichment_tables.clone(), &mut merged_cache)?;
+                possible_definitions(inputs, config, enrichment_tables.clone(), cache)?;
 
             let mut transform_definition = config
                 .transform_outputs(key, enrichment_tables.clone(), &input_definitions)
@@ -283,6 +296,11 @@ pub(crate) fn input_definitions(
             definitions.append(&mut transform_definitions);
         }
     }
+
+    cache.insert(
+        (config.schema_enabled(), inputs.to_vec()),
+        definitions.clone(),
+    );
 
     Ok(definitions)
 }
@@ -451,6 +469,149 @@ mod tests {
     use vrl::value::Kind;
 
     use super::*;
+
+    /// A chain of transforms behind one source, counting how often a transform is asked for its
+    /// outputs. Resolving a transform's outputs is the expensive half of a walk.
+    struct CountingChain {
+        chain: Vec<&'static str>,
+        upstream_ids: Vec<OutputId>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl CountingChain {
+        fn new(chain: Vec<&'static str>) -> Self {
+            let upstream_ids = std::iter::once("source")
+                .chain(chain.iter().copied())
+                .take(chain.len())
+                .map(|id| OutputId {
+                    component: id.into(),
+                    port: None,
+                })
+                .collect();
+            Self {
+                chain,
+                upstream_ids,
+                calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn output_id(&self) -> Vec<OutputId> {
+            vec![OutputId {
+                component: (*self.chain.last().unwrap()).into(),
+                port: None,
+            }]
+        }
+    }
+
+    impl ComponentContainer for CountingChain {
+        fn schema_enabled(&self) -> bool {
+            true
+        }
+
+        fn source_outputs(&self, key: &ComponentKey) -> Option<Vec<SourceOutput>> {
+            (key.id() == "source").then(|| {
+                vec![SourceOutput::new_maybe_logs(
+                    DataType::all_bits(),
+                    Definition::empty_legacy_namespace(),
+                )]
+            })
+        }
+
+        fn transform_inputs(&self, key: &ComponentKey) -> Option<&[OutputId]> {
+            let index = self.chain.iter().position(|id| *id == key.id())?;
+            Some(std::slice::from_ref(&self.upstream_ids[index]))
+        }
+
+        fn transform_outputs(
+            &self,
+            key: &ComponentKey,
+            _: vector_lib::enrichment::TableRegistry,
+            input_definitions: &[(OutputId, Definition)],
+        ) -> Option<Vec<TransformOutput>> {
+            self.chain.iter().position(|id| *id == key.id())?;
+            self.calls.set(self.calls.get() + 1);
+            let definition = input_definitions
+                .iter()
+                .map(|(_, definition)| definition.clone())
+                .reduce(Definition::merge)
+                .unwrap_or_else(Definition::any)
+                .with_event_field(&owned_value_path!(key.id()), Kind::bytes(), None);
+            Some(vec![TransformOutput::new(
+                DataType::all_bits(),
+                [(OutputId::from("in"), definition)].into(),
+            )])
+        }
+    }
+
+    #[test]
+    fn walkers_serve_a_repeated_walk_from_the_cache() {
+        let chain = || CountingChain::new(vec!["t1", "t2", "t3"]);
+
+        // A fresh walk, and then the same walk again against the same cache.
+        let case = chain();
+        let inputs = case.output_id();
+        let mut cache = HashMap::default();
+        let first = possible_definitions(
+            &inputs,
+            &case,
+            vector_lib::enrichment::TableRegistry::default(),
+            &mut cache,
+        )
+        .unwrap();
+        let after_first = case.calls.get();
+        let second = possible_definitions(
+            &inputs,
+            &case,
+            vector_lib::enrichment::TableRegistry::default(),
+            &mut cache,
+        )
+        .unwrap();
+
+        assert_eq!(
+            first, second,
+            "a cache hit must match the walk that filled it"
+        );
+        assert_eq!(
+            after_first,
+            case.calls.get(),
+            "the repeated walk must not resolve any transform again"
+        );
+
+        // The cached answer must also match a walk that never saw a cache entry.
+        let fresh_case = chain();
+        let fresh = possible_definitions(
+            &fresh_case.output_id(),
+            &fresh_case,
+            vector_lib::enrichment::TableRegistry::default(),
+            &mut HashMap::default(),
+        )
+        .unwrap();
+        assert_eq!(fresh, second);
+
+        // `expanded_definitions` shares the cache with `possible_definitions`, so it is served
+        // the same definitions without resolving anything itself.
+        let shared_case = chain();
+        let shared_inputs = shared_case.output_id();
+        let mut shared_cache = HashMap::default();
+        let expanded = expanded_definitions(
+            vector_lib::enrichment::TableRegistry::default(),
+            &shared_inputs,
+            &shared_case,
+            &mut shared_cache,
+        )
+        .unwrap();
+        let after_expanded = shared_case.calls.get();
+        let possible = possible_definitions(
+            &shared_inputs,
+            &shared_case,
+            vector_lib::enrichment::TableRegistry::default(),
+            &mut shared_cache,
+        )
+        .unwrap();
+
+        assert_eq!(expanded, possible);
+        assert_eq!(after_expanded, shared_case.calls.get());
+    }
 
     #[test]
     fn test_expanded_definition() {

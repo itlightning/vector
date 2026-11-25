@@ -655,6 +655,34 @@ components: sources: internal_metrics: {
 				}
 			}
 		}
+		file_encoding_detected_total: {
+			description:       "The total number of files whose character encoding was decided by `charset: auto` detection."
+			type:              "counter"
+			default_namespace: "vector"
+			tags: _internal_metrics_tags & {
+				file: _file
+				encoding: {
+					description: "The decided character encoding."
+					required:    true
+				}
+				via: {
+					description: "How the encoding was decided (`bom`, `utf16-heuristic`, `utf8-valid`, or `fallback`)."
+					required:    true
+				}
+			}
+		}
+		file_encoding_rejected_total: {
+			description:       "The total number of files skipped because their content looked like garbage under the detected character encoding (`max_replacement_ratio`)."
+			type:              "counter"
+			default_namespace: "vector"
+			tags: _internal_metrics_tags & {
+				file: _file
+				encoding: {
+					description: "The character encoding the file was rejected under."
+					required:    true
+				}
+			}
+		}
 		files_added_total: {
 			description:       "The total number of files Vector has found to watch."
 			type:              "counter"
@@ -814,6 +842,12 @@ components: sources: internal_metrics: {
 			type:              "gauge"
 			default_namespace: "vector"
 			tags:              _internal_metrics_tags
+		}
+		memory_enrichment_table_evictions_total: {
+			description:       "The total number of entries a memory enrichment table removed to make room under `on_full: evict_oldest`."
+			type:              "counter"
+			default_namespace: "vector"
+			tags:              _component_tags
 		}
 		metadata_refresh_failed_total: {
 			description:       "The total number of failed efforts to refresh AWS EC2 metadata."
