@@ -131,3 +131,14 @@ impl InternalEvent for MemoryEnrichmentTableInsertFailed<'_> {
         }
     }
 }
+
+#[derive(Debug, NamedInternalEvent)]
+pub(crate) struct MemoryEnrichmentTableEvicted {
+    pub count: usize,
+}
+
+impl InternalEvent for MemoryEnrichmentTableEvicted {
+    fn emit(self) {
+        counter!(CounterName::MemoryEnrichmentTableEvictionsTotal,).increment(self.count as u64);
+    }
+}
